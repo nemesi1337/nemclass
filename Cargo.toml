@@ -1,15 +1,31 @@
-[package]
-name = "reclass-rs"
+[workspace]
+resolver = "2"
+members = [
+    "crates/nemclass-core",
+    "crates/nemclass-model",
+    "crates/nemclass-script",
+    "crates/nemclass-ui",
+    "crates/nemclass-app",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = ["std", "alloc"]
-alloc = []
-std = []
-
-[dependencies]
+[workspace.dependencies]
+# External
 iced-x86 = { version = "1.21.0", features = ["default"] }
 bitflags = "2.4.0"
 obfstr = "0.4.3"
-libc = { version = "0.2.189" }
+libc = "0.2.189"
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+
+# Internal
+nemclass-core = { path = "crates/nemclass-core" }
+nemclass-model = { path = "crates/nemclass-model" }
+nemclass-script = { path = "crates/nemclass-script" }
+nemclass-ui = { path = "crates/nemclass-ui" }

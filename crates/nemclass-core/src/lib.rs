@@ -1,7 +1,6 @@
 use core::result;
 
 pub mod internal;
-pub mod ui;
 
 pub enum Error {
     InvalidAddress,

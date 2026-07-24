@@ -1,0 +1,14 @@
+[package]
+name = "nemclass-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nemclass"
+path = "src/main.rs"
+
+[dependencies]
+nemclass-core.workspace = true
+nemclass-model.workspace = true
+nemclass-script.workspace = true
+nemclass-ui.workspace = true

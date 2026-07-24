@@ -1,0 +1,14 @@
+[package]
+name = "nemclass-script"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# rustyscript / deno_core (v8) engine is wired in M2. Heavy build — opt-in only.
+scripting = []
+
+[dependencies]
+nemclass-core.workspace = true
+nemclass-model.workspace = true
+serde.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "nemclass-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["std", "alloc"]
+alloc = []
+std = []
+
+[dependencies]
+iced-x86.workspace = true
+bitflags.workspace = true
+obfstr.workspace = true
+libc.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
