@@ -6,9 +6,17 @@ edition.workspace = true
 [features]
 default = []
 # rustyscript / deno_core (v8) engine is wired in M2. Heavy build — opt-in only.
+# Kept intentionally EMPTY for M1: enabling it must still compile today, so the
+# M2 `RustyScriptEngine` slots in behind this flag without touching any
+# bus / engine / host-API contract. When M2 lands it becomes:
+#   scripting = ["dep:rustyscript"]
 scripting = []
+# A trivial compile-time plugin (`ExamplePlugin`) that proves the `Plugin`
+# seam end-to-end. Off by default so the crate stays lean.
+example-plugin = []
 
 [dependencies]
 nemclass-core.workspace = true
 nemclass-model.workspace = true
 serde.workspace = true
+uuid.workspace = true
