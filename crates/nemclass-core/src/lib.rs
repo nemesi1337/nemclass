@@ -28,6 +28,9 @@ pub use internal::{
     disassemble_instructions,
     // PE utilities (shared between Wine detection and a future Windows backend).
     pe,
+    // Exported-symbol resolution (PE export directory / ELF `.dynsym`).
+    Symbol,
+    symbols,
 };
 
 // Native Linux provider (`process_vm_readv` + `/proc`), Linux-only.

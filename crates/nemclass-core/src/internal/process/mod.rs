@@ -26,6 +26,11 @@ pub mod kernel;
 // Windows backend tomorrow), so it is always compiled and publicly exposed.
 pub mod pe;
 
+// Exported-symbol resolution (PE export directory / ELF `.dynsym`) over a mapped
+// module image. The `pe_exports`/`elf_exports` parsers are platform-neutral
+// (they take a byte reader); only the `Process` convenience glue is Linux-gated.
+pub mod symbols;
+
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
@@ -35,6 +40,7 @@ pub use types::*;
 pub use protection::*;
 pub use provider::*;
 pub use memory::MemoryBackend;
+pub use symbols::Symbol;
 
 // The kernel-device client and its privileged backend/provider (Linux-only).
 #[cfg(target_os = "linux")]

@@ -6,7 +6,8 @@ mod process;
 // private — callers use these names, not `internal::process::…` paths.
 pub use process::{
     MemoryBackend, MemoryRegion, Module, ModuleInfoWithName, Pid, Process, ProcessEntry,
-    ProcessIterator, ProcessProvider, Protection, ProviderRegistry, Section, SectionType, pe,
+    ProcessIterator, ProcessProvider, Protection, ProviderRegistry, Section, SectionType, Symbol,
+    pe, symbols,
 };
 
 // Native Linux provider (`process_vm_readv` backend + `/proc` enumeration).
