@@ -10,6 +10,7 @@
 //! - EventBus integration: publishes `OnAttach`/`OnDetach`.
 
 mod process_reader;
+pub mod project_io;
 mod views;
 
 pub use views::NemclassApp;

@@ -12,3 +12,6 @@ egui_extras.workspace = true
 eframe.workspace = true
 uuid.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -2,19 +2,21 @@
 //!
 //! ## Layout
 //! ```text
-//! ┌─ top bar (address_bar) ──────────────────────────────────────┐
-//! │ Class: PlayerObject   Base: 0x7fff…   Formula: [_____]       │
-//! ├─ left panel ────┬─ central panel (memory table) ─────────────┤
-//! │ Backend: [combo]│ Address │ Offset │ Type  │ Name │ Val │ Cmt│
-//! │ [Refresh][Attach│ ─────────────────────────────────────────── │
-//! │  pid list ]     │  rows …                                    │
-//! │─────────────────│                                            │
-//! │ Classes:        │                                            │
-//! │  ▶ PlayerObject │                                            │
-//! └─────────────────┴────────────────────────────────────────────┘
+//! ┌─ menu bar (New / Open / Save) ───────────────────────────────────┐
+//! ├─ top bar (address_bar) ──────────────────────────────────────────┤
+//! │ Class: PlayerObject   Base: 0x7fff…   Formula: [_____]           │
+//! ├─ left panel ────┬─ central panel (memory table) ──────────────── ┤
+//! │ Backend: [combo]│ Address │ Offset │ Type  │ Name │ Val │ Cmt    │
+//! │ [Refresh][Attach│ ──────────────────────────────────────────────  │
+//! │  pid list ]     │  rows …                                        │
+//! │─────────────────│                                                │
+//! │ Classes:        │                                                │
+//! │  ▶ PlayerObject │                                                │
+//! └─────────────────┴──────────────────────────────────────────────── ┘
 //! ```
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -26,6 +28,7 @@ use nemclass_script::{Event, EventBus};
 use uuid::Uuid;
 
 use crate::process_reader::ProcessReader;
+use crate::project_io::{create_project_at, load_project_from, save_project_to};
 
 // ---------------------------------------------------------------------------
 // Flat snapshot of a node tree row
@@ -62,6 +65,36 @@ struct EditState {
 }
 
 // ---------------------------------------------------------------------------
+// File dialog state
+// ---------------------------------------------------------------------------
+
+/// Which file operation is pending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileOp {
+    /// Creating a new project — `path_buf` is the target directory.
+    New,
+    /// Opening an existing project file or directory.
+    Open,
+    /// Saving to a new directory (Save As / first save).
+    SaveAs,
+}
+
+/// State for the in-app path-input dialog.
+struct FileDialog {
+    op: FileOp,
+    /// The text the user is typing into the path field.
+    path_text: String,
+    /// Error message to show inside the dialog (e.g. parse/IO failure).
+    error: Option<String>,
+}
+
+impl FileDialog {
+    fn new(op: FileOp, initial: &str) -> Self {
+        Self { op, path_text: initial.to_owned(), error: None }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NemclassApp
 // ---------------------------------------------------------------------------
 
@@ -79,7 +112,10 @@ pub struct NemclassApp {
 
     // Project
     project: Project,
-    _node_registry: NodeRegistry,
+    /// The shared node-type registry (built once with `with_builtins()`).
+    node_registry: NodeRegistry,
+    /// Directory that contains `project.nemclass`, or `None` if unsaved.
+    project_dir: Option<PathBuf>,
     selected_class: Option<Uuid>,
 
     // Memory view
@@ -93,6 +129,11 @@ pub struct NemclassApp {
 
     // Scripting seam
     event_bus: EventBus,
+
+    // In-app file dialog
+    file_dialog: Option<FileDialog>,
+    /// Non-modal status message shown below the menu bar (e.g. last save path).
+    status_msg: Option<String>,
 }
 
 impl NemclassApp {
@@ -119,7 +160,8 @@ impl NemclassApp {
             attached_name: None,
             last_error: None,
             project,
-            _node_registry: node_registry,
+            node_registry,
+            project_dir: None,
             selected_class,
             node_snapshots: Vec::new(),
             class_base: None,
@@ -129,6 +171,8 @@ impl NemclassApp {
             collapsed: HashSet::new(),
             edit_state: None,
             event_bus: EventBus::new(),
+            file_dialog: None,
+            status_msg: Some("Demo project loaded. Use File > New or Open to load a project.".into()),
         }
     }
 
@@ -163,7 +207,6 @@ impl NemclassApp {
             self.last_error = Some("Selection out of range.".into());
             return;
         };
-        // ProcessEntry uses `id: u32` and `name: String`.
         let pid = entry.id as libc::pid_t;
         let name = entry.name.clone();
 
@@ -219,30 +262,103 @@ impl NemclassApp {
     }
 
     // -----------------------------------------------------------------------
+    // Project actions (called after the dialog confirms a path)
+    // -----------------------------------------------------------------------
+
+    /// Replace the in-memory project with `new_project` and update UI state.
+    fn replace_project(&mut self, new_project: Project, new_dir: Option<PathBuf>) {
+        // Reset selection to the first class in the new project (if any).
+        let first_class = new_project.classes_in_order().next().map(|c| c.uuid);
+        self.project = new_project;
+        self.project_dir = new_dir;
+        self.selected_class = first_class;
+        self.clear_memory_state();
+        self.last_snapshot = None;
+        self.collapsed.clear();
+    }
+
+    /// Execute the New action: create a blank project at `dir`.
+    fn exec_new(&mut self, dir: PathBuf) -> Result<(), String> {
+        let new_project = Project::new(
+            dir.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Untitled".into()),
+        );
+        create_project_at(&dir, &new_project, &self.node_registry)
+            .map_err(|e| format!("New project failed: {e}"))?;
+        let project_name = new_project.name.clone();
+        self.replace_project(new_project, Some(dir.clone()));
+        self.status_msg = Some(format!(
+            "Created project '{}' at {}",
+            project_name,
+            dir.display()
+        ));
+        Ok(())
+    }
+
+    /// Execute the Open action: load from `path` (file or dir).
+    fn exec_open(&mut self, path: PathBuf) -> Result<(), String> {
+        let (loaded, proj_dir) =
+            load_project_from(&path, &self.node_registry)
+                .map_err(|e| format!("Open failed: {e}"))?;
+        let project_name = loaded.name.clone();
+        let dir_display = proj_dir.display().to_string();
+        self.replace_project(loaded, Some(proj_dir));
+        self.status_msg = Some(format!(
+            "Opened '{}' from {}",
+            project_name, dir_display
+        ));
+        Ok(())
+    }
+
+    /// Execute the Save action.  If `project_dir` is `None`, route to Save As dialog.
+    fn exec_save(&mut self) -> Result<(), String> {
+        if let Some(dir) = self.project_dir.clone() {
+            save_project_to(&dir, &self.project, &self.node_registry)
+                .map_err(|e| format!("Save failed: {e}"))?;
+            self.status_msg = Some(format!("Saved to {}", dir.display()));
+            Ok(())
+        } else {
+            // No project dir yet — open the Save As dialog.
+            self.file_dialog = Some(FileDialog::new(FileOp::SaveAs, ""));
+            Ok(())
+        }
+    }
+
+    /// Execute the Save As action: save to a new directory.
+    fn exec_save_as(&mut self, dir: PathBuf) -> Result<(), String> {
+        // If the directory doesn't exist yet, create it.
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("Cannot create directory: {e}"))?;
+        }
+        save_project_to(&dir, &self.project, &self.node_registry)
+            .map_err(|e| format!("Save As failed: {e}"))?;
+        let dir_display = dir.display().to_string();
+        self.project_dir = Some(dir);
+        self.status_msg = Some(format!("Saved to {dir_display}"));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Memory snapshot
     // -----------------------------------------------------------------------
 
     fn take_snapshot(&mut self) {
         let Some(uuid) = self.selected_class else { return; };
         let Some(proc) = &self.process else {
-            // No process attached — rebuild snapshots from zeroed buffer so
-            // the demo table shows layout on launch.
             self.rebuild_snapshots_from_buf(uuid);
             return;
         };
 
-        // Collect modules (needed for formula evaluation).
         let modules: Vec<ModuleInfoWithName> = match proc.modules() {
             Ok(it) => it.collect(),
             Err(e) => {
                 self.last_error = Some(format!("modules(): {e}"));
-                // Fall back to empty module list — formula may still work for
-                // constant offsets.
                 Vec::new()
             }
         };
 
-        // Resolve base address.
         let formula = self.project.get_class(&uuid)
             .map(|c| c.address_formula.clone())
             .unwrap_or_default();
@@ -265,7 +381,6 @@ impl NemclassApp {
         };
         self.class_base = base;
 
-        // Read the class memory region.
         let total_size = self.project.get_class(&uuid)
             .map(|c| c.memory_size())
             .unwrap_or(0);
@@ -281,7 +396,6 @@ impl NemclassApp {
         self.last_snapshot = Some(Instant::now());
     }
 
-    /// Rebuild `node_snapshots` from `self.mem_buf` for the given class.
     fn rebuild_snapshots_from_buf(&mut self, uuid: Uuid) {
         self.node_snapshots.clear();
         if let Some(class) = self.project.get_class(&uuid) {
@@ -314,7 +428,6 @@ impl NemclassApp {
         match write_parsed(proc, addr, type_tag, edit.text.trim()) {
             Ok(()) => {
                 self.last_error = None;
-                // Force immediate re-read to show the updated value.
                 self.last_snapshot = None;
             }
             Err(e) => {
@@ -335,10 +448,9 @@ impl Default for NemclassApp {
 // ---------------------------------------------------------------------------
 
 impl eframe::App for NemclassApp {
-    /// Called every frame before `ui()`.  Run memory snapshot here so it never
-    /// stalls the render pass.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let needs_snapshot = self.selected_class.is_some()
+            && self.file_dialog.is_none()   // don't snapshot while dialog is open
             && self
                 .last_snapshot
                 .map(|t| t.elapsed() >= self.snapshot_interval)
@@ -348,14 +460,24 @@ impl eframe::App for NemclassApp {
             self.take_snapshot();
         }
 
-        // Keep repainting at the snapshot interval while attached.
         if self.process.is_some() {
             ctx.request_repaint_after(self.snapshot_interval);
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Panels must be declared outermost first (top → left → central).
+        // Menu bar (outermost — rendered before any panels).
+        egui::Panel::top("menu_bar")
+            .resizable(false)
+            .show(ui, |ui| self.show_menu_bar(ui));
+
+        // File dialog (modal overlay — rendered as a Window).
+        // We drive the dialog from outside the closure to avoid borrow issues.
+        if self.file_dialog.is_some() {
+            self.show_file_dialog(ui.ctx());
+        }
+
+        // Address bar.
         egui::Panel::top("address_bar")
             .resizable(false)
             .show(ui, |ui| self.show_address_bar(ui));
@@ -373,9 +495,162 @@ impl eframe::App for NemclassApp {
 // ---------------------------------------------------------------------------
 
 impl NemclassApp {
+    // -----------------------------------------------------------------------
+    // Menu bar
+    // -----------------------------------------------------------------------
+
+    fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            // Project name / path indicator.
+            let title = match &self.project_dir {
+                Some(dir) => format!(
+                    "{} — {}",
+                    self.project.name,
+                    dir.display()
+                ),
+                None => format!("{} (unsaved)", self.project.name),
+            };
+            ui.strong(&title);
+
+            ui.separator();
+
+            if ui.button("New").clicked() && self.file_dialog.is_none() {
+                self.file_dialog = Some(FileDialog::new(FileOp::New, ""));
+            }
+            if ui.button("Open").clicked() && self.file_dialog.is_none() {
+                self.file_dialog = Some(FileDialog::new(FileOp::Open, ""));
+            }
+            if ui.button("Save").clicked() && self.file_dialog.is_none()
+                && let Err(e) = self.exec_save() {
+                    self.last_error = Some(e);
+            }
+            if ui.button("Save As").clicked() && self.file_dialog.is_none() {
+                let hint = self.project_dir
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.file_dialog = Some(FileDialog::new(FileOp::SaveAs, &hint));
+            }
+
+            // Status message (right-aligned).
+            if let Some(msg) = &self.status_msg {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(msg);
+                });
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // File dialog (in-app path input)
+    // -----------------------------------------------------------------------
+
+    fn show_file_dialog(&mut self, ctx: &egui::Context) {
+        // Extract the dialog state to avoid holding &self borrow inside closure.
+        let Some(ref dialog) = self.file_dialog else { return; };
+        let title = match dialog.op {
+            FileOp::New    => "New Project — choose target directory",
+            FileOp::Open   => "Open Project — enter path to project.nemclass or its directory",
+            FileOp::SaveAs => "Save As — choose target directory",
+        };
+        let op = dialog.op.clone();
+
+        // We need owned copies to avoid borrow-checker issues inside the closure.
+        let mut path_text = dialog.path_text.clone();
+        let dialog_error = dialog.error.clone();
+        let mut close = false;
+        let mut confirm = false;
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+
+                let hint = match op {
+                    FileOp::New    => "e.g. /home/user/myproject",
+                    FileOp::Open   => "e.g. /home/user/myproject  or  /home/user/myproject/project.nemclass",
+                    FileOp::SaveAs => "e.g. /home/user/myproject",
+                };
+                ui.label(hint);
+                ui.add_space(4.0);
+
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut path_text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(hint),
+                );
+                // Allow confirming with Enter.
+                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if resp.lost_focus() && enter_pressed {
+                    confirm = true;
+                }
+
+                ui.add_space(4.0);
+
+                if let Some(err) = &dialog_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                    ui.add_space(4.0);
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Confirm").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        // Write back any edits to path_text.
+        if let Some(ref mut d) = self.file_dialog {
+            d.path_text = path_text.clone();
+        }
+
+        if close {
+            self.file_dialog = None;
+            return;
+        }
+
+        if confirm {
+            let path = PathBuf::from(path_text.trim());
+            if path.as_os_str().is_empty() {
+                if let Some(ref mut d) = self.file_dialog {
+                    d.error = Some("Path cannot be empty.".into());
+                }
+                return;
+            }
+
+            let result = match op {
+                FileOp::New    => self.exec_new(path),
+                FileOp::Open   => self.exec_open(path),
+                FileOp::SaveAs => self.exec_save_as(path),
+            };
+
+            match result {
+                Ok(()) => {
+                    self.file_dialog = None;
+                    // Clear any prior errors on success.
+                    self.last_error = None;
+                }
+                Err(e) => {
+                    // Show the error inside the dialog so the user can correct the path.
+                    if let Some(ref mut d) = self.file_dialog {
+                        d.error = Some(e);
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Address bar
+    // -----------------------------------------------------------------------
+
     fn show_address_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // Class name.
             let class_name = self
                 .selected_class
                 .and_then(|id| self.project.get_class(&id))
@@ -385,7 +660,6 @@ impl NemclassApp {
             ui.label(&class_name);
             ui.separator();
 
-            // Resolved base.
             ui.strong("Base:");
             match self.class_base {
                 Some(b) => { ui.monospace(format!("0x{b:016X}")); }
@@ -393,7 +667,6 @@ impl NemclassApp {
             }
             ui.separator();
 
-            // Editable formula.
             if let Some(uuid) = self.selected_class
                 && let Some(class) = self.project.get_class_mut(&uuid)
             {
@@ -404,7 +677,6 @@ impl NemclassApp {
                     }
             }
 
-            // Attach status (right-aligned).
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 match &self.attached_name {
                     Some(n) => ui.colored_label(egui::Color32::GREEN, format!("Attached: {n}")),
@@ -413,6 +685,10 @@ impl NemclassApp {
             });
         });
     }
+
+    // -----------------------------------------------------------------------
+    // Left panel
+    // -----------------------------------------------------------------------
 
     fn show_left_panel(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(220.0);
@@ -469,7 +745,7 @@ impl NemclassApp {
         // Class list.
         ui.heading("Classes");
         if ui.button("+ Add class").clicked() {
-            let cls = extra_demo_class();
+            let cls = blank_class();
             let uuid = cls.uuid;
             self.project.add_class(cls);
             self.selected_class = Some(uuid);
@@ -518,6 +794,10 @@ impl NemclassApp {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // Central panel (memory table)
+    // -----------------------------------------------------------------------
+
     fn show_class_view(&mut self, ui: &mut egui::Ui) {
         if self.selected_class.is_none() {
             ui.centered_and_justified(|ui| {
@@ -534,7 +814,6 @@ impl NemclassApp {
             ui.add_space(4.0);
         }
 
-        // Trigger first snapshot if we just switched class (no process needed).
         if self.node_snapshots.is_empty()
             && let Some(uuid) = self.selected_class
         {
@@ -589,7 +868,6 @@ impl NemclassApp {
                     row.col(|ui| { ui.monospace(format!("+{offset:#06X}")); });
                     row.col(|ui| { ui.label(type_tag); });
 
-                    // Name column: indented + collapse toggle for containers.
                     row.col(|ui| {
                         ui.horizontal(|ui| {
                             let indent = depth as f32 * 12.0;
@@ -612,7 +890,6 @@ impl NemclassApp {
                         });
                     });
 
-                    // Value column: editable for scalars when attached.
                     row.col(|ui| {
                         let editing = self
                             .edit_state
@@ -634,9 +911,6 @@ impl NemclassApp {
                             } else {
                                 let resp = ui.selectable_label(false, &value);
                                 if resp.double_clicked() {
-                                    // Seed the edit box with the current raw value
-                                    // (strip "0x" prefix for hex types so the user
-                                    // can type a plain hex literal).
                                     let seed = value
                                         .strip_prefix("0x")
                                         .or_else(|| value.strip_prefix("0X"))
@@ -697,7 +971,6 @@ fn flatten_nodes(
             _memory_size: size,
         });
 
-        // Recurse into children immediately after their parent row.
         if has_children {
             flatten_nodes(
                 node.children(),
@@ -714,16 +987,12 @@ fn flatten_nodes(
     }
 }
 
-/// Build the list of snapshot indices visible given the current collapse state.
-/// A node is hidden if any of its ancestor id_paths is in `collapsed`.
 fn build_visible_rows(
     snapshots: &[NodeSnapshot],
     collapsed: &HashSet<String>,
 ) -> Vec<usize> {
     let mut visible = Vec::with_capacity(snapshots.len());
     'snap: for (i, snap) in snapshots.iter().enumerate() {
-        // Check if any strict ancestor id_path is collapsed.
-        // Ancestors are the prefixes of the dot-separated path.
         let parts: Vec<&str> = snap.id_path.split('.').collect();
         for len in 1..parts.len() {
             let ancestor = parts[..len].join(".");
@@ -741,7 +1010,6 @@ fn build_visible_rows(
 // ---------------------------------------------------------------------------
 
 fn write_parsed(proc: &Process, addr: usize, type_tag: &str, text: &str) -> Result<(), String> {
-    // Strip optional "0x"/"0X" prefix for hex input.
     let raw = text.trim_start_matches("0x").trim_start_matches("0X");
 
     macro_rules! parse_write {
@@ -798,12 +1066,6 @@ fn is_editable(type_tag: &str) -> bool {
 // Bulk memory read helper
 // ---------------------------------------------------------------------------
 
-/// Read `size` bytes from `addr` in the target process into a `Vec<u8>`.
-///
-/// Uses `Process::read_buf` — one `process_vm_readv` for the whole region (not
-/// one iovec per byte, which `read_batch::<u8>` would do). On partial transfer
-/// or error the returned buffer stays zeroed for the missing bytes (best-effort,
-/// non-panicking), so the view degrades gracefully on a partly-unmapped region.
 fn read_process_buf(proc: &Process, addr: usize, size: usize) -> Vec<u8> {
     if size == 0 {
         return Vec::new();
@@ -814,7 +1076,7 @@ fn read_process_buf(proc: &Process, addr: usize, size: usize) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Demo project
+// Demo project (used as the in-memory default on first launch)
 // ---------------------------------------------------------------------------
 
 fn demo_project() -> Project {
@@ -825,74 +1087,31 @@ fn demo_project() -> Project {
 
     let mut project = Project::new("Demo Project");
     let mut player = ClassNode::new("PlayerObject");
-    player.address_formula = String::new(); // blank → no live read needed on launch
+    player.address_formula = String::new();
     player.comment = "Attach to a process and set a formula to go live.".into();
 
-    {
-        let mut n = Int32Node::new("health");      n.comment = "Current HP".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = Int32Node::new("max_health");  n.comment = "Max HP".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = Float32Node::new("mana");      n.comment = "Mana pool".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = Float64Node::new("pos_x");     n.comment = "X position".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = Float64Node::new("pos_y");     n.comment = "Y position".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = Float64Node::new("pos_z");     n.comment = "Z position".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = Hex32Node::new("flags");       n.comment = "State flags (hex)".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = Hex64Node::new("vtable");      n.comment = "vptr (hex)".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = PointerNode::new("next");      n.comment = "Linked list next".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = BoolNode::new("alive");        n.comment = "Is alive?".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = UInt8Node::new("level");       n.comment = "Level (1-255)".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = Utf8TextNode::new("name", 32); n.comment = "Name (UTF-8, 32 B)".into();
-        player.children.push(Box::new(n));
-    }
-    {
-        let mut n = ArrayNode::new("inv_ids", 10, 4); n.comment = "10 x u32 item IDs".into();
-        player.children.push(Box::new(n));
-    }
+    { let mut n = Int32Node::new("health");      n.comment = "Current HP".into();           player.children.push(Box::new(n)); }
+    { let mut n = Int32Node::new("max_health");  n.comment = "Max HP".into();               player.children.push(Box::new(n)); }
+    { let mut n = Float32Node::new("mana");      n.comment = "Mana pool".into();            player.children.push(Box::new(n)); }
+    { let mut n = Float64Node::new("pos_x");     n.comment = "X position".into();           player.children.push(Box::new(n)); }
+    { let mut n = Float64Node::new("pos_y");     n.comment = "Y position".into();           player.children.push(Box::new(n)); }
+    { let mut n = Float64Node::new("pos_z");     n.comment = "Z position".into();           player.children.push(Box::new(n)); }
+    { let mut n = Hex32Node::new("flags");       n.comment = "State flags (hex)".into();    player.children.push(Box::new(n)); }
+    { let mut n = Hex64Node::new("vtable");      n.comment = "vptr (hex)".into();           player.children.push(Box::new(n)); }
+    { let mut n = PointerNode::new("next");      n.comment = "Linked list next".into();     player.children.push(Box::new(n)); }
+    { let mut n = BoolNode::new("alive");        n.comment = "Is alive?".into();            player.children.push(Box::new(n)); }
+    { let mut n = UInt8Node::new("level");       n.comment = "Level (1-255)".into();        player.children.push(Box::new(n)); }
+    { let mut n = Utf8TextNode::new("name", 32); n.comment = "Name (UTF-8, 32 B)".into();  player.children.push(Box::new(n)); }
+    { let mut n = ArrayNode::new("inv_ids", 10, 4); n.comment = "10 x u32 item IDs".into(); player.children.push(Box::new(n)); }
+
     project.add_class(player);
     project
 }
 
-fn extra_demo_class() -> ClassNode {
-    use nemclass_model::node::builtins::{Int64Node, UInt32Node};
-
-    let mut class = ClassNode::new("EntityBase");
-    let mut id = UInt32Node::new("entity_id");
-    id.comment = "Unique entity ID".into();
-    class.children.push(Box::new(id));
-    let mut tick = Int64Node::new("last_tick");
-    tick.comment = "Last update tick".into();
-    class.children.push(Box::new(tick));
-    class
+/// A blank class for "Add class" in an open project.
+fn blank_class() -> ClassNode {
+    use nemclass_model::node::builtins::Int32Node;
+    let mut cls = ClassNode::new("NewClass");
+    cls.children.push(Box::new(Int32Node::new("field_0")));
+    cls
 }
