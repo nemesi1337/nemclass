@@ -1,0 +1,15 @@
+[package]
+name = "reclass-rs"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["std", "alloc"]
+alloc = []
+std = []
+
+[dependencies]
+iced-x86 = { version = "1.21.0", features = ["default"] }
+bitflags = "2.4.0"
+obfstr = "0.4.3"
+libc = { version = "0.2.189" }
