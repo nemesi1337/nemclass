@@ -15,7 +15,9 @@
 //! tuple-struct newtype + associated const block instead of an `enum` keyword, which
 //! is safe for any integer value (including bit-flag sets).
 
-use super::{CodeGenerator, FieldKind, Language, PrimKind, resolve_fields, sanitize_ident};
+use std::collections::HashSet;
+
+use super::{CodeGenerator, FieldKind, Language, PrimKind, resolve_fields, resolved_class_size, sanitize_ident};
 use crate::node::registry::NodeRegistry;
 use crate::project::Project;
 
@@ -97,7 +99,9 @@ impl CodeGenerator for RustCodeGenerator {
         // Structs
         for class in project.classes_in_order() {
             let cname = sanitize_ident(&class.name);
-            let total_size = class.memory_size();
+            // Use resolved size so ClassInstance fields count their target's
+            // real byte width rather than the placeholder 0 from memory_size().
+            let total_size = resolved_class_size(class, project, &mut HashSet::new());
 
             out.push_str("#[repr(C)]\n");
             out.push_str(&format!("pub struct {cname}"));
@@ -138,8 +142,10 @@ impl CodeGenerator for RustCodeGenerator {
                         format!("    pub {}: [u8; {}],{}\n", f.name, len, comment_part)
                     }
                     FieldKind::Utf16Text(len) => {
-                        // Store as u16 array; len is byte count
-                        let char_count = len / 2;
+                        // Store as u16 array; len is byte count.
+                        // div_ceil so an odd byte length rounds up rather than
+                        // silently dropping the trailing byte.
+                        let char_count = len.div_ceil(2);
                         format!(
                             "    pub {}: [u16; {}],{}\n",
                             f.name, char_count, comment_part

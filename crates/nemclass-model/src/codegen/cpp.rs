@@ -12,7 +12,9 @@
 //! #pragma pack(pop)
 //! ```
 
-use super::{CodeGenerator, FieldKind, Language, PrimKind, resolve_fields, sanitize_ident};
+use std::collections::HashSet;
+
+use super::{CodeGenerator, FieldKind, Language, PrimKind, resolve_fields, resolved_class_size, sanitize_ident};
 use crate::node::registry::NodeRegistry;
 use crate::project::Project;
 
@@ -83,7 +85,9 @@ impl CodeGenerator for CppCodeGenerator {
 
         for class in project.classes_in_order() {
             let cname = sanitize_ident(&class.name);
-            let total_size = class.memory_size();
+            // Use resolved size so ClassInstance fields count their target's
+            // real byte width rather than the placeholder 0 from memory_size().
+            let total_size = resolved_class_size(class, project, &mut HashSet::new());
 
             // Class header
             out.push_str(&format!("class {cname}"));
@@ -126,8 +130,10 @@ impl CodeGenerator for CppCodeGenerator {
                         format!("    char {}[{}];{}\n", f.name, len, offset_comment)
                     }
                     FieldKind::Utf16Text(len) => {
-                        // len is byte count; each wchar_t is 2 bytes
-                        let char_count = len / 2;
+                        // len is byte count; each wchar_t is 2 bytes.
+                        // div_ceil so an odd byte length rounds up rather than
+                        // silently dropping the trailing byte.
+                        let char_count = len.div_ceil(2);
                         format!("    wchar_t {}[{}];{}\n", f.name, char_count, offset_comment)
                     }
                 };

@@ -17,6 +17,9 @@
 use super::{CodeGenerator, FieldKind, Language, PrimKind, resolve_fields, sanitize_ident};
 use crate::node::registry::NodeRegistry;
 use crate::project::Project;
+// Note: C# generator does not currently emit a sizeof assertion (C# structs with
+// `unsafe fixed` arrays require an `unsafe` context for Marshal.SizeOf). The
+// resolved total size is correct when read from resolve_fields offsets.
 
 pub struct CSharpCodeGenerator;
 
@@ -146,15 +149,17 @@ impl CodeGenerator for CSharpCodeGenerator {
                         ));
                     }
                     FieldKind::Utf16Text(len) => {
-                        // byte length → char count (2 bytes per UTF-16 unit)
-                        let char_count = len / 2;
-                        out.push_str(&format!(
-                            "    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = {char_count})]\n"
-                        ));
+                        // Emit as a raw byte array rather than a marshalled string.
+                        // Using ByValTStr under CharSet.Ansi would marshal 1 byte/char
+                        // (half the true width). A fixed byte array is unambiguous,
+                        // matches the C++/Rust treatment, and always compiles.
+                        // div_ceil so an odd byte length rounds up rather than
+                        // silently dropping the trailing byte.
+                        let byte_count = len.div_ceil(2) * 2; // keep even for UTF-16
                         out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
                         out.push_str(&format!(
-                            "    public readonly string {};{}\n",
-                            f.name, comment_part
+                            "    public unsafe fixed byte {}[{}];{} // UTF-16 LE\n",
+                            f.name, byte_count, comment_part
                         ));
                     }
                 }

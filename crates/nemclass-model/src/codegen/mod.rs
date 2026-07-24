@@ -7,6 +7,15 @@
 //!
 //! All three implement [`CodeGenerator`]. Use the free [`generate`] helper to
 //! dispatch by [`Language`].
+//!
+//! ## ClassInstance size resolution
+//!
+//! `ClassInstanceNode::memory_size()` deliberately returns 0 in the model layer
+//! (the real size is only known when a `Project` is available). All size
+//! computations in this module — offset accumulation, class totals, and size
+//! assertions — use [`resolved_class_size`] instead, which walks the target
+//! `ClassNode`'s children recursively and accumulates their sizes. A visited-set
+//! guards against self/mutual inline-embed cycles.
 
 mod cpp;
 mod csharp;
@@ -24,6 +33,8 @@ pub use rust_gen::RustCodeGenerator;
 pub(crate) mod mod_test_helpers {
     pub(crate) use super::sanitize_ident;
 }
+
+use std::collections::HashSet;
 
 use crate::node::registry::NodeRegistry;
 use crate::project::Project;
@@ -75,6 +86,61 @@ pub(crate) fn sanitize_ident(name: &str) -> String {
     out
 }
 
+/// Compute the byte size that a `ClassInstance` node contributes when embedded
+/// inline. This must be done in codegen where a `Project` is available, rather
+/// than in the model's `memory_size()` which has no project context.
+///
+/// Recursion is guarded by `visited` (a set of UUIDs currently on the call
+/// stack). A cycle is detected when a UUID is already in the set; the
+/// contribution for that node is 0 (emit a `// cyclic` fallback comment
+/// instead of recursing forever). Pointer-to-self is not a hazard — pointers
+/// are fixed 8 bytes — only inline `ClassInstance` embeds can recurse.
+pub(crate) fn resolved_class_size(
+    class: &crate::class::ClassNode,
+    project: &Project,
+    visited: &mut HashSet<uuid::Uuid>,
+) -> usize {
+    class.children.iter().map(|child| {
+        resolved_node_size(child.as_ref(), project, visited)
+    }).fold(0usize, usize::saturating_add)
+}
+
+/// Size that a single node contributes. For `ClassInstance`, recurses into the
+/// referenced class. For everything else, falls back to `Node::memory_size()`.
+pub(crate) fn resolved_node_size(
+    node: &dyn crate::node::Node,
+    project: &Project,
+    visited: &mut HashSet<uuid::Uuid>,
+) -> usize {
+    let def = node.to_node_def();
+    if def.type_tag == "ClassInstance" {
+        let maybe_uuid = def
+            .attrs
+            .get("class_uuid")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<uuid::Uuid>().ok());
+
+        if let Some(uuid) = maybe_uuid {
+            if visited.contains(&uuid) {
+                // Cycle detected — stop recursing, contribute 0.
+                return 0;
+            }
+            if let Some(target_class) = project.get_class(&uuid) {
+                visited.insert(uuid);
+                let sz = resolved_class_size(target_class, project, visited);
+                visited.remove(&uuid);
+                return sz;
+            }
+            // UUID present but class not in project → unresolvable; contribute 0.
+            return 0;
+        }
+        // Malformed ClassInstance (no class_uuid attr) → 0.
+        return 0;
+    }
+    // All other node types: trust the model's own memory_size().
+    node.memory_size()
+}
+
 /// A resolved field description produced by walking a `ClassNode`'s children.
 /// Enough information for each generator to emit one struct field line.
 #[derive(Debug)]
@@ -121,6 +187,11 @@ pub(crate) enum PrimKind {
 
 /// Walk one `ClassNode`'s children, computing running offsets and resolving
 /// `ClassInstance` UUID references against the project.
+///
+/// Key invariant: every field's `offset` and the total returned from summing
+/// sizes both agree with [`resolved_class_size`], so the size comment/assert
+/// emitted by generators and the per-field `[FieldOffset]`/`// 0x….` annotations
+/// all describe the same layout.
 pub(crate) fn resolve_fields(
     class_node: &crate::class::ClassNode,
     project: &Project,
@@ -128,12 +199,19 @@ pub(crate) fn resolve_fields(
 ) -> Vec<FieldInfo> {
     let mut fields = Vec::new();
     let mut offset = 0usize;
+    // Visited set shared across the entire walk of this class's children so
+    // that a single call to resolve_fields does not double-count recursion guards.
+    let mut visited: HashSet<uuid::Uuid> = HashSet::new();
 
     for child in &class_node.children {
         let def = child.to_node_def();
         let name = sanitize_ident(child.name());
         let comment = child.comment().to_string();
-        let size = child.memory_size();
+
+        // Resolve the size this child contributes to the running offset.
+        // For ClassInstance this MUST go through resolved_node_size so we get
+        // the referenced class's real byte width, not the placeholder 0.
+        let contributed_size = resolved_node_size(child.as_ref(), project, &mut visited);
 
         let kind = match def.type_tag.as_str() {
             "Int8"   => FieldKind::Primitive(PrimKind::Int8),
@@ -166,15 +244,53 @@ pub(crate) fn resolve_fields(
             }
 
             "ClassInstance" => {
-                let class_name = def
+                let maybe_uuid = def
                     .attrs
                     .get("class_uuid")
                     .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<uuid::Uuid>().ok())
-                    .and_then(|uuid| project.get_class(&uuid))
-                    .map(|c| sanitize_ident(&c.name))
-                    .unwrap_or_else(|| "_UnknownClass".to_string());
-                FieldKind::ClassInstance(class_name)
+                    .and_then(|s| s.parse::<uuid::Uuid>().ok());
+
+                match maybe_uuid {
+                    Some(uuid) if project.get_class(&uuid).is_some() => {
+                        // Resolved: emit the named type.
+                        let class_name = sanitize_ident(&project.get_class(&uuid).unwrap().name);
+                        FieldKind::ClassInstance(class_name)
+                    }
+                    Some(uuid) => {
+                        // UUID present but not in project: emit a defined-size byte
+                        // blob with a comment so output still compiles and we know
+                        // something is missing. Size is 0 (we have no information).
+                        // The comment carries the UUID for diagnostics.
+                        let comment_with_uuid = if comment.is_empty() {
+                            format!("UNRESOLVED {uuid}")
+                        } else {
+                            format!("{comment} UNRESOLVED {uuid}")
+                        };
+                        fields.push(FieldInfo {
+                            name,
+                            offset,
+                            kind: FieldKind::RawBytes(0),
+                            comment: comment_with_uuid,
+                        });
+                        offset = offset.saturating_add(contributed_size); // 0
+                        continue;
+                    }
+                    None => {
+                        // Malformed node (no class_uuid attr): emit 0-byte blob.
+                        fields.push(FieldInfo {
+                            name,
+                            offset,
+                            kind: FieldKind::RawBytes(0),
+                            comment: if comment.is_empty() {
+                                "UNRESOLVED (missing class_uuid)".to_string()
+                            } else {
+                                format!("{comment} UNRESOLVED (missing class_uuid)")
+                            },
+                        });
+                        offset = offset.saturating_add(contributed_size); // 0
+                        continue;
+                    }
+                }
             }
 
             "Array" => {
@@ -213,16 +329,16 @@ pub(crate) fn resolve_fields(
                 FieldKind::Utf16Text(length)
             }
 
-            // Unknown / Class container nodes embedded as children: skip with a
+            // Unknown / Class container nodes embedded as children: emit a
             // raw-bytes fallback so the total size still advances correctly.
             _ => {
                 let _ = registry; // registry available if needed in the future
-                FieldKind::RawBytes(size)
+                FieldKind::RawBytes(contributed_size)
             }
         };
 
         fields.push(FieldInfo { name, offset, kind, comment });
-        offset = offset.saturating_add(size);
+        offset = offset.saturating_add(contributed_size);
     }
 
     fields

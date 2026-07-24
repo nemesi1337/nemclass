@@ -23,16 +23,18 @@ fn registry() -> NodeRegistry {
 
 /// Build a realistic test project:
 /// - enum `Status` (4-byte, not flags): Active=0, Inactive=1
-/// - class `Vec3`: Float x, Float y, Float z (12 bytes)
+/// - class `Vec3`: Float x, Float y, Float z (12 bytes total)
 /// - class `Entity`:
-///     - Int32 health (4 bytes, offset 0)
-///     - Float speed (4 bytes, offset 4)
-///     - Pointer p_next to Entity (8 bytes, offset 8)
-///     - ClassInstance pos -> Vec3 (0 bytes in model sense, but inline)
-///     - Array inventory 10x4 (40 bytes)
-///     - Hex32 _pad (4 bytes raw)
-///     - Utf8Text name 32 (32 bytes)
-///     - Utf16Text wname 32 (32 bytes, = 16 wchar_t)
+///     - Int32 health    (4 bytes,  offset 0x00)
+///     - Float speed     (4 bytes,  offset 0x04)
+///     - Pointer p_next  (8 bytes,  offset 0x08)
+///     - ClassInstance pos → Vec3 (12 bytes resolved, offset 0x10)
+///     - Array inventory 10×4 (40 bytes, offset 0x1C)
+///     - Hex32 _pad      (4 bytes,  offset 0x44)
+///     - Utf8Text name   (32 bytes, offset 0x48)
+///     - Utf16Text wname (32 bytes, offset 0x68)
+///
+/// Total: 4+4+8+12+40+4+32+32 = 136 = 0x88
 fn make_project() -> (Project, NodeRegistry, Uuid, Uuid) {
     let reg = registry();
     let mut project = Project::new("Test");
@@ -129,9 +131,11 @@ fn cpp_struct_fields() {
 fn cpp_static_assert_and_size_comment() {
     let (proj, reg, _, _) = make_project();
     let out = generate(Language::Cpp, &proj, &reg);
-    // Entity: 4+4+8+0+40+4+32+32 = 124 = 0x7C
-    assert!(out.contains("static_assert(sizeof(Entity) == 0x7C)"), "bad static_assert: {out}");
-    assert!(out.contains("//Size: 0x007C"), "missing size comment: {out}");
+    // Entity: 4+4+8+12+40+4+32+32 = 136 = 0x88
+    // Vec3's 12 bytes are resolved from the referenced ClassNode, not
+    // from ClassInstanceNode::memory_size() which returns 0 by design.
+    assert!(out.contains("static_assert(sizeof(Entity) == 0x88)"), "bad static_assert: {out}");
+    assert!(out.contains("//Size: 0x0088"), "missing size comment: {out}");
 }
 
 #[test]
@@ -273,9 +277,11 @@ fn rust_utf16_text_as_u16_array() {
 fn rust_size_assert() {
     let (proj, reg, _, _) = make_project();
     let out = generate(Language::Rust, &proj, &reg);
-    // Entity total: 4+4+8+0+40+4+32+32 = 124 = 0x7C
+    // Entity total: 4+4+8+12+40+4+32+32 = 136 = 0x88
+    // Vec3's 12 bytes are resolved from the referenced ClassNode, not
+    // from ClassInstanceNode::memory_size() which returns 0 by design.
     assert!(
-        out.contains("assert!(std::mem::size_of::<Entity>() == 0x7C)"),
+        out.contains("assert!(std::mem::size_of::<Entity>() == 0x88)"),
         "missing size assert: {out}"
     );
 }
@@ -376,4 +382,149 @@ fn sanitize_ident_replaces_bad_chars() {
     assert_eq!(sanitize_ident("123abc"), "_123abc");
     assert_eq!(sanitize_ident(""), "_unnamed");
     assert_eq!(sanitize_ident("valid_name"), "valid_name");
+}
+
+// ---------------------------------------------------------------------------
+// ClassInstance size-resolution correctness
+// ---------------------------------------------------------------------------
+
+/// The field AFTER a ClassInstance must be at offset = (sum of all prior fields
+/// including the ClassInstance's resolved size). Vec3 is 12 bytes, so `pos`
+/// occupies 0x10..0x1C and `inventory` must start at 0x1C.
+#[test]
+fn cpp_offset_after_class_instance_is_resolved() {
+    let (proj, reg, _, _) = make_project();
+    let out = generate(Language::Cpp, &proj, &reg);
+    // pos (Vec3, 12 bytes) should be at offset 0x0010
+    assert!(out.contains("//0x0010"), "pos not at 0x0010: {out}");
+    // inventory (40 bytes) should be at offset 0x001C (= 0x10 + 12)
+    assert!(out.contains("//0x001C"), "inventory not at 0x001C: {out}");
+}
+
+#[test]
+fn rust_offset_after_class_instance_is_resolved() {
+    let (proj, reg, _, _) = make_project();
+    let out = generate(Language::Rust, &proj, &reg);
+    // pos (Vec3, 12 bytes) at 0x0010
+    assert!(out.contains("// 0x0010"), "pos not at 0x0010: {out}");
+    // inventory at 0x001C
+    assert!(out.contains("// 0x001C"), "inventory not at 0x001C: {out}");
+}
+
+// ---------------------------------------------------------------------------
+// Missing-target ClassInstance — output must still compile (no dangling type)
+// ---------------------------------------------------------------------------
+
+/// When a ClassInstance references a UUID not present in the Project, we must
+/// NOT emit an undefined type name. Instead a 0-byte raw-bytes blob with a
+/// // UNRESOLVED comment is emitted so the output is at least syntactically
+/// valid (a zero-element array is still legal C++/Rust/C#).
+#[test]
+fn missing_class_instance_target_emits_fallback_cpp() {
+    let reg = registry();
+    let mut proj = Project::new("P");
+
+    let ghost_uuid = Uuid::new_v4(); // never added to project
+    let cls_uuid = Uuid::new_v4();
+    let mut cls = ClassNode::with_uuid(cls_uuid, "HasGhost");
+    cls.children.push(Box::new(Int32Node::new("before")));
+    cls.children.push(Box::new(ClassInstanceNode::new("ghost", ghost_uuid)));
+    cls.children.push(Box::new(Int32Node::new("after")));
+    proj.add_class(cls);
+
+    let cpp = generate(Language::Cpp, &proj, &reg);
+
+    // Must NOT contain the dangling undefined type
+    assert!(!cpp.contains("_UnknownClass"), "must not emit _UnknownClass: {cpp}");
+    // Must contain the UNRESOLVED annotation
+    assert!(cpp.contains("UNRESOLVED"), "must contain UNRESOLVED: {cpp}");
+    // 'before' and 'after' must still be present and well-formed
+    assert!(cpp.contains("int32_t before;"), "missing before: {cpp}");
+    assert!(cpp.contains("int32_t after;"), "missing after: {cpp}");
+    // 'after' offset must be 4 (before=4, ghost=0) — not a junk value
+    assert!(cpp.contains("//0x0004"), "after offset wrong: {cpp}");
+}
+
+#[test]
+fn missing_class_instance_target_emits_fallback_rust() {
+    let reg = registry();
+    let mut proj = Project::new("P");
+
+    let ghost_uuid = Uuid::new_v4();
+    let cls_uuid = Uuid::new_v4();
+    let mut cls = ClassNode::with_uuid(cls_uuid, "HasGhost");
+    cls.children.push(Box::new(Int32Node::new("before")));
+    cls.children.push(Box::new(ClassInstanceNode::new("ghost", ghost_uuid)));
+    cls.children.push(Box::new(Int32Node::new("after")));
+    proj.add_class(cls);
+
+    let rs = generate(Language::Rust, &proj, &reg);
+
+    assert!(!rs.contains("_UnknownClass"), "must not emit _UnknownClass: {rs}");
+    assert!(rs.contains("UNRESOLVED"), "must contain UNRESOLVED: {rs}");
+    assert!(rs.contains("pub before: i32,"), "missing before: {rs}");
+    assert!(rs.contains("pub after: i32,"), "missing after: {rs}");
+    // 'after' at offset 4 (before=4, ghost contributes 0)
+    assert!(rs.contains("// 0x0004"), "after offset wrong: {rs}");
+}
+
+// ---------------------------------------------------------------------------
+// Self-referential ClassInstance cycle — must terminate, not stack-overflow
+// ---------------------------------------------------------------------------
+
+/// A class that contains a ClassInstance pointing at itself is a cycle.
+/// resolved_class_size must detect this via the visited set and stop,
+/// emitting a fallback 0-byte placeholder rather than recursing forever.
+#[test]
+fn self_referential_class_instance_terminates() {
+    let reg = registry();
+    let mut proj = Project::new("P");
+
+    let self_uuid = Uuid::new_v4();
+    let mut cls = ClassNode::with_uuid(self_uuid, "Cyclic");
+    cls.children.push(Box::new(Int32Node::new("value")));
+    // Self-embed: Cyclic contains a ClassInstance that references Cyclic itself.
+    cls.children.push(Box::new(ClassInstanceNode::new("self_ref", self_uuid)));
+    proj.add_class(cls);
+
+    // Must not stack-overflow or hang. We just verify it terminates and emits
+    // something syntactically plausible.
+    for lang in [Language::Cpp, Language::CSharp, Language::Rust] {
+        let out = generate(lang, &proj, &reg);
+        assert!(out.contains("Cyclic"), "lang {lang:?} missing Cyclic: {out}");
+        // value field must be present
+        match lang {
+            Language::Cpp   => assert!(out.contains("int32_t value;"), "missing value field: {out}"),
+            Language::CSharp => assert!(out.contains("public readonly int value;"), "missing value field: {out}"),
+            Language::Rust  => assert!(out.contains("pub value: i32,"), "missing value field: {out}"),
+        }
+    }
+}
+
+/// Mutual cycle: A embeds B, B embeds A.  Must terminate.
+#[test]
+fn mutual_class_instance_cycle_terminates() {
+    let reg = registry();
+    let mut proj = Project::new("P");
+
+    let uuid_a = Uuid::new_v4();
+    let uuid_b = Uuid::new_v4();
+
+    let mut cls_a = ClassNode::with_uuid(uuid_a, "CyclicA");
+    cls_a.children.push(Box::new(Int32Node::new("a_val")));
+    cls_a.children.push(Box::new(ClassInstanceNode::new("b_ref", uuid_b)));
+
+    let mut cls_b = ClassNode::with_uuid(uuid_b, "CyclicB");
+    cls_b.children.push(Box::new(Int32Node::new("b_val")));
+    cls_b.children.push(Box::new(ClassInstanceNode::new("a_ref", uuid_a)));
+
+    proj.add_class(cls_a);
+    proj.add_class(cls_b);
+
+    // Must not recurse forever
+    for lang in [Language::Cpp, Language::Rust] {
+        let out = generate(lang, &proj, &reg);
+        assert!(out.contains("CyclicA"), "missing CyclicA: {out}");
+        assert!(out.contains("CyclicB"), "missing CyclicB: {out}");
+    }
 }
