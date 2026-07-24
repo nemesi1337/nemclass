@@ -13,17 +13,19 @@
 use std::collections::HashMap;
 
 use crate::internal::process::{
-    Module, Process, ProcessEntry, ProcessIterator, Section,
+    Module, Pid, Process, ProcessEntry, Section,
 };
 
 #[cfg(target_os = "linux")]
 use crate::internal::process::{
+    ProcessIterator,
     SectionType,
     kernel::KernelBackend,
 };
 
 /// Name of the default, built-in provider registered by
-/// [`ProviderRegistry::default`].
+/// [`ProviderRegistry::default`] on Linux.
+#[cfg(target_os = "linux")]
 pub const LINUX_NATIVE: &str = "linux-native";
 
 /// Name of the privileged, kernel-module-backed provider registered by
@@ -31,6 +33,12 @@ pub const LINUX_NATIVE: &str = "linux-native";
 /// `/dev/nemclass` (bypassing ptrace/Yama) instead of `process_vm_readv`.
 #[cfg(target_os = "linux")]
 pub const LINUX_KERNEL: &str = "linux-kernel";
+
+/// Name of the default, built-in provider registered by
+/// [`ProviderRegistry::default`] on Windows: the native
+/// `ReadProcessMemory`/`WriteProcessMemory` backend. Mirrors [`LINUX_NATIVE`].
+#[cfg(windows)]
+pub const WINDOWS_NATIVE: &str = "windows-native";
 
 /// Platform lifecycle above raw memory IO: process enumeration, opening a target
 /// (into a [`Process`] backed by a [`crate::MemoryBackend`]), and enumerating
@@ -47,13 +55,13 @@ pub trait ProcessProvider {
 
     /// Opens the process `pid`, returning a [`Process`] whose typed reads/writes
     /// go through this provider's [`crate::MemoryBackend`].
-    fn open(&self, pid: libc::pid_t) -> crate::Result<Process>;
+    fn open(&self, pid: Pid) -> crate::Result<Process>;
 
     /// Enumerates the target's memory [`Section`]s and loaded [`Module`]s
     /// (ReClass.NET's `EnumerateRemoteSectionsAndModules`).
     fn enumerate_sections_and_modules(
         &self,
-        pid: libc::pid_t,
+        pid: Pid,
     ) -> crate::Result<(Vec<Section>, Vec<Module>)>;
 }
 
@@ -74,13 +82,13 @@ impl ProcessProvider for LinuxProvider {
         Ok(ProcessIterator::new()?.collect())
     }
 
-    fn open(&self, pid: libc::pid_t) -> crate::Result<Process> {
+    fn open(&self, pid: Pid) -> crate::Result<Process> {
         Process::attach(pid)
     }
 
     fn enumerate_sections_and_modules(
         &self,
-        pid: libc::pid_t,
+        pid: Pid,
     ) -> crate::Result<(Vec<Section>, Vec<Module>)> {
         // Open a handle so module sizing can read PE headers (Wine `SizeOfImage`).
         let process = Process::attach(pid)?;
@@ -121,7 +129,7 @@ impl ProcessProvider for KernelProvider {
         Ok(ProcessIterator::new()?.collect())
     }
 
-    fn open(&self, pid: libc::pid_t) -> crate::Result<Process> {
+    fn open(&self, pid: Pid) -> crate::Result<Process> {
         // Opens `/dev/nemclass`; surfaces `DeviceUnavailable` if not loaded.
         let backend = KernelBackend::open(pid)?;
         Ok(Process::from_backend(pid, Box::new(backend)))
@@ -129,7 +137,7 @@ impl ProcessProvider for KernelProvider {
 
     fn enumerate_sections_and_modules(
         &self,
-        pid: libc::pid_t,
+        pid: Pid,
     ) -> crate::Result<(Vec<Section>, Vec<Module>)> {
         // Sections come from the module's VMA enumeration (kernel-side, so it
         // works where `/proc/<pid>/maps` is inaccessible). The ABI's region
@@ -193,9 +201,9 @@ impl ProviderRegistry {
 impl Default for ProviderRegistry {
     /// A registry pre-loaded with the platform's native provider — on Linux, the
     /// `"linux-native"` [`LinuxProvider`] plus the privileged, kernel-module
-    /// `"linux-kernel"` [`KernelProvider`] fallback. On other platforms it is
-    /// empty until a provider is registered (a Windows provider slots in here
-    /// later).
+    /// `"linux-kernel"` [`KernelProvider`] fallback; on Windows, the
+    /// `"windows-native"` [`WindowsProvider`] (`ReadProcessMemory`/`OpenProcess`).
+    /// On any other platform it is empty until a provider is registered.
     ///
     /// The kernel provider is registered even when the module is not loaded:
     /// registration only names it, and `KernelProvider::open` reports
@@ -207,6 +215,10 @@ impl Default for ProviderRegistry {
         {
             registry.register(Box::new(LinuxProvider));
             registry.register(Box::new(KernelProvider));
+        }
+        #[cfg(windows)]
+        {
+            registry.register(Box::new(super::WindowsProvider));
         }
         registry
     }
@@ -241,7 +253,7 @@ mod tests {
     /// clear message rather than fail.
     #[test]
     fn self_attach_typed_io_round_trip() {
-        let pid = std::process::id() as libc::pid_t;
+        let pid = std::process::id() as Pid;
         let provider = LinuxProvider;
         let process = provider.open(pid).expect("open self");
 

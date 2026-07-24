@@ -105,6 +105,9 @@ mod tests {
         assert!(rx.read() && !rx.write() && rx.execute());
     }
 
+    // `to_os`/`from_os` are `#[cfg(unix)]` (they map to/from POSIX `PROT_*`
+    // integers), so this round-trip test is unix-only too.
+    #[cfg(unix)]
     #[test]
     fn os_round_trip_preserves_rwx() {
         let p = Protection::RWX;

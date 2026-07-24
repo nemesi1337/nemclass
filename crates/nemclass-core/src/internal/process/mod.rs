@@ -8,6 +8,14 @@ mod provider;
 #[cfg(target_os = "linux")]
 mod windows;
 
+// Native Windows memory backend + provider (`ReadProcessMemory`, `OpenProcess`,
+// `VirtualQueryEx`, ...). Speaks the Win32 API via `windows-sys`, so it is
+// Windows-only — the shared `MemoryBackend`/`ProcessProvider` seams stay
+// platform-neutral, and this is the `#[cfg(windows)]` mirror of the Linux
+// `IovecProcessMemoryBackend`/`LinuxProvider`.
+#[cfg(windows)]
+mod win_backend;
+
 // Client for the `nemclass_mod` kernel char device: a privileged memory backend
 // plus a non-ptrace debugger. Speaks a Linux ioctl ABI, so it is Linux-only —
 // the shared `MemoryBackend` seam stays platform-neutral for a Windows backend.
@@ -18,7 +26,9 @@ pub mod kernel;
 // Windows backend tomorrow), so it is always compiled and publicly exposed.
 pub mod pe;
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
 pub use iter::*;
 pub use types::*;
@@ -30,7 +40,13 @@ pub use memory::MemoryBackend;
 #[cfg(target_os = "linux")]
 pub use kernel::{Event, KernelBackend, KernelClient, PtraceStatus};
 
+// The native Windows backend/provider (`ReadProcessMemory` etc.). Compiled only
+// on Windows so the Linux build never sees `windows-sys`.
+#[cfg(windows)]
+pub use win_backend::{WindowsBackend, WindowsProvider};
+
 use crate::Error;
+#[cfg(target_os = "linux")]
 use crate::internal::process::memory::IovecProcessMemoryBackend;
 
 /// A handle to an opened target process: its [`ProcessEntry`] identity plus the
@@ -39,13 +55,13 @@ use crate::internal::process::memory::IovecProcessMemoryBackend;
 /// Construct one with [`Process::attach`] (opens the default Linux backend) or,
 /// for a specific backend, via [`crate::ProcessProvider::open`].
 pub struct Process {
-    pid: libc::pid_t,
+    pid: Pid,
     backend: Box<dyn MemoryBackend>,
 }
 
 impl Process {
     /// Builds a `Process` from an already-opened backend. Used by providers.
-    pub(crate) fn from_backend(pid: libc::pid_t, backend: Box<dyn MemoryBackend>) -> Self {
+    pub(crate) fn from_backend(pid: Pid, backend: Box<dyn MemoryBackend>) -> Self {
         Process { pid, backend }
     }
 
@@ -55,7 +71,7 @@ impl Process {
     /// This does not stop the target or verify liveness up front — a dead or
     /// inaccessible pid surfaces on the first read/write as an [`Error`].
     #[cfg(target_os = "linux")]
-    pub fn attach(pid: libc::pid_t) -> crate::Result<Self> {
+    pub fn attach(pid: Pid) -> crate::Result<Self> {
         Ok(Process::from_backend(
             pid,
             Box::new(IovecProcessMemoryBackend::new(pid)),
@@ -63,11 +79,12 @@ impl Process {
     }
 
     /// The process id this handle is attached to.
-    pub fn pid(&self) -> libc::pid_t {
+    pub fn pid(&self) -> Pid {
         self.pid
     }
 
     /// Returns full path to the process.
+    #[cfg(target_os = "linux")]
     pub fn path(&self) -> crate::Result<String> {
         Ok(fs::read_link(format!("/proc/{}/exe", self.pid))
             .map_err(|_| Error::ProcessDied)?
@@ -76,6 +93,7 @@ impl Process {
     }
 
     /// Returns the name of the process
+    #[cfg(target_os = "linux")]
     pub fn name(&self) -> crate::Result<String> {
         Ok(fs::read_link(format!("/proc/{}/exe", self.pid))
             .map_err(|_| Error::ProcessDied)?
@@ -163,6 +181,7 @@ impl Process {
 
     /// Enumerates the target's loaded modules, aggregating the many
     /// `/proc/<pid>/maps` mappings of one image into a single base/size/name.
+    #[cfg(target_os = "linux")]
     pub fn modules(&self) -> crate::Result<impl Iterator<Item = ModuleInfoWithName>> {
         let s = fs::read_to_string(format!("/proc/{}/maps", self.pid))
             .map_err(|_| crate::Error::ProcessDied)?;
@@ -200,6 +219,7 @@ impl Process {
 ///   distinct). The reported base is the mapping at file offset 0 (the PE
 ///   headers / true image base), falling back to the lowest mapping. Modules are
 ///   returned in first-seen order.
+#[cfg(target_os = "linux")]
 fn parse_maps_modules(maps: &str) -> Vec<RawModule> {
     struct Acc {
         name: String,
@@ -277,6 +297,7 @@ fn parse_maps_modules(maps: &str) -> Vec<RawModule> {
 /// (ReClass.NET's `EnumerateRemoteSectionData`): file-backed mappings are
 /// [`SectionType::Image`] and carry their module file name; anonymous mappings
 /// are [`SectionType::Mapped`]. Sections are returned in `maps` order.
+#[cfg(target_os = "linux")]
 fn parse_maps_sections(maps: &str) -> Vec<Section> {
     let mut out = Vec::new();
 
@@ -325,7 +346,7 @@ fn parse_maps_sections(maps: &str) -> Vec<Section> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

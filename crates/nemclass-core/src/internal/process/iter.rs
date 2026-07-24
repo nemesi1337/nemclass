@@ -1,8 +1,17 @@
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use crate::internal::process::ProcessEntry;
+#[cfg(target_os = "linux")]
 use crate::internal::process::windows::windows_exe_name;
 
+/// An iterator over the system's processes as [`ProcessEntry`]s.
+///
+/// The constructor ([`ProcessIterator::new`]) is a Linux `/proc` walk and is
+/// therefore `#[cfg(target_os = "linux")]`; on Windows, process enumeration
+/// lives on [`crate::WindowsProvider`] via the Toolhelp snapshot API instead.
+/// The type itself stays platform-neutral so the crate-root re-export is stable.
 pub struct ProcessIterator(Box<dyn Iterator<Item = ProcessEntry>>);
 
 impl ProcessIterator {
@@ -13,6 +22,7 @@ impl ProcessIterator {
     /// vanish or can't be inspected mid-iteration are skipped, not fatal — a
     /// process exiting between `readdir` and reading its `status`/`exe` is a
     /// routine race, so the iterator must never panic on it.
+    #[cfg(target_os = "linux")]
     pub fn new() -> crate::Result<Self> {
         fn get_parent_id(proc: &Path) -> Option<u32> {
             // The process may have exited between enumeration and this read, or be

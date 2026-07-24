@@ -25,6 +25,18 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 env_logger = "0.11"
 serde_json = "1"
+# Win32 bindings for the native Windows memory backend (nemclass-core, cfg(windows)
+# only). windows-sys is the raw-FFI crate (no wrappers) — smaller and faster to
+# build than the higher-level `windows` crate. Feature list = only the namespaces
+# the backend touches: process/module/memory enumeration + read/write.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
 # rustyscript wraps deno_core/v8 (the `scripting` feature of nemclass-script).
 # Heavy build — an optional dep, pinned. Enabled only via `--features scripting`.
 #

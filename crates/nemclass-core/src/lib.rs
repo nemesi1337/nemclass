@@ -9,11 +9,11 @@ pub use internal::{
     // Backend seam (raw IO) + platform provider seam.
     MemoryBackend,
     ProcessProvider,
-    LinuxProvider,
     ProviderRegistry,
     // Process handle + typed IO.
     Process,
     // Platform-neutral value types.
+    Pid,
     ProcessEntry,
     ModuleInfoWithName,
     MemoryRegion,
@@ -29,6 +29,15 @@ pub use internal::{
     // PE utilities (shared between Wine detection and a future Windows backend).
     pe,
 };
+
+// Native Linux provider (`process_vm_readv` + `/proc`), Linux-only.
+#[cfg(target_os = "linux")]
+pub use internal::LinuxProvider;
+
+// Native Windows backend + provider, the `#[cfg(windows)]` mirror of the Linux
+// native provider. Gated so non-Windows builds never pull in `windows-sys`.
+#[cfg(windows)]
+pub use internal::{WindowsBackend, WindowsProvider};
 
 // Kernel-module client, privileged backend/provider, and debugger types
 // (Linux-only): ptrace-free memory IO plus hardware breakpoints/uprobes over
@@ -48,6 +57,12 @@ pub enum Error {
     #[cfg(unix)]
     #[error("os error {0}: {msg}", msg = os_error_message(*.0))]
     Errno(i32),
+    /// A Win32 error code from a failing Windows API call (the value of
+    /// `GetLastError`, e.g. after a failed `OpenProcess`/`ReadProcessMemory`).
+    /// The `Errno` counterpart on the unix side.
+    #[cfg(windows)]
+    #[error("win32 error {code}: {msg}", msg = os_error_message(*code))]
+    WinApi { code: u32 },
     /// Specified process was not found.
     #[error("process not found")]
     ProcessNotFound,
@@ -81,6 +96,13 @@ fn os_error_message(errno: i32) -> String {
     std::io::Error::from_raw_os_error(errno).to_string()
 }
 
+/// Renders a Win32 error code to its system message for the `Display` impl
+/// above. `std::io` knows how to format a raw Windows error code.
+#[cfg(windows)]
+fn os_error_message(code: u32) -> String {
+    std::io::Error::from_raw_os_error(code as i32).to_string()
+}
+
 #[allow(missing_docs)]
 pub type Result<T> = result::Result<T, Error>;
 
@@ -94,5 +116,15 @@ impl Error {
         // SAFETY: `__errno_location` returns a valid, thread-local `*mut i32`
         // that libc guarantees is live for the current thread; we only read it.
         unsafe { Err(Error::Errno(*libc::__errno_location())) }
+    }
+
+    /// Captures the current thread's Win32 last-error as an [`Error::WinApi`].
+    /// The Windows counterpart of [`Error::last`].
+    #[cfg(windows)]
+    pub(crate) fn last_win32<T>() -> Result<T> {
+        // SAFETY: `GetLastError` is a thread-local read of the calling thread's
+        // last-error code; it has no preconditions and cannot fault.
+        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        Err(Error::WinApi { code })
     }
 }

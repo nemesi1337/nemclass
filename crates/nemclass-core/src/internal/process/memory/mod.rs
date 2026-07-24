@@ -1,5 +1,10 @@
+// The `process_vm_readv`/`writev` backend is Linux-only; on Windows the native
+// backend lives in `super::win_backend`. Gating the module keeps `libc::iovec`
+// and the `process_vm_*` syscalls out of the Windows build entirely.
+#[cfg(target_os = "linux")]
 mod iovec;
 
+#[cfg(target_os = "linux")]
 pub use iovec::*;
 
 /// Raw read/write IO on an already-opened target process.

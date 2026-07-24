@@ -15,3 +15,8 @@ obfstr.workspace = true
 libc.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
+
+# Native Windows backend (`ReadProcessMemory`/`OpenProcess`/...). Compiled only
+# on Windows targets, so the Linux build never sees `windows-sys`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

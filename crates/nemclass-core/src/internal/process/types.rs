@@ -1,5 +1,21 @@
 use crate::internal::process::Protection;
 
+/// A platform-neutral process id, used across the [`crate::ProcessProvider`] /
+/// [`crate::Process`] seam so the trait signatures don't hard-depend on
+/// `libc::pid_t` (which `libc` only defines on unix, not on Windows).
+///
+/// On unix this is exactly `libc::pid_t` (an `i32`), so existing callers that
+/// pass a `libc::pid_t` keep type-checking unchanged. On Windows it is an `i32`
+/// as well — wide enough to hold any real process id (a Win32 `DWORD` pid) — so
+/// the same providers/handles compile there with no signature churn.
+#[cfg(unix)]
+pub type Pid = libc::pid_t;
+
+/// See the unix definition above. Windows process ids are `DWORD` (`u32`) but the
+/// neutral seam keeps a single signed `i32` type; every real pid fits.
+#[cfg(not(unix))]
+pub type Pid = i32;
+
 #[derive(Debug, Clone)]
 pub struct MemoryRegion {
     /// Start
@@ -73,7 +89,8 @@ pub struct Section {
 }
 
 /// One module aggregated from `/proc/<pid>/maps`: its file name, image base and
-/// the end of its last mapping.
+/// the end of its last mapping. Linux-only (the `maps`-parsing internal type).
+#[cfg(target_os = "linux")]
 pub struct RawModule {
     pub name: String,
     pub base: usize,
