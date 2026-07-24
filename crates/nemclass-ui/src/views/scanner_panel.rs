@@ -53,6 +53,8 @@ pub struct ScannerPanel {
     compare:    ScanCompareType,
     /// The text in the value/needle field.
     needle_text: String,
+    /// Upper-bound text field, shown only when `compare == Between`.
+    upper_text: String,
 
     // ── active scanner (Linux: Option<Scanner<ProcessTarget>>) ─────────
     /// Boxed so it can be `None` on non-Linux, or before the first scan.
@@ -77,6 +79,7 @@ impl ScannerPanel {
             value_type:   ScanValueType::I32,
             compare:      ScanCompareType::Exact,
             needle_text:  String::new(),
+            upper_text:   String::new(),
             #[cfg(target_os = "linux")]
             scanner:      None,
             result_snapshot: Vec::new(),
@@ -194,6 +197,15 @@ impl ScannerPanel {
                         .desired_width(120.0)
                         .hint_text("value"),
                 );
+                // Second field: upper bound, visible only for Between.
+                if self.compare == ScanCompareType::Between {
+                    ui.label("to");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.upper_text)
+                            .desired_width(120.0)
+                            .hint_text("upper bound"),
+                    );
+                }
             }
         });
 
@@ -349,16 +361,38 @@ impl ScannerPanel {
 
     /// Parse the needle text for the current value type, storing an error
     /// message and returning `None` on failure.
+    ///
+    /// When the compare type is `Between`, also parses `upper_text` and
+    /// attaches it as the exclusive upper bound via [`Needle::with_upper_bound`].
+    /// A missing or empty upper-bound field is treated as a parse error so the
+    /// user always gets a meaningful two-sided range, never a silent `> value`.
     fn parse_needle(&mut self) -> Option<Needle> {
         if !self.compare.needs_needle() || self.needle_text.trim().is_empty() {
             return None;
         }
-        match self.value_type.parse_needle(&self.needle_text) {
-            Ok(n) => Some(n),
+        let needle = match self.value_type.parse_needle(&self.needle_text) {
+            Ok(n) => n,
             Err(e) => {
-                self.status_msg = Some(format!("Bad needle: {e}"));
-                None
+                self.status_msg = Some(format!("Bad value: {e}"));
+                return None;
             }
+        };
+        if self.compare == ScanCompareType::Between {
+            if self.upper_text.trim().is_empty() {
+                self.status_msg = Some(
+                    "Between requires an upper bound — fill in the \"to\" field.".into(),
+                );
+                return None;
+            }
+            match needle.with_upper_bound(&self.upper_text) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    self.status_msg = Some(format!("Bad upper bound: {e}"));
+                    None
+                }
+            }
+        } else {
+            Some(needle)
         }
     }
 
