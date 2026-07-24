@@ -35,6 +35,43 @@ pub struct ModuleInfoWithName {
     pub name: String,
 }
 
+/// A module in a target: a loaded image with a base, size and name. Alias of
+/// [`ModuleInfoWithName`] so the [`crate::ProcessProvider`] vocabulary
+/// (`Section`/`Module`) reads cleanly without duplicating the type.
+pub type Module = ModuleInfoWithName;
+
+/// Origin of a memory [`Section`] — mirrors ReClass.NET's `SectionType`, telling
+/// an image mapping (backed by a file / inode) apart from an anonymous mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionType {
+    /// Backed by a mapped file (has an inode) — part of a module image.
+    Image,
+    /// An anonymous mapping (heap, stack, private, ...).
+    Mapped,
+    /// Origin could not be determined.
+    Unknown,
+}
+
+/// One contiguous mapping in the target's address space: an address range, its
+/// protection, and — for file-backed mappings — the backing module's name.
+///
+/// This is the per-mapping "section" a [`crate::ProcessProvider`] enumerates
+/// (ReClass.NET's `EnumerateRemoteSectionData`). Distinct from [`Module`], which
+/// aggregates the sections of one image into a single base/size/name.
+#[derive(Debug, Clone)]
+pub struct Section {
+    /// Start address of the mapping.
+    pub base: usize,
+    /// Size of the mapping in bytes.
+    pub size: usize,
+    /// Protection flags for the mapping.
+    pub prot: Protection,
+    /// Whether the mapping is file-backed (image) or anonymous.
+    pub kind: SectionType,
+    /// Backing module file name for image sections; `None` for anonymous ones.
+    pub module: Option<String>,
+}
+
 /// One module aggregated from `/proc/<pid>/maps`: its file name, image base and
 /// the end of its last mapping.
 pub struct RawModule {

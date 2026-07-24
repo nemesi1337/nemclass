@@ -18,7 +18,7 @@ iced-x86 = { version = "1.21.0", features = ["default"] }
 bitflags = "2.4.0"
 obfstr = "0.4.3"
 libc = "0.2.189"
-bytemuck = { version = "1", features = ["derive"] }
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -16,7 +16,9 @@ pub struct InstructionData {
 }
 
 fn are_operands_static(instruction: &Instruction) -> bool {
-    // Check for unconditional and conditional branches
+    // Check for unconditional and conditional branches. Kept as nested `if`s
+    // (not collapsed) to mirror the two distinct conditions being reasoned about.
+    #[allow(clippy::collapsible_if)]
     if instruction.is_jcc_short_or_near() || instruction.is_jmp_short_or_near() {
         if instruction.len() < 5 {
             return true;
@@ -24,6 +26,12 @@ fn are_operands_static(instruction: &Instruction) -> bool {
     }
 
     for i in 0..instruction.op_count() {
+        // The final `_ =>` arm is a deliberate, defensive catch-all: `OpKind` is
+        // `#[non_exhaustive]`-in-spirit and iced-x86 adds variants across
+        // versions, so a future kind must default to "not static" rather than
+        // silently fall through. `unreachable_patterns` fires only because the
+        // current enum happens to be fully covered above.
+        #[allow(unreachable_patterns)]
         match instruction.op_kind(i) {
             // Static length operands
             OpKind::Register

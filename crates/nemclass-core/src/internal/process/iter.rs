@@ -13,7 +13,7 @@ impl ProcessIterator {
         fn get_parent_id(proc: &Path) -> u32 {
             let status = fs::read_to_string(proc.join("status")).unwrap();
 
-            let parent_id = status
+            status
                 .lines()
                 .find_map(|l: &str| {
                     if l.starts_with("PPid:") {
@@ -23,9 +23,7 @@ impl ProcessIterator {
                     }
                 })
                 .and_then(|p| p.parse::<u32>().ok())
-                .unwrap();
-
-            parent_id
+                .unwrap()
         }
 
         let iter = fs::read_dir("/proc")
@@ -43,10 +41,10 @@ impl ProcessIterator {
                 // wine64-preloader, ...), so every Wine game lists under the same
                 // useless name. Surface the actual Windows program it runs. Gate
                 // on the loader name so we only scan maps for likely candidates.
-                if name.to_ascii_lowercase().starts_with("wine") {
-                    if let Some(exe) = windows_exe_name(id) {
-                        name = format!("{name} ({exe})");
-                    }
+                if name.to_ascii_lowercase().starts_with("wine")
+                    && let Some(exe) = windows_exe_name(id)
+                {
+                    name = format!("{name} ({exe})");
                 }
 
                 Some(ProcessEntry {

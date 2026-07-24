@@ -78,3 +78,32 @@ impl Protection {
         Self::from_bits_truncate(prot as u8)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_maps_perm_strings() {
+        assert_eq!(Protection::parse("---"), Protection::empty());
+        assert_eq!(Protection::parse("r--"), Protection::R);
+        assert_eq!(Protection::parse("rw-"), Protection::RW);
+        assert_eq!(Protection::parse("r-x"), Protection::RX);
+        assert_eq!(Protection::parse("rwx"), Protection::RWX);
+    }
+
+    #[test]
+    fn accessor_predicates_match_bits() {
+        let rw = Protection::parse("rw-");
+        assert!(rw.read() && rw.write() && !rw.execute());
+
+        let rx = Protection::parse("r-x");
+        assert!(rx.read() && !rx.write() && rx.execute());
+    }
+
+    #[test]
+    fn os_round_trip_preserves_rwx() {
+        let p = Protection::RWX;
+        assert_eq!(Protection::from_os(p.to_os()), p);
+    }
+}
