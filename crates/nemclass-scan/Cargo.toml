@@ -1,0 +1,8 @@
+[package]
+name = "nemclass-scan"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nemclass-core.workspace = true
+bytemuck.workspace = true
