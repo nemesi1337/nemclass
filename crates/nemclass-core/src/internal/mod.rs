@@ -9,5 +9,11 @@ pub use process::{
     ProcessIterator, ProcessProvider, Protection, ProviderRegistry, Section, SectionType, pe,
 };
 
+// Kernel-device client + privileged backend/provider (Linux-only). Speaks the
+// `nemclass_mod` ioctl ABI over `/dev/nemclass` for ptrace-free memory IO and
+// the non-ptrace debugger; the `kernel` module holds the `#[repr(C)]` ABI.
+#[cfg(target_os = "linux")]
+pub use process::{Event, KernelBackend, KernelClient, KernelProvider, PtraceStatus, kernel};
+
 // Disassembler wrapper (iced-x86) — consumed by the future scanner/host APIs.
 pub use decoder::{InstructionData, disassemble_instructions};

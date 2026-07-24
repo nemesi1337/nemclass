@@ -16,9 +16,21 @@ use crate::internal::process::{
     Module, Process, ProcessEntry, ProcessIterator, Section,
 };
 
+#[cfg(target_os = "linux")]
+use crate::internal::process::{
+    SectionType,
+    kernel::KernelBackend,
+};
+
 /// Name of the default, built-in provider registered by
 /// [`ProviderRegistry::default`].
 pub const LINUX_NATIVE: &str = "linux-native";
+
+/// Name of the privileged, kernel-module-backed provider registered by
+/// [`ProviderRegistry::default`] on Linux. Reads/writes go through
+/// `/dev/nemclass` (bypassing ptrace/Yama) instead of `process_vm_readv`.
+#[cfg(target_os = "linux")]
+pub const LINUX_KERNEL: &str = "linux-kernel";
 
 /// Platform lifecycle above raw memory IO: process enumeration, opening a target
 /// (into a [`Process`] backed by a [`crate::MemoryBackend`]), and enumerating
@@ -81,6 +93,71 @@ impl ProcessProvider for LinuxProvider {
     }
 }
 
+/// Privileged Linux provider backed by the `nemclass_mod` kernel char device.
+///
+/// Enumeration reuses `/proc` (process listing) exactly like [`LinuxProvider`];
+/// the difference is [`open`](ProcessProvider::open), which wires the target's
+/// [`Process`] to a [`KernelBackend`] so reads/writes go through the module
+/// (bypassing ptrace/Yama) instead of `process_vm_readv`. Opening fails with
+/// [`crate::Error::DeviceUnavailable`] when the module is not loaded, so a UI
+/// can offer this as a higher-privilege fallback and fall back to
+/// `"linux-native"` when it is absent.
+///
+/// The kernel-side debugger (hardware breakpoints / uprobes) lives on
+/// [`KernelBackend::client`], reachable via the opened [`Process`]'s backend;
+/// it is not part of the [`ProcessProvider`] contract.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KernelProvider;
+
+#[cfg(target_os = "linux")]
+impl ProcessProvider for KernelProvider {
+    fn name(&self) -> &str {
+        LINUX_KERNEL
+    }
+
+    fn enumerate_processes(&self) -> crate::Result<Vec<ProcessEntry>> {
+        // Process discovery is a `/proc` walk regardless of the IO backend.
+        Ok(ProcessIterator::new()?.collect())
+    }
+
+    fn open(&self, pid: libc::pid_t) -> crate::Result<Process> {
+        // Opens `/dev/nemclass`; surfaces `DeviceUnavailable` if not loaded.
+        let backend = KernelBackend::open(pid)?;
+        Ok(Process::from_backend(pid, Box::new(backend)))
+    }
+
+    fn enumerate_sections_and_modules(
+        &self,
+        pid: libc::pid_t,
+    ) -> crate::Result<(Vec<Section>, Vec<Module>)> {
+        // Sections come from the module's VMA enumeration (kernel-side, so it
+        // works where `/proc/<pid>/maps` is inaccessible). The ABI's region
+        // record carries no backing-file name, so every section is classified
+        // `Mapped` with no module — module aggregation stays with the native
+        // `/proc/<pid>/maps` path (`Process::modules`), used here for parity.
+        let backend = KernelBackend::open(pid)?;
+        let sections = backend
+            .client()
+            .enum_regions(pid)?
+            .into_iter()
+            .map(|r| Section {
+                base: r.from,
+                size: r.to.saturating_sub(r.from),
+                prot: r.prot,
+                kind: SectionType::Mapped,
+                module: None,
+            })
+            .collect();
+
+        // Reuse the well-tested `/proc/<pid>/maps` module aggregation (Wine PE
+        // sizing and all) for the module list.
+        let process = Process::attach(pid)?;
+        let modules = process.modules()?.collect();
+        Ok((sections, modules))
+    }
+}
+
 /// Registry mapping a backend name to a boxed [`ProcessProvider`], so a UI can
 /// list and select backends. [`ProviderRegistry::default`] pre-registers the
 /// `"linux-native"` provider on Linux.
@@ -115,12 +192,22 @@ impl ProviderRegistry {
 
 impl Default for ProviderRegistry {
     /// A registry pre-loaded with the platform's native provider — on Linux, the
-    /// `"linux-native"` [`LinuxProvider`]. On other platforms it is empty until a
-    /// provider is registered (a Windows provider slots in here later).
+    /// `"linux-native"` [`LinuxProvider`] plus the privileged, kernel-module
+    /// `"linux-kernel"` [`KernelProvider`] fallback. On other platforms it is
+    /// empty until a provider is registered (a Windows provider slots in here
+    /// later).
+    ///
+    /// The kernel provider is registered even when the module is not loaded:
+    /// registration only names it, and `KernelProvider::open` reports
+    /// [`crate::Error::DeviceUnavailable`] so a UI can probe availability and
+    /// fall back to `"linux-native"`.
     fn default() -> Self {
         let mut registry = Self::new();
         #[cfg(target_os = "linux")]
-        registry.register(Box::new(LinuxProvider));
+        {
+            registry.register(Box::new(LinuxProvider));
+            registry.register(Box::new(KernelProvider));
+        }
         registry
     }
 }
@@ -135,6 +222,16 @@ mod tests {
         assert!(registry.get(LINUX_NATIVE).is_some());
         assert_eq!(registry.get(LINUX_NATIVE).unwrap().name(), LINUX_NATIVE);
         assert!(registry.get("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn default_registry_has_kernel_fallback() {
+        // The privileged kernel provider is always registered (its `open` fails
+        // gracefully when the module is absent), so it can be offered as a
+        // higher-privilege fallback in the backend picker.
+        let registry = ProviderRegistry::default();
+        assert!(registry.get(LINUX_KERNEL).is_some());
+        assert_eq!(registry.get(LINUX_KERNEL).unwrap().name(), LINUX_KERNEL);
     }
 
     /// Live typed read/write against *our own* memory. A process may always

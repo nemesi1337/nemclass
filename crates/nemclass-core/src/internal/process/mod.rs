@@ -8,6 +8,12 @@ mod provider;
 #[cfg(target_os = "linux")]
 mod windows;
 
+// Client for the `nemclass_mod` kernel char device: a privileged memory backend
+// plus a non-ptrace debugger. Speaks a Linux ioctl ABI, so it is Linux-only —
+// the shared `MemoryBackend` seam stays platform-neutral for a Windows backend.
+#[cfg(target_os = "linux")]
+pub mod kernel;
+
 // PE header parsing is platform-neutral (used by Wine detection today, a future
 // Windows backend tomorrow), so it is always compiled and publicly exposed.
 pub mod pe;
@@ -19,6 +25,10 @@ pub use types::*;
 pub use protection::*;
 pub use provider::*;
 pub use memory::MemoryBackend;
+
+// The kernel-device client and its privileged backend/provider (Linux-only).
+#[cfg(target_os = "linux")]
+pub use kernel::{Event, KernelBackend, KernelClient, PtraceStatus};
 
 use crate::Error;
 use crate::internal::process::memory::IovecProcessMemoryBackend;

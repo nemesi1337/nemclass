@@ -30,6 +30,12 @@ pub use internal::{
     pe,
 };
 
+// Kernel-module client, privileged backend/provider, and debugger types
+// (Linux-only): ptrace-free memory IO plus hardware breakpoints/uprobes over
+// the `nemclass_mod` char device. Gated so non-Linux builds stay clean.
+#[cfg(target_os = "linux")]
+pub use internal::{Event, KernelBackend, KernelClient, KernelProvider, PtraceStatus, kernel};
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     /// The address could not be translated / was outside a valid mapping.
@@ -60,6 +66,13 @@ pub enum Error {
     /// A short transfer: fewer bytes were read/written than requested.
     #[error("partial memory transfer: {actual} of {requested} bytes")]
     PartialTransfer { requested: usize, actual: usize },
+    /// The `nemclass` kernel char device (`/dev/nemclass`) could not be opened —
+    /// the module is not loaded, or the caller lacks permission on the node.
+    #[error("kernel device unavailable: {0}")]
+    DeviceUnavailable(String),
+    /// The kernel module reports an ABI revision this client does not speak.
+    #[error("kernel ABI mismatch: module reports {found}, client expects {expected}")]
+    AbiMismatch { expected: u32, found: u32 },
 }
 
 /// Renders an errno to its libc message for the `Display` impl above.
