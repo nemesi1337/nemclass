@@ -284,7 +284,7 @@ impl NemclassApp {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Untitled".into()),
         );
-        create_project_at(&dir, &new_project, &self.node_registry)
+        create_project_at(&dir, &new_project, &self.node_registry, false)
             .map_err(|e| format!("New project failed: {e}"))?;
         let project_name = new_project.name.clone();
         self.replace_project(new_project, Some(dir.clone()));
@@ -325,14 +325,12 @@ impl NemclassApp {
         }
     }
 
-    /// Execute the Save As action: save to a new directory.
+    /// Execute the Save As action: save the current project to a chosen
+    /// directory, scaffolding it like New (dirs + package.json/tsconfig/
+    /// nemclass.d.ts). Overwrites any existing `project.nemclass` there — the
+    /// directory was explicitly chosen, so overwrite is intended.
     fn exec_save_as(&mut self, dir: PathBuf) -> Result<(), String> {
-        // If the directory doesn't exist yet, create it.
-        if !dir.exists() {
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("Cannot create directory: {e}"))?;
-        }
-        save_project_to(&dir, &self.project, &self.node_registry)
+        create_project_at(&dir, &self.project, &self.node_registry, true)
             .map_err(|e| format!("Save As failed: {e}"))?;
         let dir_display = dir.display().to_string();
         self.project_dir = Some(dir);

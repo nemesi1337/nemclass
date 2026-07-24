@@ -6,9 +6,10 @@
 //! A v8 isolate — and therefore `rustyscript::Runtime` — is **single-threaded and
 //! `!Send`**. So [`RustyScriptEngine`] owns a **dedicated OS thread** that
 //! constructs and drives the `Runtime` for its whole lifetime. The public handle
-//! is `Send + Sync`: it holds only a [`std::sync::mpsc::Sender`] of [`Command`]s
-//! plus the worker's [`JoinHandle`]. Every [`ScriptEngine`] method turns into a
-//! command on that channel; [`Drop`] sends [`Command::Shutdown`] and joins.
+//! is `Send` (owned by one thread — its [`std::sync::mpsc::Receiver`] field makes
+//! it `!Sync`): it holds channel ends plus the worker's [`JoinHandle`]. Every
+//! [`ScriptEngine`] method turns into a command on that channel; [`Drop`] sends
+//! [`Command::Shutdown`] and joins.
 //!
 //! Event payloads are already `serde`-serializable ([`crate::events`]), so they
 //! cross into JS as `serde_json::Value` via `json_args!`.
@@ -37,11 +38,13 @@
 //!
 //! We resolve this by the **document-and-error** strategy (rather than a
 //! re-entrant select on the main thread): the worker sets a *resolving* flag for
-//! the duration of a `tryResolveClassAddress` call, and any host-function request
-//! raised while that flag is set returns an **error to JS immediately** instead
-//! of round-tripping to the (blocked) main thread. Host functions are therefore
-//! *unavailable inside the resolver* — a resolver that calls one gets a clear
-//! JS exception, never a hang. This keeps the main-thread wait a simple blocking
+//! the duration of a `tryResolveClassAddress` call. Any *replying* host function
+//! (`pattern_scan`/`declare_type`/`declare_class`) raised while that flag is set
+//! returns an **error to JS immediately** instead of round-tripping to the
+//! (blocked) main thread — a resolver that calls one gets a clear JS exception,
+//! never a hang. `log` is fire-and-forget (it never awaits a reply), so it can't
+//! deadlock; it is simply **deferred** until the resolve returns and the next
+//! frame pumps. This keeps the main-thread wait a simple blocking
 //! `recv()` with no re-entrancy, which is trivially deadlock-free. The `.d.ts`
 //! documents the restriction (`tryResolveClassAddress` note).
 
@@ -186,8 +189,9 @@ enum Command {
     Shutdown,
 }
 
-/// The `RustyScriptEngine` public handle: `Send + Sync`, lives on the UI/bus
-/// thread, and proxies to a dedicated v8 worker thread.
+/// The `RustyScriptEngine` public handle: `Send` (owned by one thread — the
+/// `host_rx` [`Receiver`] field makes it `!Sync`), lives on the UI/bus thread,
+/// and proxies to a dedicated v8 worker thread.
 pub struct RustyScriptEngine {
     /// Command channel to the worker.
     tx: Sender<Command>,

@@ -29,8 +29,30 @@ pub const PROJECT_FILE: &str = "project.nemclass";
 /// - `<dir>/tsconfig.json`     (via `write_script_scaffold`)
 /// - `<dir>/nemclass.d.ts`     (via `write_script_scaffold`)
 ///
+/// When `overwrite` is `false`, refuses (with [`io::ErrorKind::AlreadyExists`])
+/// to run if `<dir>/project.nemclass` already exists — so "New" can't silently
+/// destroy an existing project's class layout. Pass `true` only for an explicit
+/// "Save As" into a chosen directory.
+///
 /// Returns `Ok(())` on success, or the first IO/serialisation error encountered.
-pub fn create_project_at(dir: &Path, project: &Project, registry: &NodeRegistry) -> io::Result<()> {
+pub fn create_project_at(
+    dir: &Path,
+    project: &Project,
+    registry: &NodeRegistry,
+    overwrite: bool,
+) -> io::Result<()> {
+    // Guard against clobbering an existing project's model on an accidental New.
+    let project_file = dir.join(PROJECT_FILE);
+    if !overwrite && project_file.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists — open it, or choose an empty directory",
+                project_file.display()
+            ),
+        ));
+    }
+
     // Create directory structure.
     fs::create_dir_all(dir)?;
     fs::create_dir_all(dir.join("src"))?;
@@ -130,7 +152,7 @@ mod tests {
         let registry = make_registry();
         let project = make_project();
 
-        create_project_at(dir.path(), &project, &registry).expect("create");
+        create_project_at(dir.path(), &project, &registry, false).expect("create");
 
         // The expected files must exist.
         assert!(dir.path().join(PROJECT_FILE).exists(), "project.nemclass missing");
@@ -155,7 +177,7 @@ mod tests {
         let registry = make_registry();
         let project = make_project();
 
-        create_project_at(dir.path(), &project, &registry).expect("create");
+        create_project_at(dir.path(), &project, &registry, false).expect("create");
 
         // Modify and save.
         let mut modified = make_project();
@@ -172,11 +194,25 @@ mod tests {
         let registry = make_registry();
         let project = make_project();
 
-        create_project_at(dir.path(), &project, &registry).expect("create");
+        create_project_at(dir.path(), &project, &registry, false).expect("create");
 
         let file = dir.path().join(PROJECT_FILE);
         let (loaded, loaded_dir) = load_project_from(&file, &registry).expect("load from file");
         assert_eq!(loaded.name, "TestProject");
         assert_eq!(loaded_dir, dir.path());
+    }
+
+    #[test]
+    fn new_refuses_to_clobber_existing_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = make_registry();
+        let project = make_project();
+        create_project_at(dir.path(), &project, &registry, false).expect("first create");
+        // A second New (overwrite=false) over the same dir must refuse rather
+        // than silently destroy the existing project's class layout.
+        let err = create_project_at(dir.path(), &project, &registry, false).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // An explicit overwrite (Save As) still succeeds.
+        create_project_at(dir.path(), &project, &registry, true).expect("overwrite ok");
     }
 }
