@@ -5,12 +5,11 @@ edition.workspace = true
 
 [features]
 default = []
-# rustyscript / deno_core (v8) engine is wired in M2. Heavy build — opt-in only.
-# Kept intentionally EMPTY for M1: enabling it must still compile today, so the
-# M2 `RustyScriptEngine` slots in behind this flag without touching any
-# bus / engine / host-API contract. When M2 lands it becomes:
-#   scripting = ["dep:rustyscript"]
-scripting = []
+# rustyscript / deno_core (v8) engine (M2). Heavy build (prebuilt v8 download +
+# long compile) — opt-in only. Pulls in the optional `rustyscript` + `serde_json`
+# deps; the default build has no v8 dependency. The M2 `RustyScriptEngine` slots
+# in behind this flag without touching any bus / engine / host-API contract.
+scripting = ["dep:rustyscript", "dep:serde_json"]
 # A trivial compile-time plugin (`ExamplePlugin`) that proves the `Plugin`
 # seam end-to-end. Off by default so the crate stays lean.
 example-plugin = []
@@ -21,3 +20,12 @@ nemclass-model.workspace = true
 serde.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+# M2 (behind `scripting`): the v8 engine + JSON for the JS boundary.
+rustyscript = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+# The scripting integration test's mock HostApi references model types.
+nemclass-model.workspace = true
+uuid.workspace = true
