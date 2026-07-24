@@ -7,6 +7,28 @@ use crate::serialize::NodeDef;
 pub type NodeConstructor = fn() -> Box<dyn Node>;
 pub type NodeDeserializer = fn(NodeDef, &NodeRegistry) -> Result<Box<dyn Node>>;
 
+/// Maximum node-tree nesting accepted when deserializing from (untrusted) TOML.
+/// Bounds the recursive `deserialize_node_inner` below so a crafted/corrupt
+/// project file errors instead of overflowing the stack. (Extremely deep input
+/// could still overflow `toml`'s own parser upstream in `Project::from_toml`;
+/// this guard covers our own recursion, which was previously unbounded.)
+const MAX_NODE_DEPTH: usize = 128;
+
+/// Measures the deepest nesting in `def` iteratively (explicit stack — so the
+/// check itself can't overflow) and rejects trees past [`MAX_NODE_DEPTH`].
+fn check_node_depth(def: &NodeDef) -> Result<()> {
+    let mut stack = vec![(def, 1usize)];
+    while let Some((d, depth)) = stack.pop() {
+        if depth > MAX_NODE_DEPTH {
+            return Err(ModelError::MaxDepthExceeded(MAX_NODE_DEPTH));
+        }
+        for child in &d.nodes {
+            stack.push((child, depth + 1));
+        }
+    }
+    Ok(())
+}
+
 pub struct NodeRegistry {
     entries: HashMap<&'static str, (NodeConstructor, NodeDeserializer)>,
 }
@@ -49,7 +71,16 @@ impl NodeRegistry {
         def
     }
 
+    /// Public entry: bounds the tree depth once (against untrusted input), then
+    /// deserializes. Recursive re-entry goes through [`Self::deserialize_node_inner`]
+    /// so the depth scan runs a single time, not per subtree.
     pub fn deserialize_node(&self, def: NodeDef) -> Result<Box<dyn Node>> {
+        check_node_depth(&def)?;
+        self.deserialize_node_inner(def)
+    }
+
+    /// Recursive core (depth already bounded by [`Self::deserialize_node`]).
+    pub(crate) fn deserialize_node_inner(&self, def: NodeDef) -> Result<Box<dyn Node>> {
         let tag = def.type_tag.clone();
         match self.entries.get(tag.as_str()) {
             Some((_, de)) => de(def, self),
@@ -180,7 +211,16 @@ fn register_builtins(reg: &mut NodeRegistry) {
             let uuid_str = def.attrs.get("uuid")
                 .and_then(|v| if let TV::String(s) = v { Some(s.as_str()) } else { None })
                 .unwrap_or("");
-            let uuid = uuid_str.parse::<Uuid>().unwrap_or_else(|_| Uuid::new_v4());
+            // Empty = a genuinely new class (mint a fresh id). A PRESENT but
+            // malformed uuid is an error, not a silently-minted random identity
+            // (which would break cross-class references).
+            let uuid = if uuid_str.is_empty() {
+                Uuid::new_v4()
+            } else {
+                uuid_str.parse::<Uuid>().map_err(|e| {
+                    ModelError::DeserializeError(format!("bad class node uuid '{uuid_str}': {e}"))
+                })?
+            };
             let address_formula = def.attrs.get("address_formula")
                 .and_then(|v| if let TV::String(s) = v { Some(s.clone()) } else { None })
                 .unwrap_or_default();
@@ -188,7 +228,8 @@ fn register_builtins(reg: &mut NodeRegistry) {
             class.comment = def.comment;
             class.address_formula = address_formula;
             for child_def in def.nodes {
-                class.children.push(reg.deserialize_node(child_def)?);
+                // Depth already bounded by the public entry point.
+                class.children.push(reg.deserialize_node_inner(child_def)?);
             }
             Ok(Box::new(class))
         }

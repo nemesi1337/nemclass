@@ -72,18 +72,18 @@ fn render_uint8() {
 
 #[test]
 fn render_float32() {
-    let val: f32 = 3.14;
+    let val: f32 = 1.25;
     let buf = val.to_le_bytes();
     let r = Float32Node::new("x").render(&buf, 0);
-    assert!(r.value.starts_with("3.14"), "got: {}", r.value);
+    assert!(r.value.starts_with("1.25"), "got: {}", r.value);
 }
 
 #[test]
 fn render_float64() {
-    let val: f64 = 2.718281828;
+    let val: f64 = 9.75;
     let buf = val.to_le_bytes();
     let r = Float64Node::new("x").render(&buf, 0);
-    assert!(r.value.starts_with("2.718"), "got: {}", r.value);
+    assert!(r.value.starts_with("9.75"), "got: {}", r.value);
 }
 
 #[test]
@@ -395,4 +395,46 @@ fn remove_unreferenced_class_succeeds() {
     let removed = project.remove_class(&uuid).unwrap();
     assert_eq!(removed.name, "Solo");
     assert!(project.get_class(&uuid).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Hardening against malformed / hostile input (review findings M1, M2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn array_memory_size_saturates_instead_of_panicking() {
+    // count * element_size would overflow usize; saturating_mul clamps (no panic).
+    let n = ArrayNode::new("", usize::MAX, 4);
+    assert_eq!(n.memory_size(), usize::MAX);
+}
+
+#[test]
+fn deserialize_rejects_overdeep_tree_instead_of_overflowing() {
+    use crate::error::ModelError;
+    use crate::serialize::NodeDef;
+    use std::collections::HashMap;
+
+    // Build a Class-node chain far deeper than MAX_NODE_DEPTH (128), iteratively
+    // so the test itself never recurses.
+    fn class_def(child: Option<NodeDef>) -> NodeDef {
+        NodeDef {
+            type_tag: "Class".to_string(),
+            name: "n".to_string(),
+            comment: String::new(),
+            attrs: HashMap::new(),
+            nodes: child.into_iter().collect(),
+        }
+    }
+    let mut def = class_def(None);
+    for _ in 0..300 {
+        def = class_def(Some(def));
+    }
+
+    let reg = NodeRegistry::new().with_builtins();
+    // Note: `matches!` (not `unwrap_err`) — the Ok type `Box<dyn Node>` is not `Debug`.
+    let result = reg.deserialize_node(def);
+    assert!(
+        matches!(result, Err(ModelError::MaxDepthExceeded(_))),
+        "expected MaxDepthExceeded"
+    );
 }

@@ -2129,6 +2129,7 @@ dependencies = [
  "nemclass-core",
  "nemclass-model",
  "serde",
+ "thiserror 2.0.19",
  "uuid",
 ]
 

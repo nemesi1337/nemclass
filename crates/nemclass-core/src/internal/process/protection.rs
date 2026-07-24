@@ -36,44 +36,35 @@ impl Protection {
         self.contains(Self::X)
     }
 
-    /// Parses string of kind `r-x`.
-    /// # Panics
-    /// * `s.len()` isn't 3.
-    /// * s\[0\] != r | -
-    /// * s\[1\] != w | -
-    /// * s\[2\] != x | -
+    /// Parses a permission string of kind `r-x` (as found in `/proc/<pid>/maps`).
+    ///
+    /// Lenient by design: this parses external kernel text, so it never panics.
+    /// Each of the first three bytes sets its bit iff it is `r`/`w`/`x`
+    /// respectively; anything else (`-`, a missing byte, a trailing `p`/`s`
+    /// sharing flag) simply leaves that bit clear.
     pub fn parse(s: &str) -> Self {
-        assert!(
-            s.len() == 3
-                && s.is_ascii()
-                && s.chars()
-                .all(|c| c == '-' || c == 'r' || c == 'w' || c == 'x')
-        );
-
+        let b = s.as_bytes();
         let mut prot = Self::empty();
-        if s.as_bytes()[0] == b'r' {
+        if b.first() == Some(&b'r') {
             prot |= Self::R;
         }
-
-        if s.as_bytes()[1] == b'w' {
+        if b.get(1) == Some(&b'w') {
             prot |= Self::W;
         }
-
-        if s.as_bytes()[2] == b'x' {
+        if b.get(2) == Some(&b'x') {
             prot |= Self::X;
         }
-
         prot
     }
-    
+
     /// Converts to os protection type.
-    #[cfg(all(unix, feature = "std"))]
+    #[cfg(unix)]
     pub const fn to_os(&self) -> i32 {
         self.bits() as i32
     }
 
     /// Converts from os protection type.
-    #[cfg(all(unix, feature = "std"))]
+    #[cfg(unix)]
     pub const fn from_os(prot: i32) -> Self {
         Self::from_bits_truncate(prot as u8)
     }
@@ -90,6 +81,19 @@ mod tests {
         assert_eq!(Protection::parse("rw-"), Protection::RW);
         assert_eq!(Protection::parse("r-x"), Protection::RX);
         assert_eq!(Protection::parse("rwx"), Protection::RWX);
+    }
+
+    #[test]
+    fn parse_is_lenient_on_malformed_input() {
+        // Parses external kernel text, so it must never panic on short/odd input.
+        assert_eq!(Protection::parse(""), Protection::empty());
+        assert_eq!(Protection::parse("r"), Protection::R);
+        assert_eq!(Protection::parse("rw"), Protection::RW);
+        // The maps perms field is 4 chars ("rwxp"/"r-xp"); only the first 3 count.
+        assert_eq!(Protection::parse("rwxp"), Protection::RWX);
+        assert_eq!(Protection::parse("r-xp"), Protection::RX);
+        // Unknown characters leave their bit clear.
+        assert_eq!(Protection::parse("???"), Protection::empty());
     }
 
     #[test]

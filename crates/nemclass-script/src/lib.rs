@@ -36,5 +36,7 @@ pub mod plugin;
 pub use bus::{EventBus, Subscriber};
 pub use engine::{EngineSubscriber, HostFn, NoopEngine, ScriptEngine};
 pub use events::{ClassAddressQuery, CustomPayload, Event, GlobalVariable};
-pub use host_api::{PatternScan, TypeDeclare, find_pattern, scan_module};
+pub use host_api::{
+    PatternError, PatternScan, TypeDeclare, find_pattern, scan_module, try_find_pattern,
+};
 pub use plugin::{Plugin, PluginHost, PluginRegistry, register_builtin_plugins};

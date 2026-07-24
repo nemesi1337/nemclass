@@ -20,6 +20,8 @@ pub enum ModelError {
     CycleDetected,
     #[error("buffer too small: need {need} bytes at offset {offset}, got {got}")]
     BufferTooSmall { need: usize, offset: usize, got: usize },
+    #[error("node nesting exceeds the maximum depth of {0}")]
+    MaxDepthExceeded(usize),
 }
 
 pub type Result<T> = std::result::Result<T, ModelError>;

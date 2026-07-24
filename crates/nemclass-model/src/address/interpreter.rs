@@ -47,8 +47,10 @@ pub fn evaluate(
             Ok(evaluate(lhs, modules, reader)? % divisor)
         }
         Expr::Negate(inner) => {
-            let v = evaluate(inner, modules, reader)? as i64;
-            Ok((-v) as usize)
+            // `wrapping_neg` (two's complement) to match the other ops and avoid a
+            // debug-build panic on i64::MIN; negating an address is unusual but
+            // formula resolution must never crash on it.
+            Ok(evaluate(inner, modules, reader)?.wrapping_neg())
         }
         Expr::Deref(inner) => {
             let addr = evaluate(inner, modules, reader)?;

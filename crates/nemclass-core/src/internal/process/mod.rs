@@ -98,6 +98,11 @@ impl Process {
     /// backend call (chunked to `IOV_MAX` under the hood).
     pub fn read_batch<T: bytemuck::Pod>(&self, addresses: &[usize]) -> crate::Result<Vec<T>> {
         let size = core::mem::size_of::<T>();
+        // A zero-sized `T` transfers nothing; return one value per address rather
+        // than letting the chunking below silently collapse to an empty `Vec`.
+        if size == 0 {
+            return Ok(vec![T::zeroed(); addresses.len()]);
+        }
         // Back the batch with one flat byte buffer, then split it into per-value
         // sub-slices to hand the backend as `(address, &mut [u8])` regions.
         let mut bytes = vec![0u8; size * addresses.len()];
@@ -120,6 +125,15 @@ impl Process {
             .chunks(size.max(1))
             .map(bytemuck::pod_read_unaligned::<T>)
             .collect())
+    }
+
+    /// Bulk-reads bytes starting at `address` into `buf` in a single backend
+    /// call (one `process_vm_readv` on Linux). Returns the number of bytes read,
+    /// which may be short if the region is partly unmapped. Prefer this over
+    /// per-byte [`Process::read`]/[`Process::read_batch`] when snapshotting a
+    /// whole class/struct region for display.
+    pub fn read_buf(&self, address: usize, buf: &mut [u8]) -> crate::Result<usize> {
+        self.backend.read_buf(address, buf)
     }
 
     /// Writes a single `T` to `address`. A short write is reported as

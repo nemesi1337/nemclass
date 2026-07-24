@@ -7,11 +7,17 @@ pub struct ProcessIterator(Box<dyn Iterator<Item = ProcessEntry>>);
 
 impl ProcessIterator {
     /// Creates new iterator over all processes in the system.
+    ///
     /// # Unix
-    /// Always returns Ok(I).
+    /// Returns `Err` only if `/proc` itself cannot be read. Individual PIDs that
+    /// vanish or can't be inspected mid-iteration are skipped, not fatal — a
+    /// process exiting between `readdir` and reading its `status`/`exe` is a
+    /// routine race, so the iterator must never panic on it.
     pub fn new() -> crate::Result<Self> {
-        fn get_parent_id(proc: &Path) -> u32 {
-            let status = fs::read_to_string(proc.join("status")).unwrap();
+        fn get_parent_id(proc: &Path) -> Option<u32> {
+            // The process may have exited between enumeration and this read, or be
+            // a kernel entry without a parseable `PPid:` — either way, drop it.
+            let status = fs::read_to_string(proc.join("status")).ok()?;
 
             status
                 .lines()
@@ -23,11 +29,9 @@ impl ProcessIterator {
                     }
                 })
                 .and_then(|p| p.parse::<u32>().ok())
-                .unwrap()
         }
 
-        let iter = fs::read_dir("/proc")
-            .unwrap()
+        let iter = fs::read_dir("/proc")?
             .flatten()
             .filter_map(|de| Some((de.file_name().to_str()?.parse::<u32>().ok()?, de)))
             .filter_map(|(id, de)| {
@@ -35,7 +39,8 @@ impl ProcessIterator {
 
                 let path = fs::read_link(entry.join("exe")).ok()?;
                 let mut name = path.file_name()?.to_str()?.to_owned();
-                let parent_id = get_parent_id(&entry);
+                // `?`: if the process died mid-scan its `status` is gone — skip it.
+                let parent_id = get_parent_id(&entry)?;
 
                 // A Wine process's ELF image is just the loader (wine-preloader,
                 // wine64-preloader, ...), so every Wine game lists under the same

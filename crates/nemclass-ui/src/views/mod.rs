@@ -800,18 +800,17 @@ fn is_editable(type_tag: &str) -> bool {
 
 /// Read `size` bytes from `addr` in the target process into a `Vec<u8>`.
 ///
-/// Uses `Process::read_batch::<u8>` (single batched iovec call) under the hood.
-/// On partial transfer or error the returned buffer is zeroed for the missing
-/// bytes (best-effort, non-panicking).
+/// Uses `Process::read_buf` — one `process_vm_readv` for the whole region (not
+/// one iovec per byte, which `read_batch::<u8>` would do). On partial transfer
+/// or error the returned buffer stays zeroed for the missing bytes (best-effort,
+/// non-panicking), so the view degrades gracefully on a partly-unmapped region.
 fn read_process_buf(proc: &Process, addr: usize, size: usize) -> Vec<u8> {
     if size == 0 {
         return Vec::new();
     }
-    let addrs: Vec<usize> = (0..size).map(|i| addr.wrapping_add(i)).collect();
-    match proc.read_batch::<u8>(&addrs) {
-        Ok(bytes) => bytes,
-        Err(_) => vec![0u8; size],
-    }
+    let mut buf = vec![0u8; size];
+    let _ = proc.read_buf(addr, &mut buf);
+    buf
 }
 
 // ---------------------------------------------------------------------------

@@ -234,7 +234,8 @@ impl Node for ArrayNode {
     fn set_name(&mut self, n: String) { self.name = n; }
     fn comment(&self) -> &str { &self.comment }
     fn set_comment(&mut self, c: String) { self.comment = c; }
-    fn memory_size(&self) -> usize { self.count * self.element_size }
+    // Saturating: count/element_size come from (untrusted) project files.
+    fn memory_size(&self) -> usize { self.count.saturating_mul(self.element_size) }
     fn children(&self) -> &[Box<dyn Node>] { &[] }
     fn children_mut(&mut self) -> Option<&mut Vec<Box<dyn Node>>> { None }
     fn render(&self, _buf: &[u8], _base_offset: usize) -> RenderedValue {

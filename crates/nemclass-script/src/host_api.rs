@@ -13,8 +13,8 @@ use nemclass_model::EnumDescription;
 /// IDA-style pattern scanning over a target module.
 ///
 /// The host implements this against a live [`nemclass_core::Process`]; scripts
-/// call it as `pattern_scan("game.exe", "48 8B ?? ??")`. Wildcards are `??` or a
-/// single `?` (either matches any byte); other tokens are two hex nibbles.
+/// call it as `pattern_scan("game.exe", "48 8B ?? ??")`. Tokens are two hex
+/// nibbles (`4A`), a full wildcard (`??`/`?`), or a nibble wildcard (`4?`/`?8`).
 pub trait PatternScan {
     /// Scans `module` for `pattern`, returning every absolute match address.
     ///
@@ -45,75 +45,109 @@ pub trait TypeDeclare {
     fn declare_class(&mut self, name: &str, address_formula: &str) -> CoreResult<()>;
 }
 
-/// One parsed pattern element: an exact byte or a wildcard.
+/// Why a pattern string could not be parsed. Lets callers tell a *malformed*
+/// pattern (a bug in the script) apart from a valid pattern that simply *did not
+/// match* — the two were previously indistinguishable (both an empty `Vec`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PatternError {
+    /// The pattern had no tokens.
+    #[error("empty pattern")]
+    Empty,
+    /// A token was neither a hex byte, a nibble-wildcard, nor `?`/`??`.
+    #[error("malformed pattern token: '{0}'")]
+    BadToken(String),
+}
+
+/// One parsed pattern element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatByte {
     /// Match this exact byte.
     Byte(u8),
     /// Match any byte (`??` / `?`).
     Any,
+    /// Match only the masked nibble (`4?` → value `0x40`, mask `0xF0`; `?8` →
+    /// value `0x08`, mask `0x0F`).
+    Nibble { value: u8, mask: u8 },
 }
 
-/// Parses an IDA-style pattern string (`"48 8B ?? ?? E8"`) into a mask.
+/// Parses one whitespace-separated token into a [`PatByte`].
 ///
-/// Accepted tokens (whitespace-separated):
-/// - two hex nibbles → an exact byte (`4A`, `0f`);
-/// - `??` or a single `?` → a wildcard byte.
-///
-/// Returns `None` on any malformed token (bad hex, wrong length) or an empty
-/// pattern, so callers can surface a clean error instead of scanning garbage.
-fn parse_pattern(pattern: &str) -> Option<Vec<PatByte>> {
-    let mut out = Vec::new();
-    for tok in pattern.split_whitespace() {
-        match tok {
-            "?" | "??" => out.push(PatByte::Any),
-            hex => {
-                if hex.len() != 2 {
-                    return None;
-                }
-                let byte = u8::from_str_radix(hex, 16).ok()?;
-                out.push(PatByte::Byte(byte));
-            }
-        }
+/// Accepted: two hex nibbles (`4A`, `0f`); `?`/`??` (any byte); a mixed
+/// nibble/wildcard (`4?`, `?8`). Anything else is a [`PatternError::BadToken`].
+fn parse_token(tok: &str) -> Result<PatByte, PatternError> {
+    if tok == "?" || tok == "??" {
+        return Ok(PatByte::Any);
     }
-    if out.is_empty() { None } else { Some(out) }
+    let b = tok.as_bytes();
+    if b.len() != 2 {
+        return Err(PatternError::BadToken(tok.to_string()));
+    }
+    let hi = (b[0] as char).to_digit(16);
+    let lo = (b[1] as char).to_digit(16);
+    match (hi, lo, b[0] == b'?', b[1] == b'?') {
+        (Some(h), Some(l), _, _) => Ok(PatByte::Byte(((h << 4) | l) as u8)),
+        (Some(h), None, _, true) => Ok(PatByte::Nibble { value: (h as u8) << 4, mask: 0xF0 }),
+        (None, Some(l), true, _) => Ok(PatByte::Nibble { value: l as u8, mask: 0x0F }),
+        _ => Err(PatternError::BadToken(tok.to_string())),
+    }
 }
 
-/// Finds every offset in `haystack` where `pattern` matches (IDA-style).
+/// Parses a full IDA-style pattern string (`"48 8B 4? ?? E8"`) into a mask,
+/// erroring on any malformed token or an empty pattern.
+fn parse_pattern_checked(pattern: &str) -> Result<Vec<PatByte>, PatternError> {
+    let out: Vec<PatByte> = pattern
+        .split_whitespace()
+        .map(parse_token)
+        .collect::<Result<_, _>>()?;
+    if out.is_empty() {
+        Err(PatternError::Empty)
+    } else {
+        Ok(out)
+    }
+}
+
+#[inline]
+fn pat_matches(p: &PatByte, b: u8) -> bool {
+    match *p {
+        PatByte::Byte(expected) => b == expected,
+        PatByte::Any => true,
+        PatByte::Nibble { value, mask } => (b & mask) == value,
+    }
+}
+
+/// Finds every offset in `haystack` where `pattern` matches, or a
+/// [`PatternError`] if the pattern itself is malformed.
 ///
-/// `pattern` is parsed by [`parse_pattern`]: hex bytes match exactly, `??`/`?`
-/// match any byte. Returns the byte offsets (relative to the start of
-/// `haystack`) of every match; a caller scanning a module adds the module base
-/// to turn these into absolute addresses (see [`scan_module`]). A malformed or
-/// empty pattern yields no matches.
-///
-/// This is deliberately a pure function over an in-memory buffer so it is cheap
-/// and fully testable without a live process.
-pub fn find_pattern(haystack: &[u8], pattern: &str) -> Vec<usize> {
-    let Some(pat) = parse_pattern(pattern) else {
-        return Vec::new();
-    };
+/// Prefer this over [`find_pattern`] when scanning a user/script-supplied
+/// pattern so a typo surfaces as an error instead of a silent empty result.
+pub fn try_find_pattern(haystack: &[u8], pattern: &str) -> Result<Vec<usize>, PatternError> {
+    let pat = parse_pattern_checked(pattern)?;
     if pat.len() > haystack.len() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-
     let mut matches = Vec::new();
     // Last start offset at which the pattern can still fit.
     let last = haystack.len() - pat.len();
     for start in 0..=last {
-        let window = &haystack[start..start + pat.len()];
-        let hit = window
+        let hit = haystack[start..start + pat.len()]
             .iter()
             .zip(&pat)
-            .all(|(&b, p)| match p {
-                PatByte::Any => true,
-                PatByte::Byte(expected) => b == *expected,
-            });
+            .all(|(&b, p)| pat_matches(p, b));
         if hit {
             matches.push(start);
         }
     }
-    matches
+    Ok(matches)
+}
+
+/// Lenient wrapper over [`try_find_pattern`]: a malformed/empty pattern yields
+/// no matches (rather than an error). Kept for callers that only care about the
+/// hit list; hex bytes match exactly, `??`/`?` match any byte, `4?`/`?8` match a
+/// single nibble. Offsets are relative to `haystack`; add the module base for
+/// absolute addresses (see [`scan_module`]). Pure over an in-memory buffer, so
+/// it is cheap and fully testable without a live process.
+pub fn find_pattern(haystack: &[u8], pattern: &str) -> Vec<usize> {
+    try_find_pattern(haystack, pattern).unwrap_or_default()
 }
 
 /// Thin adapter that turns [`find_pattern`] offsets into absolute addresses in a
@@ -210,5 +244,31 @@ mod tests {
         let base = 0x1400_0000;
         let hits = scan_module(base, HAYSTACK, "48 8B 05");
         assert_eq!(hits, vec![base, base + 7]);
+    }
+
+    #[test]
+    fn nibble_wildcards_match_masked_half_byte() {
+        // "4?" matches 0x40..=0x4F (0x48 qualifies) as the first byte.
+        assert_eq!(find_pattern(HAYSTACK, "4? 8B 05"), vec![0, 7]);
+        // "?B" matches the low nibble B (0x8B qualifies) as the second byte.
+        assert_eq!(find_pattern(HAYSTACK, "48 ?B 05"), vec![0, 7]);
+        // "0?" as the third byte matches 0x05 (offsets 0, 7) and 0x0D (offset 12).
+        assert_eq!(find_pattern(HAYSTACK, "48 8B 0?"), vec![0, 7, 12]);
+    }
+
+    #[test]
+    fn try_find_pattern_distinguishes_malformed_from_no_match() {
+        // Valid pattern, no match → Ok(empty), NOT an error.
+        assert_eq!(try_find_pattern(HAYSTACK, "DE AD BE EF"), Ok(vec![]));
+        // Malformed tokens → error (a script typo, not "no matches").
+        assert_eq!(
+            try_find_pattern(HAYSTACK, "48 ZZ"),
+            Err(PatternError::BadToken("ZZ".to_string()))
+        );
+        assert_eq!(
+            try_find_pattern(HAYSTACK, "48 8"),
+            Err(PatternError::BadToken("8".to_string()))
+        );
+        assert_eq!(try_find_pattern(HAYSTACK, ""), Err(PatternError::Empty));
     }
 }

@@ -33,7 +33,12 @@ impl ClassNode {
     }
 
     pub fn memory_size(&self) -> usize {
-        self.children.iter().map(|n| n.memory_size()).sum()
+        // Saturating: child sizes come from (untrusted) project files, so a bogus
+        // element/count must clamp rather than overflow-panic in debug builds.
+        self.children
+            .iter()
+            .map(|n| n.memory_size())
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Check if any child (recursively) references `target_uuid` as a ClassInstance or Pointer.
@@ -84,7 +89,12 @@ impl Node for ClassNode {
     fn set_comment(&mut self, c: String) { self.comment = c; }
 
     fn memory_size(&self) -> usize {
-        self.children.iter().map(|n| n.memory_size()).sum()
+        // Saturating: child sizes come from (untrusted) project files, so a bogus
+        // element/count must clamp rather than overflow-panic in debug builds.
+        self.children
+            .iter()
+            .map(|n| n.memory_size())
+            .fold(0usize, usize::saturating_add)
     }
 
     fn children(&self) -> &[Box<dyn Node>] { &self.children }

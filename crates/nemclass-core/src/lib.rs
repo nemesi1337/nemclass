@@ -73,7 +73,10 @@ pub type Result<T> = result::Result<T, Error>;
 
 impl Error {
     /// Captures the current thread's `errno` as an [`Error::Errno`].
-    #[cfg(all(unix, feature = "std"))]
+    // Gated on `unix` only (not the `std` feature): the callers in the iovec
+    // backend are `cfg(unix)`, so gating this on `feature = "std"` broke
+    // `--no-default-features` builds (the `alloc`-only tier the crate advertises).
+    #[cfg(unix)]
     pub(crate) fn last<T>() -> Result<T> {
         // SAFETY: `__errno_location` returns a valid, thread-local `*mut i32`
         // that libc guarantees is live for the current thread; we only read it.
