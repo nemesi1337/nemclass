@@ -44,9 +44,14 @@ pub use internal::{WindowsBackend, WindowsProvider};
 
 // Kernel-module client, privileged backend/provider, and debugger types
 // (Linux-only): ptrace-free memory IO plus hardware breakpoints/uprobes over
-// the `nemclass_mod` char device. Gated so non-Linux builds stay clean.
+// the `nemclass_mod` char device. The `Debugger` controller (attach → auth →
+// set bp → wait → inspect → clear) sits on top of `KernelClient`. Gated so
+// non-Linux builds stay clean.
 #[cfg(target_os = "linux")]
-pub use internal::{Event, KernelBackend, KernelClient, KernelProvider, PtraceStatus, kernel};
+pub use internal::{
+    Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Event, KernelBackend,
+    KernelClient, KernelProvider, PtraceStatus, Registers, kernel,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -91,6 +96,12 @@ pub enum Error {
     /// The kernel module reports an ABI revision this client does not speak.
     #[error("kernel ABI mismatch: module reports {found}, client expects {expected}")]
     AbiMismatch { expected: u32, found: u32 },
+    /// A caller supplied an argument the API rejects before any syscall (e.g. a
+    /// hardware-breakpoint length that is not 1/2/4/8, or clearing a breakpoint
+    /// id that was never armed). Distinct from an OS [`Error::Errno`]: this is
+    /// caught client-side so the caller learns of the misuse without a round-trip.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 /// Renders an errno to its libc message for the `Display` impl above.

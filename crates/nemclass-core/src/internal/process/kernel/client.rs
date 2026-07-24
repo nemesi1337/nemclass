@@ -433,6 +433,21 @@ impl KernelClient {
     pub fn into_file(self) -> File {
         self.file
     }
+
+    /// Builds a client over `/dev/null` for unit tests that exercise only pure
+    /// bookkeeping/decoding and must **never** issue an ioctl. The fd is a real,
+    /// owned [`File`] (so `Drop` is well-defined) but is not a nemclass device —
+    /// any accidental ioctl fails with an errno instead of hitting hardware.
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts_for_test() -> Self {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null for test client");
+        let fd = file.as_raw_fd();
+        KernelClient { file, fd }
+    }
 }
 
 /// A [`MemoryBackend`] that routes reads/writes through the kernel module for a

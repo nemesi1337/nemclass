@@ -7,8 +7,11 @@
 //!
 //! - [`abi`] mirrors the C UAPI header byte-for-byte (`#[repr(C)]` structs +
 //!   the `_IOC`-encoded request codes), with compile-time size assertions.
-//! - [`client`] wraps the device fd and drives every ioctl, exposing the memory
-//!   API, the debugger API, and the ptrace-interop queries.
+//! - [`client`] wraps the device fd and drives every ioctl, exposing the raw
+//!   memory API, the low-level debugger calls, and the ptrace-interop queries.
+//! - [`debugger`] is the ergonomic controller over [`client`]: it authenticates
+//!   the fd, keeps breakpoint bookkeeping (id → spec, list / clear), and decodes
+//!   raw events into a rich [`DebugEvent`] with named registers.
 //!
 //! Everything here is Linux-only (it speaks a Linux ioctl ABI over `/dev`), so
 //! the whole module is gated at the `process` level with
@@ -17,5 +20,7 @@
 
 pub mod abi;
 pub mod client;
+pub mod debugger;
 
 pub use client::{Event, KernelBackend, KernelClient, PtraceStatus, NEMCLASS_DEVICE};
+pub use debugger::{Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Registers};

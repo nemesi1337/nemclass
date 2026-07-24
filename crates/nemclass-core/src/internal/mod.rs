@@ -21,9 +21,13 @@ pub use process::{WindowsBackend, WindowsProvider};
 
 // Kernel-device client + privileged backend/provider (Linux-only). Speaks the
 // `nemclass_mod` ioctl ABI over `/dev/nemclass` for ptrace-free memory IO and
-// the non-ptrace debugger; the `kernel` module holds the `#[repr(C)]` ABI.
+// the non-ptrace debugger; the `kernel` module holds the `#[repr(C)]` ABI and
+// the `Debugger` controller layered over the client.
 #[cfg(target_os = "linux")]
-pub use process::{Event, KernelBackend, KernelClient, KernelProvider, PtraceStatus, kernel};
+pub use process::{
+    Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Event, KernelBackend,
+    KernelClient, KernelProvider, PtraceStatus, Registers, kernel,
+};
 
 // Disassembler wrapper (iced-x86) — consumed by the future scanner/host APIs.
 pub use decoder::{InstructionData, disassemble_instructions};

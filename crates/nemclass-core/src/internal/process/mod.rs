@@ -42,9 +42,13 @@ pub use provider::*;
 pub use memory::MemoryBackend;
 pub use symbols::Symbol;
 
-// The kernel-device client and its privileged backend/provider (Linux-only).
+// The kernel-device client and its privileged backend/provider (Linux-only),
+// plus the ergonomic debugger controller layered over the client.
 #[cfg(target_os = "linux")]
-pub use kernel::{Event, KernelBackend, KernelClient, PtraceStatus};
+pub use kernel::{
+    Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Event, KernelBackend,
+    KernelClient, PtraceStatus, Registers,
+};
 
 // The native Windows backend/provider (`ReadProcessMemory` etc.). Compiled only
 // on Windows so the Linux build never sees `windows-sys`.
