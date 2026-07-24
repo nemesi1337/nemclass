@@ -1,6 +1,15 @@
 //! nemclass-ui: egui/eframe views and widgets.
 //!
-//! The `eframe::App`, process picker, class/memory `TableBuilder` view, address
-//! bar, and value editing. No app lifecycle here — that is `nemclass-app`.
-//!
-//! WIP — implemented by the `ui-engineer` agent (M1 vertical slice).
+//! Implements the M1 vertical slice:
+//! - `NemclassApp` — `eframe::App` impl (the top-level app struct).
+//! - Left panel: backend selector, process list, attach, class list.
+//! - Central panel: `egui_extras::TableBuilder` memory view (virtualized rows).
+//! - Address bar: resolved via `resolve_formula` + `ProcessReader` wrapper.
+//! - Live reads throttled via `ctx.request_repaint_after`; graceful error states.
+//! - Value editing writes back via `Process::write`.
+//! - EventBus integration: publishes `OnAttach`/`OnDetach`.
+
+mod process_reader;
+mod views;
+
+pub use views::NemclassApp;

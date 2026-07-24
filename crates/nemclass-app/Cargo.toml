@@ -12,3 +12,6 @@ nemclass-core.workspace = true
 nemclass-model.workspace = true
 nemclass-script.workspace = true
 nemclass-ui.workspace = true
+eframe.workspace = true
+egui.workspace = true
+env_logger.workspace = true

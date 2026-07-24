@@ -7,4 +7,8 @@ edition.workspace = true
 nemclass-core.workspace = true
 nemclass-model.workspace = true
 nemclass-script.workspace = true
-# egui / eframe / egui_extras added by the ui-engineer agent (version pinned via ctx7).
+egui.workspace = true
+egui_extras.workspace = true
+eframe.workspace = true
+uuid.workspace = true
+libc.workspace = true

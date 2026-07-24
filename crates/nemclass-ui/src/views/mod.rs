@@ -1,0 +1,899 @@
+//! Top-level `NemclassApp` — the `eframe::App` implementation.
+//!
+//! ## Layout
+//! ```text
+//! ┌─ top bar (address_bar) ──────────────────────────────────────┐
+//! │ Class: PlayerObject   Base: 0x7fff…   Formula: [_____]       │
+//! ├─ left panel ────┬─ central panel (memory table) ─────────────┤
+//! │ Backend: [combo]│ Address │ Offset │ Type  │ Name │ Val │ Cmt│
+//! │ [Refresh][Attach│ ─────────────────────────────────────────── │
+//! │  pid list ]     │  rows …                                    │
+//! │─────────────────│                                            │
+//! │ Classes:        │                                            │
+//! │  ▶ PlayerObject │                                            │
+//! └─────────────────┴────────────────────────────────────────────┘
+//! ```
+
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+
+use eframe::egui;
+use egui_extras::{Column, TableBuilder};
+
+use nemclass_core::{ModuleInfoWithName, Process, ProcessEntry, ProviderRegistry};
+use nemclass_model::{ClassNode, ModelError, Node, NodeRegistry, Project, RenderedValue, resolve_formula};
+use nemclass_script::{Event, EventBus};
+use uuid::Uuid;
+
+use crate::process_reader::ProcessReader;
+
+// ---------------------------------------------------------------------------
+// Flat snapshot of a node tree row
+// ---------------------------------------------------------------------------
+
+struct NodeSnapshot {
+    /// Absolute address in target address space.
+    address: usize,
+    /// Byte offset from the class base.
+    offset: usize,
+    /// Tree depth (0 = direct child of the class, 1 = grandchild, …).
+    depth: usize,
+    /// Dot-separated index path: "0", "0.2", "0.2.1" — used as the egui id
+    /// and the collapse-set key.
+    id_path: String,
+    /// Pre-rendered value string from the last snapshot.
+    rendered: RenderedValue,
+    /// True if this node has children (is a container).
+    has_children: bool,
+    type_tag: &'static str,
+    name: String,
+    comment: String,
+    _memory_size: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Active cell edit
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct EditState {
+    node_id: String,
+    text: String,
+}
+
+// ---------------------------------------------------------------------------
+// NemclassApp
+// ---------------------------------------------------------------------------
+
+pub struct NemclassApp {
+    // Backend / process
+    registry: ProviderRegistry,
+    backend_names: Vec<String>,
+    selected_backend: String,
+    process_list: Vec<ProcessEntry>,
+    process_list_status: String,
+    selected_process_idx: Option<usize>,
+    process: Option<Process>,
+    attached_name: Option<String>,
+    last_error: Option<String>,
+
+    // Project
+    project: Project,
+    _node_registry: NodeRegistry,
+    selected_class: Option<Uuid>,
+
+    // Memory view
+    node_snapshots: Vec<NodeSnapshot>,
+    class_base: Option<usize>,
+    mem_buf: Vec<u8>,
+    last_snapshot: Option<Instant>,
+    snapshot_interval: Duration,
+    collapsed: HashSet<String>,
+    edit_state: Option<EditState>,
+
+    // Scripting seam
+    event_bus: EventBus,
+}
+
+impl NemclassApp {
+    pub fn new() -> Self {
+        let registry = ProviderRegistry::default();
+        let mut backend_names: Vec<String> = registry.names().map(str::to_owned).collect();
+        backend_names.sort();
+        let selected_backend = backend_names.first().cloned().unwrap_or_default();
+
+        let node_registry = NodeRegistry::new().with_builtins();
+        let project = demo_project();
+
+        // Pre-select the first (demo) class.
+        let selected_class = project.classes_in_order().next().map(|c| c.uuid);
+
+        Self {
+            registry,
+            backend_names,
+            selected_backend,
+            process_list: Vec::new(),
+            process_list_status: "Press Refresh to enumerate processes.".into(),
+            selected_process_idx: None,
+            process: None,
+            attached_name: None,
+            last_error: None,
+            project,
+            _node_registry: node_registry,
+            selected_class,
+            node_snapshots: Vec::new(),
+            class_base: None,
+            mem_buf: Vec::new(),
+            last_snapshot: None,
+            snapshot_interval: Duration::from_millis(100),
+            collapsed: HashSet::new(),
+            edit_state: None,
+            event_bus: EventBus::new(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Process actions
+    // -----------------------------------------------------------------------
+
+    fn do_refresh(&mut self) {
+        let Some(provider) = self.registry.get(&self.selected_backend) else {
+            self.process_list_status = format!("Backend '{}' not found.", self.selected_backend);
+            return;
+        };
+        match provider.enumerate_processes() {
+            Ok(list) => {
+                self.process_list_status = format!("{} processes", list.len());
+                self.process_list = list;
+                self.selected_process_idx = None;
+            }
+            Err(e) => {
+                self.process_list_status = format!("Error: {e}");
+                self.process_list.clear();
+            }
+        }
+    }
+
+    fn do_attach(&mut self) {
+        let Some(idx) = self.selected_process_idx else {
+            self.last_error = Some("No process selected.".into());
+            return;
+        };
+        let Some(entry) = self.process_list.get(idx) else {
+            self.last_error = Some("Selection out of range.".into());
+            return;
+        };
+        // ProcessEntry uses `id: u32` and `name: String`.
+        let pid = entry.id as libc::pid_t;
+        let name = entry.name.clone();
+
+        // Detach first.
+        if self.process.is_some() {
+            self.event_bus.publish(&Event::OnDetach);
+            self.process = None;
+            self.attached_name = None;
+            self.clear_memory_state();
+        }
+
+        let Some(provider) = self.registry.get(&self.selected_backend) else {
+            self.last_error = Some(format!("Backend '{}' not found.", self.selected_backend));
+            return;
+        };
+
+        match provider.open(pid) {
+            Ok(proc) => {
+                self.attached_name = Some(if name.is_empty() {
+                    format!("pid:{pid}")
+                } else {
+                    name.clone()
+                });
+                self.process = Some(proc);
+                self.last_error = None;
+                self.last_snapshot = None;
+                self.event_bus.publish(&Event::OnAttach {
+                    pid,
+                    name: Some(name),
+                });
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Attach failed: {e}"));
+            }
+        }
+    }
+
+    fn do_detach(&mut self) {
+        if self.process.is_some() {
+            self.event_bus.publish(&Event::OnDetach);
+            self.process = None;
+            self.attached_name = None;
+            self.clear_memory_state();
+            self.last_error = None;
+        }
+    }
+
+    fn clear_memory_state(&mut self) {
+        self.class_base = None;
+        self.node_snapshots.clear();
+        self.mem_buf.clear();
+        self.edit_state = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory snapshot
+    // -----------------------------------------------------------------------
+
+    fn take_snapshot(&mut self) {
+        let Some(uuid) = self.selected_class else { return; };
+        let Some(proc) = &self.process else {
+            // No process attached — rebuild snapshots from zeroed buffer so
+            // the demo table shows layout on launch.
+            self.rebuild_snapshots_from_buf(uuid);
+            return;
+        };
+
+        // Collect modules (needed for formula evaluation).
+        let modules: Vec<ModuleInfoWithName> = match proc.modules() {
+            Ok(it) => it.collect(),
+            Err(e) => {
+                self.last_error = Some(format!("modules(): {e}"));
+                // Fall back to empty module list — formula may still work for
+                // constant offsets.
+                Vec::new()
+            }
+        };
+
+        // Resolve base address.
+        let formula = self.project.get_class(&uuid)
+            .map(|c| c.address_formula.clone())
+            .unwrap_or_default();
+
+        let base = if formula.trim().is_empty() {
+            None
+        } else {
+            let reader = ProcessReader::new(proc, modules);
+            match resolve_formula(&formula, &reader, &reader) {
+                Ok(addr) => Some(addr),
+                Err(ModelError::ResolveError(msg)) => {
+                    self.last_error = Some(format!("Formula: {msg}"));
+                    None
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("Formula: {e}"));
+                    None
+                }
+            }
+        };
+        self.class_base = base;
+
+        // Read the class memory region.
+        let total_size = self.project.get_class(&uuid)
+            .map(|c| c.memory_size())
+            .unwrap_or(0);
+
+        let buf = if let (Some(addr), true) = (base, total_size > 0) {
+            read_process_buf(proc, addr, total_size)
+        } else {
+            vec![0u8; total_size]
+        };
+        self.mem_buf = buf;
+
+        self.rebuild_snapshots_from_buf(uuid);
+        self.last_snapshot = Some(Instant::now());
+    }
+
+    /// Rebuild `node_snapshots` from `self.mem_buf` for the given class.
+    fn rebuild_snapshots_from_buf(&mut self, uuid: Uuid) {
+        self.node_snapshots.clear();
+        if let Some(class) = self.project.get_class(&uuid) {
+            let base = self.class_base.unwrap_or(0);
+            flatten_nodes(
+                &class.children,
+                base,
+                0,
+                0,
+                &self.mem_buf,
+                String::new(),
+                &mut self.node_snapshots,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-back
+    // -----------------------------------------------------------------------
+
+    fn commit_edit(&mut self) {
+        let Some(edit) = self.edit_state.take() else { return; };
+        let Some(proc) = &self.process else { return; };
+
+        let (addr, type_tag) = match self.node_snapshots.iter().find(|s| s.id_path == edit.node_id) {
+            Some(s) => (s.address, s.type_tag),
+            None => return,
+        };
+
+        match write_parsed(proc, addr, type_tag, edit.text.trim()) {
+            Ok(()) => {
+                self.last_error = None;
+                // Force immediate re-read to show the updated value.
+                self.last_snapshot = None;
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Write: {e}"));
+            }
+        }
+    }
+}
+
+impl Default for NemclassApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// eframe::App — egui 0.35 API
+// ---------------------------------------------------------------------------
+
+impl eframe::App for NemclassApp {
+    /// Called every frame before `ui()`.  Run memory snapshot here so it never
+    /// stalls the render pass.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let needs_snapshot = self.selected_class.is_some()
+            && self
+                .last_snapshot
+                .map(|t| t.elapsed() >= self.snapshot_interval)
+                .unwrap_or(true);
+
+        if needs_snapshot {
+            self.take_snapshot();
+        }
+
+        // Keep repainting at the snapshot interval while attached.
+        if self.process.is_some() {
+            ctx.request_repaint_after(self.snapshot_interval);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Panels must be declared outermost first (top → left → central).
+        egui::Panel::top("address_bar")
+            .resizable(false)
+            .show(ui, |ui| self.show_address_bar(ui));
+
+        egui::Panel::left("left_panel")
+            .resizable(true)
+            .show(ui, |ui| self.show_left_panel(ui));
+
+        egui::CentralPanel::default().show(ui, |ui| self.show_class_view(ui));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-panel implementations
+// ---------------------------------------------------------------------------
+
+impl NemclassApp {
+    fn show_address_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            // Class name.
+            let class_name = self
+                .selected_class
+                .and_then(|id| self.project.get_class(&id))
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "<no class>".into());
+            ui.strong("Class:");
+            ui.label(&class_name);
+            ui.separator();
+
+            // Resolved base.
+            ui.strong("Base:");
+            match self.class_base {
+                Some(b) => { ui.monospace(format!("0x{b:016X}")); }
+                None    => { ui.label("–"); }
+            }
+            ui.separator();
+
+            // Editable formula.
+            if let Some(uuid) = self.selected_class
+                && let Some(class) = self.project.get_class_mut(&uuid)
+            {
+                    ui.strong("Formula:");
+                    if ui.text_edit_singleline(&mut class.address_formula).changed() {
+                        self.last_snapshot = None;
+                        self.class_base = None;
+                    }
+            }
+
+            // Attach status (right-aligned).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match &self.attached_name {
+                    Some(n) => ui.colored_label(egui::Color32::GREEN, format!("Attached: {n}")),
+                    None    => ui.colored_label(egui::Color32::GRAY, "Not attached"),
+                };
+            });
+        });
+    }
+
+    fn show_left_panel(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(220.0);
+
+        // Backend selector.
+        ui.heading("Backend");
+        let backend_names = self.backend_names.clone();
+        egui::ComboBox::from_id_salt("backend_combo")
+            .selected_text(&self.selected_backend)
+            .show_ui(ui, |ui| {
+                for name in &backend_names {
+                    ui.selectable_value(&mut self.selected_backend, name.clone(), name.as_str());
+                }
+            });
+
+        ui.separator();
+
+        // Process list.
+        ui.heading("Processes");
+        ui.horizontal(|ui| {
+            if ui.button("Refresh").clicked() {
+                self.do_refresh();
+            }
+            if self.selected_process_idx.is_some() && ui.button("Attach").clicked() {
+                self.do_attach();
+            }
+            if self.process.is_some() && ui.button("Detach").clicked() {
+                self.do_detach();
+            }
+        });
+        ui.label(&self.process_list_status);
+
+        egui::ScrollArea::vertical()
+            .id_salt("proc_list")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                let mut new_sel = self.selected_process_idx;
+                for (i, entry) in self.process_list.iter().enumerate() {
+                    let label = format!("{} ({})", entry.name, entry.id);
+                    let selected = self.selected_process_idx == Some(i);
+                    if ui.selectable_label(selected, &label).clicked() {
+                        new_sel = Some(i);
+                    }
+                }
+                self.selected_process_idx = new_sel;
+            });
+
+        if let Some(err) = &self.last_error.clone() {
+            ui.colored_label(egui::Color32::RED, err);
+        }
+
+        ui.separator();
+
+        // Class list.
+        ui.heading("Classes");
+        if ui.button("+ Add class").clicked() {
+            let cls = extra_demo_class();
+            let uuid = cls.uuid;
+            self.project.add_class(cls);
+            self.selected_class = Some(uuid);
+            self.last_snapshot = None;
+            self.clear_memory_state();
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt("class_list")
+            .show(ui, |ui| {
+                let uuids: Vec<Uuid> = self
+                    .project
+                    .classes_in_order()
+                    .map(|c| c.uuid)
+                    .collect();
+                for uuid in uuids {
+                    let label = self
+                        .project
+                        .get_class(&uuid)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| uuid.to_string());
+                    let selected = self.selected_class == Some(uuid);
+                    if ui.selectable_label(selected, &label).clicked()
+                        && self.selected_class != Some(uuid)
+                    {
+                        self.selected_class = Some(uuid);
+                        self.last_snapshot = None;
+                        self.clear_memory_state();
+                    }
+                }
+            });
+
+        ui.separator();
+
+        // Snapshot interval.
+        ui.heading("Live Update");
+        let mut ms = self.snapshot_interval.as_millis() as u64;
+        ui.horizontal(|ui| {
+            ui.label("Interval (ms):");
+            if ui
+                .add(egui::DragValue::new(&mut ms).range(50..=5000))
+                .changed()
+            {
+                self.snapshot_interval = Duration::from_millis(ms);
+            }
+        });
+    }
+
+    fn show_class_view(&mut self, ui: &mut egui::Ui) {
+        if self.selected_class.is_none() {
+            ui.centered_and_justified(|ui| {
+                ui.label("Select a class from the left panel.");
+            });
+            return;
+        }
+
+        if self.process.is_none() {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Not attached — showing demo layout (zeroed buffer).",
+            );
+            ui.add_space(4.0);
+        }
+
+        // Trigger first snapshot if we just switched class (no process needed).
+        if self.node_snapshots.is_empty()
+            && let Some(uuid) = self.selected_class
+        {
+            self.rebuild_snapshots_from_buf(uuid);
+        }
+
+        if self.node_snapshots.is_empty() {
+            ui.label("No nodes in this class.");
+            return;
+        }
+
+        let visible: Vec<usize> =
+            build_visible_rows(&self.node_snapshots, &self.collapsed);
+
+        let text_height = ui.text_style_height(&egui::TextStyle::Body);
+        let row_height = text_height + 4.0;
+
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .column(Column::initial(140.0).at_least(80.0))   // Address
+            .column(Column::initial(60.0).at_least(40.0))    // Offset
+            .column(Column::initial(90.0).at_least(60.0))    // Type
+            .column(Column::initial(120.0).at_least(60.0))   // Name
+            .column(Column::remainder().at_least(80.0))      // Value
+            .column(Column::initial(150.0).at_least(60.0))   // Comment
+            .header(row_height + 2.0, |mut header| {
+                header.col(|ui| { ui.strong("Address"); });
+                header.col(|ui| { ui.strong("Offset"); });
+                header.col(|ui| { ui.strong("Type"); });
+                header.col(|ui| { ui.strong("Name"); });
+                header.col(|ui| { ui.strong("Value"); });
+                header.col(|ui| { ui.strong("Comment"); });
+            })
+            .body(|body| {
+                body.rows(row_height, visible.len(), |mut row| {
+                    let row_idx = row.index();
+                    let Some(&snap_idx) = visible.get(row_idx) else { return; };
+                    let snap = &self.node_snapshots[snap_idx];
+
+                    let address     = snap.address;
+                    let offset      = snap.offset;
+                    let type_tag    = snap.type_tag;
+                    let name        = snap.name.clone();
+                    let comment     = snap.comment.clone();
+                    let value       = snap.rendered.value.clone();
+                    let depth       = snap.depth;
+                    let has_children = snap.has_children;
+                    let id_path     = snap.id_path.clone();
+
+                    row.col(|ui| { ui.monospace(format!("0x{address:016X}")); });
+                    row.col(|ui| { ui.monospace(format!("+{offset:#06X}")); });
+                    row.col(|ui| { ui.label(type_tag); });
+
+                    // Name column: indented + collapse toggle for containers.
+                    row.col(|ui| {
+                        ui.horizontal(|ui| {
+                            let indent = depth as f32 * 12.0;
+                            if indent > 0.0 { ui.add_space(indent); }
+
+                            if has_children {
+                                let collapsed = self.collapsed.contains(&id_path);
+                                let arrow = if collapsed { "▶" } else { "▼" };
+                                if ui.small_button(arrow).clicked() {
+                                    if collapsed {
+                                        self.collapsed.remove(&id_path);
+                                    } else {
+                                        self.collapsed.insert(id_path.clone());
+                                    }
+                                }
+                            } else {
+                                ui.add_space(16.0);
+                            }
+                            ui.label(&name);
+                        });
+                    });
+
+                    // Value column: editable for scalars when attached.
+                    row.col(|ui| {
+                        let editing = self
+                            .edit_state
+                            .as_ref()
+                            .is_some_and(|e| e.node_id == id_path);
+
+                        if is_editable(type_tag) && self.process.is_some() {
+                            if editing {
+                                let resp = ui.text_edit_singleline(
+                                    &mut self.edit_state.as_mut().unwrap().text,
+                                );
+                                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                if resp.lost_focus() || enter {
+                                    self.commit_edit();
+                                } else if escape {
+                                    self.edit_state = None;
+                                }
+                            } else {
+                                let resp = ui.selectable_label(false, &value);
+                                if resp.double_clicked() {
+                                    // Seed the edit box with the current raw value
+                                    // (strip "0x" prefix for hex types so the user
+                                    // can type a plain hex literal).
+                                    let seed = value
+                                        .strip_prefix("0x")
+                                        .or_else(|| value.strip_prefix("0X"))
+                                        .unwrap_or(&value)
+                                        .to_owned();
+                                    self.edit_state = Some(EditState {
+                                        node_id: id_path.clone(),
+                                        text: seed,
+                                    });
+                                }
+                            }
+                        } else {
+                            ui.label(&value);
+                        }
+                    });
+
+                    row.col(|ui| { ui.label(&comment); });
+                });
+            });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tree flattening
+// ---------------------------------------------------------------------------
+
+fn flatten_nodes(
+    children: &[Box<dyn Node>],
+    base_addr: usize,
+    base_offset: usize,
+    depth: usize,
+    buf: &[u8],
+    parent_id: String,
+    out: &mut Vec<NodeSnapshot>,
+) {
+    let mut cur_offset = base_offset;
+    for (i, node) in children.iter().enumerate() {
+        let id_path = if parent_id.is_empty() {
+            i.to_string()
+        } else {
+            format!("{parent_id}.{i}")
+        };
+
+        let rendered = node.render(buf, cur_offset);
+        let has_children = !node.children().is_empty();
+        let size = node.memory_size();
+
+        out.push(NodeSnapshot {
+            address: base_addr.wrapping_add(cur_offset),
+            offset: cur_offset,
+            depth,
+            id_path: id_path.clone(),
+            rendered,
+            has_children,
+            type_tag: node.type_tag(),
+            name: node.name().to_owned(),
+            comment: node.comment().to_owned(),
+            _memory_size: size,
+        });
+
+        // Recurse into children immediately after their parent row.
+        if has_children {
+            flatten_nodes(
+                node.children(),
+                base_addr,
+                cur_offset,
+                depth + 1,
+                buf,
+                id_path,
+                out,
+            );
+        }
+
+        cur_offset = cur_offset.wrapping_add(size);
+    }
+}
+
+/// Build the list of snapshot indices visible given the current collapse state.
+/// A node is hidden if any of its ancestor id_paths is in `collapsed`.
+fn build_visible_rows(
+    snapshots: &[NodeSnapshot],
+    collapsed: &HashSet<String>,
+) -> Vec<usize> {
+    let mut visible = Vec::with_capacity(snapshots.len());
+    'snap: for (i, snap) in snapshots.iter().enumerate() {
+        // Check if any strict ancestor id_path is collapsed.
+        // Ancestors are the prefixes of the dot-separated path.
+        let parts: Vec<&str> = snap.id_path.split('.').collect();
+        for len in 1..parts.len() {
+            let ancestor = parts[..len].join(".");
+            if collapsed.contains(&ancestor) {
+                continue 'snap;
+            }
+        }
+        visible.push(i);
+    }
+    visible
+}
+
+// ---------------------------------------------------------------------------
+// Write-back
+// ---------------------------------------------------------------------------
+
+fn write_parsed(proc: &Process, addr: usize, type_tag: &str, text: &str) -> Result<(), String> {
+    // Strip optional "0x"/"0X" prefix for hex input.
+    let raw = text.trim_start_matches("0x").trim_start_matches("0X");
+
+    macro_rules! parse_write {
+        ($ty:ty) => {{
+            let v: $ty = raw.parse().map_err(|e: <$ty as std::str::FromStr>::Err| e.to_string())?;
+            proc.write::<$ty>(addr, v).map_err(|e| e.to_string())
+        }};
+    }
+    macro_rules! parse_write_hex {
+        ($ty:ty) => {{
+            let v = <$ty>::from_str_radix(raw, 16).map_err(|e| e.to_string())?;
+            proc.write::<$ty>(addr, v).map_err(|e| e.to_string())
+        }};
+    }
+
+    match type_tag {
+        "Int8"    => parse_write!(i8),
+        "Int16"   => parse_write!(i16),
+        "Int32"   => parse_write!(i32),
+        "Int64"   => parse_write!(i64),
+        "UInt8"   => parse_write!(u8),
+        "UInt16"  => parse_write!(u16),
+        "UInt32"  => parse_write!(u32),
+        "UInt64"  => parse_write!(u64),
+        "Hex8"    => parse_write_hex!(u8),
+        "Hex16"   => parse_write_hex!(u16),
+        "Hex32"   => parse_write_hex!(u32),
+        "Hex64"   => parse_write_hex!(u64),
+        "Float"   => parse_write!(f32),
+        "Double"  => parse_write!(f64),
+        "Bool"    => {
+            let v: u8 = match text.to_ascii_lowercase().as_str() {
+                "true" | "1" => 1,
+                _ => 0,
+            };
+            proc.write::<u8>(addr, v).map_err(|e| e.to_string())
+        }
+        "Pointer" => parse_write_hex!(u64),
+        _ => Err(format!("'{type_tag}' is not directly writable")),
+    }
+}
+
+fn is_editable(type_tag: &str) -> bool {
+    matches!(
+        type_tag,
+        "Int8" | "Int16" | "Int32" | "Int64"
+            | "UInt8" | "UInt16" | "UInt32" | "UInt64"
+            | "Hex8" | "Hex16" | "Hex32" | "Hex64"
+            | "Float" | "Double" | "Bool" | "Pointer"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Bulk memory read helper
+// ---------------------------------------------------------------------------
+
+/// Read `size` bytes from `addr` in the target process into a `Vec<u8>`.
+///
+/// Uses `Process::read_batch::<u8>` (single batched iovec call) under the hood.
+/// On partial transfer or error the returned buffer is zeroed for the missing
+/// bytes (best-effort, non-panicking).
+fn read_process_buf(proc: &Process, addr: usize, size: usize) -> Vec<u8> {
+    if size == 0 {
+        return Vec::new();
+    }
+    let addrs: Vec<usize> = (0..size).map(|i| addr.wrapping_add(i)).collect();
+    match proc.read_batch::<u8>(&addrs) {
+        Ok(bytes) => bytes,
+        Err(_) => vec![0u8; size],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Demo project
+// ---------------------------------------------------------------------------
+
+fn demo_project() -> Project {
+    use nemclass_model::node::builtins::{
+        ArrayNode, BoolNode, Float32Node, Float64Node, Hex32Node, Hex64Node,
+        Int32Node, PointerNode, UInt8Node, Utf8TextNode,
+    };
+
+    let mut project = Project::new("Demo Project");
+    let mut player = ClassNode::new("PlayerObject");
+    player.address_formula = String::new(); // blank → no live read needed on launch
+    player.comment = "Attach to a process and set a formula to go live.".into();
+
+    {
+        let mut n = Int32Node::new("health");      n.comment = "Current HP".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = Int32Node::new("max_health");  n.comment = "Max HP".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = Float32Node::new("mana");      n.comment = "Mana pool".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = Float64Node::new("pos_x");     n.comment = "X position".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = Float64Node::new("pos_y");     n.comment = "Y position".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = Float64Node::new("pos_z");     n.comment = "Z position".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = Hex32Node::new("flags");       n.comment = "State flags (hex)".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = Hex64Node::new("vtable");      n.comment = "vptr (hex)".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = PointerNode::new("next");      n.comment = "Linked list next".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = BoolNode::new("alive");        n.comment = "Is alive?".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = UInt8Node::new("level");       n.comment = "Level (1-255)".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = Utf8TextNode::new("name", 32); n.comment = "Name (UTF-8, 32 B)".into();
+        player.children.push(Box::new(n));
+    }
+    {
+        let mut n = ArrayNode::new("inv_ids", 10, 4); n.comment = "10 x u32 item IDs".into();
+        player.children.push(Box::new(n));
+    }
+    project.add_class(player);
+    project
+}
+
+fn extra_demo_class() -> ClassNode {
+    use nemclass_model::node::builtins::{Int64Node, UInt32Node};
+
+    let mut class = ClassNode::new("EntityBase");
+    let mut id = UInt32Node::new("entity_id");
+    id.comment = "Unique entity ID".into();
+    class.children.push(Box::new(id));
+    let mut tick = Int64Node::new("last_tick");
+    tick.comment = "Last update tick".into();
+    class.children.push(Box::new(tick));
+    class
+}
