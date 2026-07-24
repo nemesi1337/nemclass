@@ -7,6 +7,7 @@ edition.workspace = true
 nemclass-core.workspace = true
 nemclass-model.workspace = true
 nemclass-script.workspace = true
+nemclass-scan.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
 eframe.workspace = true

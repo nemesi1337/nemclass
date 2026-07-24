@@ -5,15 +5,21 @@
 //! ┌─ menu bar (New / Open / Save) ───────────────────────────────────┐
 //! ├─ top bar (address_bar) ──────────────────────────────────────────┤
 //! │ Class: PlayerObject   Base: 0x7fff…   Formula: [_____]           │
-//! ├─ left panel ────┬─ central panel (memory table) ──────────────── ┤
-//! │ Backend: [combo]│ Address │ Offset │ Type  │ Name │ Val │ Cmt    │
-//! │ [Refresh][Attach│ ──────────────────────────────────────────────  │
-//! │  pid list ]     │  rows …                                        │
+//! ├─ left panel ────┬─ central panel ──────────────────────────────── ┤
+//! │ Backend: [combo]│ [Memory View] [Scanner] [Debugger]             │
+//! │ [Refresh][Attach│────────────────────────────────────────────────│
+//! │  pid list ]     │  active tab content …                          │
 //! │─────────────────│                                                │
 //! │ Classes:        │                                                │
 //! │  ▶ PlayerObject │                                                │
 //! └─────────────────┴──────────────────────────────────────────────── ┘
 //! ```
+
+mod scanner_panel;
+mod debugger_panel;
+
+pub use scanner_panel::ScannerPanel;
+pub use debugger_panel::DebuggerPanel;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -29,6 +35,17 @@ use uuid::Uuid;
 
 use crate::process_reader::ProcessReader;
 use crate::project_io::{create_project_at, load_project_from, save_project_to};
+
+// ---------------------------------------------------------------------------
+// Central-panel tab selector
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CentralTab {
+    MemoryView,
+    Scanner,
+    Debugger,
+}
 
 // ---------------------------------------------------------------------------
 // Flat snapshot of a node tree row
@@ -134,6 +151,15 @@ pub struct NemclassApp {
     file_dialog: Option<FileDialog>,
     /// Non-modal status message shown below the menu bar (e.g. last save path).
     status_msg: Option<String>,
+
+    // Central panel tab
+    central_tab: CentralTab,
+
+    // Scanner panel
+    scanner_panel: ScannerPanel,
+
+    // Debugger panel
+    debugger_panel: DebuggerPanel,
 }
 
 impl NemclassApp {
@@ -173,6 +199,9 @@ impl NemclassApp {
             event_bus: EventBus::new(),
             file_dialog: None,
             status_msg: Some("Demo project loaded. Use File > New or Open to load a project.".into()),
+            central_tab: CentralTab::MemoryView,
+            scanner_panel: ScannerPanel::new(),
+            debugger_panel: DebuggerPanel::new(),
         }
     }
 
@@ -251,6 +280,8 @@ impl NemclassApp {
             self.attached_name = None;
             self.clear_memory_state();
             self.last_error = None;
+            self.scanner_panel.on_detach();
+            self.debugger_panel.on_detach();
         }
     }
 
@@ -458,6 +489,10 @@ impl eframe::App for NemclassApp {
             self.take_snapshot();
         }
 
+        // Drive scanner freeze write-back and debugger event polling.
+        self.scanner_panel.tick_freeze();
+        self.debugger_panel.tick_events();
+
         if self.process.is_some() {
             ctx.request_repaint_after(self.snapshot_interval);
         }
@@ -484,7 +519,7 @@ impl eframe::App for NemclassApp {
             .resizable(true)
             .show(ui, |ui| self.show_left_panel(ui));
 
-        egui::CentralPanel::default().show(ui, |ui| self.show_class_view(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.show_central_panel(ui));
     }
 }
 
@@ -790,6 +825,69 @@ impl NemclassApp {
                 self.snapshot_interval = Duration::from_millis(ms);
             }
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Central panel — tab bar + dispatching
+    // -----------------------------------------------------------------------
+
+    fn show_central_panel(&mut self, ui: &mut egui::Ui) {
+        // Tab bar.
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.central_tab, CentralTab::MemoryView, "Memory View");
+            ui.selectable_value(&mut self.central_tab, CentralTab::Scanner,    "Scanner");
+            ui.selectable_value(&mut self.central_tab, CentralTab::Debugger,   "Debugger");
+        });
+        ui.separator();
+
+        match self.central_tab {
+            CentralTab::MemoryView => self.show_class_view(ui),
+            CentralTab::Scanner    => self.show_scanner_tab(ui),
+            CentralTab::Debugger   => self.show_debugger_tab(ui),
+        }
+    }
+
+    fn show_scanner_tab(&mut self, ui: &mut egui::Ui) {
+        // Derive the pid from the attached process on Linux; scanner accepts
+        // Pid (u32 alias in nemclass-core) but ProcessTarget::attach takes Pid.
+        #[cfg(target_os = "linux")]
+        let pid: Option<nemclass_core::Pid> = self.process.as_ref().map(|p| p.pid());
+        #[cfg(not(target_os = "linux"))]
+        let pid: Option<nemclass_core::Pid> = None;
+
+        let process_ref = self.process.as_ref();
+        let selected_class = self.selected_class;
+        let project = &mut self.project;
+
+        self.scanner_panel.show(
+            ui,
+            process_ref,
+            pid,
+            |addr| {
+                // "Add to class" callback: append a Hex64 address node to the
+                // currently-selected class (or the first class in the project).
+                use nemclass_model::node::builtins::Hex64Node;
+                let uuid = selected_class
+                    .or_else(|| project.classes_in_order().next().map(|c| c.uuid));
+                if let Some(uuid) = uuid
+                    && let Some(class) = project.get_class_mut(&uuid)
+                {
+                    let label = format!("scan_{addr:#x}");
+                    let mut node = Hex64Node::new(&label);
+                    node.comment = format!("Scanner result 0x{addr:016X}");
+                    class.children.push(Box::new(node));
+                }
+            },
+        );
+    }
+
+    fn show_debugger_tab(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_os = "linux")]
+        let pid: Option<libc::pid_t> = self.process.as_ref().map(|p| p.pid() as libc::pid_t);
+        #[cfg(not(target_os = "linux"))]
+        let pid: Option<i32> = None;
+
+        self.debugger_panel.show(ui, pid);
     }
 
     // -----------------------------------------------------------------------
