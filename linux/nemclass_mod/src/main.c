@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * nemclass_mod — misc char device, symmetric-key auth, and ioctl dispatch.
+ *
+ * /dev/nemclass gates every operation behind a shared-secret handshake
+ * (NEMCLASS_IOC_AUTH) instead of a Linux capability check. The key is provided
+ * at module load (key=<hex>) and matched constant-time; without it the module
+ * fails closed. Memory access and the debugger engine live in the sibling
+ * translation units (memory_access.c, debugger.c).
+ */
+#define pr_fmt(fmt) "nemclass: " fmt
+
+#include <linux/fs.h>
+#include <linux/hex.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/kfifo.h>
+#include <linux/miscdevice.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/wait.h>
+#include <crypto/algapi.h>	/* crypto_memneq */
+
+#include "internal.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Thomas Wright");
+MODULE_DESCRIPTION("nemclass_mod: non-ptrace debugger + kernel-side memory access");
+MODULE_VERSION("2.0");
+
+static char *key;
+module_param(key, charp, 0400);
+MODULE_PARM_DESC(key,
+	"Shared symmetric key as raw hex (no 0x); clients must present it via NEMCLASS_IOC_AUTH");
+
+bool nemclass_allow_ptrace_hide;
+module_param_named(allow_ptrace_hide, nemclass_allow_ptrace_hide, bool, 0644);
+MODULE_PARM_DESC(allow_ptrace_hide,
+	"Enable the experimental PTRACE_HIDE ioctl (default off)");
+
+/* Parsed key. key_len == 0 means "no key configured" => fail closed. */
+static u8  nemclass_key[NEMCLASS_KEY_MAX];
+static u32 nemclass_key_len;
+
+static long nemclass_do_auth(struct nemclass_session *sess, void __user *arg)
+{
+	struct nemclass_auth a;
+	long ret = 0;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+
+	if (nemclass_key_len == 0) {
+		pr_warn_ratelimited("AUTH refused: module loaded without key=\n");
+		ret = -EACCES;
+		goto out;
+	}
+	if (a.key_len != nemclass_key_len ||
+	    crypto_memneq(a.key, nemclass_key, nemclass_key_len)) {
+		ret = -EACCES;
+		goto out;
+	}
+	sess->authed = true;
+out:
+	memzero_explicit(&a, sizeof(a));
+	return ret;
+}
+
+static long nemclass_ioctl(struct file *file, unsigned int cmd,
+			   unsigned long uarg)
+{
+	struct nemclass_session *sess = file->private_data;
+	void __user *arg = (void __user *)uarg;
+
+	/* Unauthenticated operations. */
+	switch (cmd) {
+	case NEMCLASS_IOC_VERSION: {
+		struct nemclass_version v = { .abi = NEMCLASS_ABI_VERSION };
+
+		if (copy_to_user(arg, &v, sizeof(v)))
+			return -EFAULT;
+		return 0;
+	}
+	case NEMCLASS_IOC_AUTH:
+		return nemclass_do_auth(sess, arg);
+	}
+
+	/* Everything else requires a successful handshake on this fd. */
+	if (!sess->authed)
+		return -EACCES;
+
+	switch (cmd) {
+	case NEMCLASS_IOC_READ:		return nemclass_do_read(arg);
+	case NEMCLASS_IOC_WRITE:	return nemclass_do_write(arg);
+	case NEMCLASS_IOC_ENUM_REGIONS:	return nemclass_do_enum_regions(arg);
+	case NEMCLASS_IOC_BP_SET:	return nemclass_bp_set(sess, arg);
+	case NEMCLASS_IOC_BP_CLEAR:	return nemclass_bp_clear(sess, arg);
+	case NEMCLASS_IOC_WAIT_EVENT:	return nemclass_wait_event(sess, arg);
+	case NEMCLASS_IOC_PTRACE_QUERY:	return nemclass_do_ptrace_query(arg);
+	case NEMCLASS_IOC_PTRACE_HIDE:	return nemclass_do_ptrace_hide(arg);
+	default:			return -ENOTTY;
+	}
+}
+
+static int nemclass_open(struct inode *inode, struct file *file)
+{
+	struct nemclass_session *sess;
+	int ret;
+
+	sess = kzalloc(sizeof(*sess), GFP_KERNEL);
+	if (!sess)
+		return -ENOMEM;
+
+	mutex_init(&sess->lock);
+	INIT_LIST_HEAD(&sess->slots);
+	spin_lock_init(&sess->ev_lock);
+	init_waitqueue_head(&sess->ev_wait);
+
+	ret = kfifo_alloc(&sess->events, NEMCLASS_EVENT_DEPTH, GFP_KERNEL);
+	if (ret) {
+		mutex_destroy(&sess->lock);
+		kfree(sess);
+		return ret;
+	}
+
+	file->private_data = sess;
+	return 0;
+}
+
+static int nemclass_release(struct inode *inode, struct file *file)
+{
+	struct nemclass_session *sess = file->private_data;
+
+	nemclass_session_free_slots(sess);
+	kfifo_free(&sess->events);
+	mutex_destroy(&sess->lock);
+	kfree(sess);
+	return 0;
+}
+
+static const struct file_operations nemclass_fops = {
+	.owner		= THIS_MODULE,
+	.open		= nemclass_open,
+	.release	= nemclass_release,
+	.unlocked_ioctl	= nemclass_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
+};
+
+static struct miscdevice nemclass_misc = {
+	.minor	= MISC_DYNAMIC_MINOR,
+	.name	= "nemclass",
+	.fops	= &nemclass_fops,
+	.mode	= 0600,
+};
+
+static int __init nemclass_parse_key(void)
+{
+	size_t slen;
+
+	if (!key || !*key) {
+		pr_warn("no key= given; all gated ioctls will be refused (fail closed)\n");
+		return 0;
+	}
+
+	slen = strlen(key);
+	if (slen % 2 || (slen / 2) > NEMCLASS_KEY_MAX) {
+		pr_err("invalid key: need even-length hex, <= %u bytes\n",
+		       NEMCLASS_KEY_MAX);
+		return -EINVAL;
+	}
+	if (hex2bin(nemclass_key, key, slen / 2)) {
+		pr_err("invalid key: not valid hex\n");
+		return -EINVAL;
+	}
+	nemclass_key_len = slen / 2;
+	pr_info("auth key configured (%u bytes)\n", nemclass_key_len);
+	return 0;
+}
+
+static int __init nemclass_init(void)
+{
+	int ret;
+
+	ret = nemclass_parse_key();
+	if (ret)
+		return ret;
+
+	ret = misc_register(&nemclass_misc);
+	if (ret) {
+		pr_err("misc_register failed: %d\n", ret);
+		memzero_explicit(nemclass_key, sizeof(nemclass_key));
+		return ret;
+	}
+
+	pr_info("loaded: /dev/nemclass (abi %u)\n", NEMCLASS_ABI_VERSION);
+	return 0;
+}
+
+static void __exit nemclass_exit(void)
+{
+	misc_deregister(&nemclass_misc);
+	memzero_explicit(nemclass_key, sizeof(nemclass_key));
+	pr_info("unloaded\n");
+}
+
+module_init(nemclass_init);
+module_exit(nemclass_exit);
