@@ -161,6 +161,7 @@ dependencies = [
 name = "nemclass-model"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "nemclass-core",
  "serde",
  "thiserror",
