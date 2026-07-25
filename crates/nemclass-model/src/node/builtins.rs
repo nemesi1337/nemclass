@@ -151,6 +151,7 @@ impl Node for PointerNode {
         let v = pod_read_unaligned::<u64>(bytes);
         RenderedValue { value: format!("0x{v:016X}"), type_tag: "Pointer", memory_size: 8 }
     }
+    fn pointer_target_class(&self) -> Option<Uuid> { self.target_class_uuid }
     fn to_node_def(&self) -> NodeDef {
         let mut attrs = std::collections::HashMap::new();
         if let Some(uuid) = &self.target_class_uuid {

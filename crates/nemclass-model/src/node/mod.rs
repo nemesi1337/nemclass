@@ -3,6 +3,8 @@ pub mod function;
 pub mod registry;
 pub mod vtable;
 
+use uuid::Uuid;
+
 use crate::serialize::NodeDef;
 
 /// A single rendered value from a node, with metadata.
@@ -33,4 +35,11 @@ pub trait Node: Send + Sync {
     /// Serialize this node to a `NodeDef` intermediate. Children must be serialized
     /// separately by the registry (via `serialize_children`).
     fn to_node_def(&self) -> NodeDef;
+
+    /// For pointer-to-class nodes, the UUID of the class the pointer targets;
+    /// `None` for every other node type. Lets the UI offer a "follow pointer →
+    /// open target class" action without downcasting.
+    fn pointer_target_class(&self) -> Option<Uuid> {
+        None
+    }
 }
