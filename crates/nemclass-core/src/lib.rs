@@ -48,6 +48,13 @@ pub use internal::{
     symbols,
 };
 
+// On-disk symbolication (M5.2): map a runtime code address to a function name
+// via DWARF / ELF symtab (unix) or a PDB (Windows), richer than the export-only
+// `symbols` path. Behind the optional `symbols` feature — the base build never
+// compiles addr2line/object/pdb — mirroring how the `symbols` module is exposed.
+#[cfg(feature = "symbols")]
+pub use internal::{SymbolResolver, symbol_resolver};
+
 // Linux-only analysis conveniences that touch a live `Process`/`/proc`: the
 // linear function walk and the in-process pointer classifier.
 #[cfg(target_os = "linux")]
@@ -123,6 +130,11 @@ pub enum Error {
     /// caught client-side so the caller learns of the misuse without a round-trip.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// On-disk debug info (DWARF/ELF symtab or a PDB) could not be opened or
+    /// parsed while building a `SymbolResolver` (M5.2). Carries the backend's
+    /// diagnostic. Only constructed under the `symbols` feature.
+    #[error("symbol info error: {0}")]
+    SymbolInfo(String),
 }
 
 /// Renders an errno to its libc message for the `Display` impl above.

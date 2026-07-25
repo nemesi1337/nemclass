@@ -506,13 +506,20 @@ fn gnu_hash_symbol_count<R: Read>(read: &mut R, gnu_hash: usize) -> crate::Resul
 ///   binaries and is not mapped at runtime, so it must be read from the on-disk
 ///   file (or a separate `.debug` object), not the live image.
 ///
-/// Both pull in a heavy dependency and an on-disk (not in-memory) code path, so
-/// this is intentionally deferred. The seam exists so callers can start relying
-/// on the signature now and get real results once a PDB/`.symtab` backend
-/// lands.
+/// This enumerate-all-symbols shape only has a `module_base`, so it cannot by
+/// itself locate the on-disk file its debug info lives in. **M5.2 landed the
+/// real address→name path** as a separate, on-disk-file-driven type:
+/// [`crate::SymbolResolver`] (built via `SymbolResolver::for_module` /
+/// `for_process_module`) and the [`crate::Process::resolve_symbol`] convenience,
+/// both behind the optional `symbols` feature. Those cover DWARF, the ELF symbol
+/// table, and a PDB on Windows.
 ///
-// TODO(pdb): resolve private symbols via a PDB (Windows symbol server / `pdb`
-// crate) or the ELF `.symtab`. Returns `Ok(Vec::new())` until then.
+/// This function stays a stub: full private-symbol *enumeration* (as opposed to
+/// point lookup) would layer a "list all `.symtab`/PDB functions with their
+/// runtime addresses" API over the same resolver, which no caller needs yet.
+///
+// TODO(symbols): enumerate all private symbols by layering an iterate-symbols
+// API over the M5.2 `SymbolResolver`. Returns `Ok(Vec::new())` until then.
 pub fn private_symbols(_module_base: usize) -> crate::Result<Vec<Symbol>> {
     Ok(Vec::new())
 }

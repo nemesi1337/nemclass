@@ -48,6 +48,16 @@ windows-sys = { version = "0.61.2", features = [
 # serde >= 1.0.221 (serde_core / serde_bytes 0.11.19 / uuid) — mutually unsatisfiable.
 # 0.11.0 predates the broken swc_config and builds against current serde.
 rustyscript = "=0.11.0"
+# Symbolication (nemclass-core `symbols` feature, M5.2). All optional in the
+# crate and target-scoped there — the base build never compiles them.
+#   Unix/DWARF: addr2line re-exports a matching `gimli`/`object` and, via its
+#   default `loader` feature, memory-maps+parses the object itself; we still take
+#   `object` directly to read PT_LOAD vaddrs for the runtime→object load-bias.
+#   Windows/PDB: pdb + pdb-addr2line resolve an RVA to a function via the PDB.
+addr2line = "0.27.0"
+object = { version = "0.39.1", default-features = false, features = ["read_core", "elf", "std"] }
+pdb = "0.8.0"
+pdb-addr2line = "0.12.1"
 # UI
 egui = "0.35.0"
 egui_extras = { version = "0.35.0", features = ["default"] }

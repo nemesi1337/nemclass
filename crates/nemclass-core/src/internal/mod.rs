@@ -15,6 +15,11 @@ pub use process::{
     pe, symbols,
 };
 
+// On-disk symbolication (M5.2). Behind the optional `symbols` feature so the base
+// build never references addr2line/object/pdb.
+#[cfg(feature = "symbols")]
+pub use process::{SymbolResolver, symbol_resolver};
+
 // Native Linux provider (`process_vm_readv` backend + `/proc` enumeration) plus
 // the backend-name constants a UI backend picker keys off of.
 #[cfg(target_os = "linux")]

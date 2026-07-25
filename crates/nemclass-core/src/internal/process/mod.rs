@@ -31,6 +31,12 @@ pub mod pe;
 // (they take a byte reader); only the `Process` convenience glue is Linux-gated.
 pub mod symbols;
 
+// Richer on-disk symbolication (M5.2): the `SymbolResolver` (DWARF/ELF via
+// addr2line+object on unix, PDB via pdb-addr2line on Windows). Gated behind the
+// optional `symbols` feature so the base build never pulls those crates.
+#[cfg(feature = "symbols")]
+pub mod symbol_resolver;
+
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
@@ -41,6 +47,10 @@ pub use protection::*;
 pub use provider::*;
 pub use memory::MemoryBackend;
 pub use symbols::Symbol;
+
+// On-disk symbolication (M5.2), behind the optional `symbols` feature.
+#[cfg(feature = "symbols")]
+pub use symbol_resolver::SymbolResolver;
 
 // The kernel-device client and its privileged backend/provider (Linux-only),
 // plus the ergonomic debugger controller layered over the client.
@@ -67,12 +77,26 @@ use crate::internal::process::memory::IovecProcessMemoryBackend;
 pub struct Process {
     pid: Pid,
     backend: Box<dyn MemoryBackend>,
+    // Per-module symbolication cache (M5.2), keyed by module base. Built lazily on
+    // the first `resolve_symbol` for a module and reused for subsequent lookups so
+    // the on-disk DWARF/ELF parse happens once. Behind interior mutability so it
+    // populates through a `&self` handle; only compiled with the `symbols` feature.
+    // Resolvers are stored inline (not `Arc`'d): `SymbolResolver` wraps an mmap
+    // and is not `Sync`, so we resolve while holding the lock instead of sharing a
+    // handle across threads.
+    #[cfg(all(feature = "symbols", target_os = "linux"))]
+    symbol_cache: std::sync::Mutex<HashMap<usize, symbol_resolver::SymbolResolver>>,
 }
 
 impl Process {
     /// Builds a `Process` from an already-opened backend. Used by providers.
     pub(crate) fn from_backend(pid: Pid, backend: Box<dyn MemoryBackend>) -> Self {
-        Process { pid, backend }
+        Process {
+            pid,
+            backend,
+            #[cfg(all(feature = "symbols", target_os = "linux"))]
+            symbol_cache: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// Attaches to the process with the given `pid` using the default native
@@ -215,6 +239,50 @@ impl Process {
         }
 
         Ok(out.into_iter())
+    }
+
+    /// Resolves a runtime **absolute** code address to a function name using
+    /// richer on-disk debug info (DWARF / ELF symbol table) than the export-only
+    /// [`Process::resolve`] path (M5.2).
+    ///
+    /// Finds the module whose mapped range covers `addr`, builds (and caches) a
+    /// [`symbol_resolver::SymbolResolver`] over that module's on-disk file, and
+    /// resolves. Returns:
+    /// - `Ok(Some(name))` — a tier named the address (DWARF function, symbol
+    ///   table entry, or export floor; demangled when possible);
+    /// - `Ok(None)` — the address is inside a known module but no tier names it
+    ///   (fully stripped module, or a gap between functions);
+    /// - `Err(Error::ModuleNotFound)` — no module covers `addr`.
+    ///
+    /// The per-module resolver is cached on this handle, so repeated lookups into
+    /// the same module reparse nothing.
+    #[cfg(all(feature = "symbols", target_os = "linux"))]
+    pub fn resolve_symbol(&self, addr: usize) -> crate::Result<Option<String>> {
+        // Locate the covering module (base..base+size). `modules()` gives the
+        // aggregated base/size; symbolication needs the on-disk path, which the
+        // resolver recovers from `/proc/<pid>/maps` itself.
+        let module = self
+            .modules()?
+            .find(|m| (m.base..m.base.saturating_add(m.size)).contains(&addr))
+            .ok_or(Error::ModuleNotFound)?;
+
+        // Reuse a cached resolver for this module base, building+inserting one on
+        // first use. The resolver is stored inline and consulted under the lock,
+        // so the on-disk DWARF/ELF parse happens at most once per module.
+        let mut cache = self
+            .symbol_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let resolver = match cache.entry(module.base) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let built =
+                    symbol_resolver::SymbolResolver::for_process_module(self.pid, module.base)?;
+                e.insert(built)
+            }
+        };
+
+        Ok(resolver.resolve(addr))
     }
 }
 
