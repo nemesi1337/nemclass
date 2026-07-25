@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * nemclass_mod — misc char device, symmetric-key auth, and ioctl dispatch.
+ * nemclass_mod — /proc interface, symmetric-key auth, and ioctl dispatch.
  *
- * /dev/nemclass gates every operation behind a shared-secret handshake
- * (NEMCLASS_IOC_AUTH) instead of a Linux capability check. The key is provided
- * at module load (key=<hex>) and matched constant-time; without it the module
- * fails closed. Memory access and the debugger engine live in the sibling
- * translation units (memory_access.c, debugger.c).
+ * The interface lives at /proc/nemclass/attach. Opening it is gated by the
+ * uid/gid allowlist in access.c (fixing "permission denied" without a
+ * root-only device node); every gated ioctl is then further gated behind a
+ * shared-secret handshake (NEMCLASS_IOC_AUTH). The key is provided at module
+ * load (key=<hex>) and matched constant-time; without it the module fails
+ * closed. A companion read-only /proc/nemclass/acl reports the live policy.
+ * Memory access and the debugger engine live in the sibling translation units
+ * (memory_access.c, debugger.c); the access policy lives in access.c.
  */
 #define pr_fmt(fmt) "nemclass: " fmt
 
@@ -15,9 +18,10 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kfifo.h>
-#include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
@@ -110,6 +114,11 @@ static int nemclass_open(struct inode *inode, struct file *file)
 	struct nemclass_session *sess;
 	int ret;
 
+	/* uid/gid allowlist gate (access.c); refuses before any allocation. */
+	ret = nemclass_access_check_open();
+	if (ret)
+		return ret;
+
 	sess = kzalloc(sizeof(*sess), GFP_KERNEL);
 	if (!sess)
 		return -ENOMEM;
@@ -141,20 +150,33 @@ static int nemclass_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static const struct file_operations nemclass_fops = {
-	.owner		= THIS_MODULE,
-	.open		= nemclass_open,
-	.release	= nemclass_release,
-	.unlocked_ioctl	= nemclass_ioctl,
-	.compat_ioctl	= compat_ptr_ioctl,
+/*
+ * The ioctl endpoint. Mode 0666 is intentional: the VFS permission bits are NOT
+ * the access control — nemclass_open() enforces the uid/gid allowlist (and root
+ * fails closed when no policy is loaded), so opening the node is always subject
+ * to access.c regardless of the mode bits.
+ */
+static const struct proc_ops nemclass_attach_pops = {
+	.proc_open		= nemclass_open,
+	.proc_release		= nemclass_release,
+	.proc_ioctl		= nemclass_ioctl,
+	.proc_compat_ioctl	= compat_ptr_ioctl,
+	.proc_lseek		= noop_llseek,
 };
 
-static struct miscdevice nemclass_misc = {
-	.minor	= MISC_DYNAMIC_MINOR,
-	.name	= "nemclass",
-	.fops	= &nemclass_fops,
-	.mode	= 0600,
+static int nemclass_acl_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, nemclass_access_proc_show, NULL);
+}
+
+static const struct proc_ops nemclass_acl_pops = {
+	.proc_open	= nemclass_acl_proc_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
 };
+
+static struct proc_dir_entry *nemclass_proc_dir;
 
 static int __init nemclass_parse_key(void)
 {
@@ -182,26 +204,54 @@ static int __init nemclass_parse_key(void)
 
 static int __init nemclass_init(void)
 {
+	struct proc_dir_entry *attach, *acl;
 	int ret;
 
 	ret = nemclass_parse_key();
 	if (ret)
 		return ret;
 
-	ret = misc_register(&nemclass_misc);
-	if (ret) {
-		pr_err("misc_register failed: %d\n", ret);
-		memzero_explicit(nemclass_key, sizeof(nemclass_key));
-		return ret;
+	/* Load the access policy before the interface becomes reachable. */
+	nemclass_access_init();
+
+	nemclass_proc_dir = proc_mkdir("nemclass", NULL);
+	if (!nemclass_proc_dir) {
+		pr_err("proc_mkdir(/proc/nemclass) failed\n");
+		ret = -ENOMEM;
+		goto err_access;
 	}
 
-	pr_info("loaded: /dev/nemclass (abi %u)\n", NEMCLASS_ABI_VERSION);
+	attach = proc_create("attach", 0666, nemclass_proc_dir,
+			     &nemclass_attach_pops);
+	if (!attach) {
+		pr_err("proc_create(/proc/nemclass/attach) failed\n");
+		ret = -ENOMEM;
+		goto err_dir;
+	}
+
+	acl = proc_create("acl", 0444, nemclass_proc_dir, &nemclass_acl_pops);
+	if (!acl) {
+		pr_err("proc_create(/proc/nemclass/acl) failed\n");
+		ret = -ENOMEM;
+		goto err_dir;
+	}
+
+	pr_info("loaded: /proc/nemclass/attach (abi %u)\n", NEMCLASS_ABI_VERSION);
 	return 0;
+
+err_dir:
+	proc_remove(nemclass_proc_dir);	/* removes the dir and any children */
+	nemclass_proc_dir = NULL;
+err_access:
+	nemclass_access_exit();
+	memzero_explicit(nemclass_key, sizeof(nemclass_key));
+	return ret;
 }
 
 static void __exit nemclass_exit(void)
 {
-	misc_deregister(&nemclass_misc);
+	proc_remove(nemclass_proc_dir);
+	nemclass_access_exit();
 	memzero_explicit(nemclass_key, sizeof(nemclass_key));
 	pr_info("unloaded\n");
 }

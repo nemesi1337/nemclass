@@ -80,6 +80,19 @@ long nemclass_do_ptrace_hide(void __user *arg);
 int nemclass_resolve_file_offset(struct task_struct *task, u64 addr,
 				 struct inode **out_inode, loff_t *out_off);
 
+/* --- access.c (open-time uid/gid ACL, live-reloaded numeric config) --- */
+
+struct seq_file;
+
+/* Start the config watcher and load the initial policy (called from init). */
+void nemclass_access_init(void);
+/* Stop the watcher and free the published allowlist (called from exit). */
+void nemclass_access_exit(void);
+/* Open-time gate: 0 if `current` may open the interface, -EACCES otherwise. */
+int nemclass_access_check_open(void);
+/* seq_file show() backing /proc/nemclass/acl. */
+int nemclass_access_proc_show(struct seq_file *m, void *v);
+
 /* --- debugger.c ------------------------------------------------------- */
 
 long nemclass_bp_set(struct nemclass_session *sess, void __user *arg);

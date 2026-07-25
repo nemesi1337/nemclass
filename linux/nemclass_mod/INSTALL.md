@@ -1,9 +1,10 @@
 # Installing `nemclass_mod`
 
-An out-of-tree Linux kernel module that exposes `/dev/nemclass`: kernel-side
-process memory access + a non-ptrace debugger, gated by a symmetric key. This
-guide covers a throwaway dev build, a persistent DKMS install via a symlink,
-loading with the key, device permissions, and removal.
+An out-of-tree Linux kernel module that exposes `/proc/nemclass/`: kernel-side
+process memory access + a non-ptrace debugger, gated by a symmetric key and a
+uid/gid allowlist. This guide covers a throwaway dev build, a persistent DKMS
+install via a symlink, loading with the key, the access-control config, and
+removal.
 
 > Loading any kernel module needs root. The **symmetric key** replaces a
 > capability check for *clients* of the loaded module — it does not change the
@@ -41,7 +42,7 @@ Best while iterating — build in-tree and load the `.ko` directly.
 cd linux/nemclass_mod
 make                                  # -> nemclass_mod.ko
 sudo insmod ./nemclass_mod.ko key=deadbeefcafe
-dmesg | tail -3                       # "loaded: /dev/nemclass (abi 1)"
+dmesg | tail -3                       # "loaded: /proc/nemclass/attach (abi 1)"
 # ... use it ...
 sudo rmmod nemclass_mod
 ```
@@ -116,22 +117,47 @@ sudo chmod 600 /etc/modprobe.d/nemclass_mod.conf   # the key is a secret
 
 ---
 
-## 5. Device node & permissions
+## 5. Interface & access control
 
-The module registers a misc device; udev creates `/dev/nemclass` at load time,
-mode `0600 root:root`. Only root can open it (and still needs the key). To let a
-dedicated group open the node (members still need the key), add a udev rule:
+The module publishes two files under `/proc/nemclass/`:
 
-```sh
-sudo groupadd -f nemclass
-printf 'KERNEL=="nemclass", MODE="0660", GROUP="nemclass"\n' \
-  | sudo tee /etc/udev/rules.d/99-nemclass.rules
-sudo udevadm control --reload && sudo udevadm trigger
-sudo usermod -aG nemclass "$USER"      # re-login to take effect
+- **`attach`** — the ioctl endpoint clients open (replaces the old
+  `/dev/nemclass` char device).
+- **`acl`** — read-only; prints the live access policy (handy for debugging a
+  denial).
+
+Opening `attach` is **not** governed by the file's mode bits. Instead the module
+enforces a uid/gid allowlist in `open()`, driven by a config file it re-reads
+whenever it changes (default every 2 s — no reload needed):
+
+```
+# /etc/nemclass/access.conf  — numeric IDs only (the kernel can't resolve names)
+uid 1000        # allow this user;   id -u <name>            to find it
+gid 1001        # allow this group;  getent group <name>     field 3 is the gid
 ```
 
-Widening the node only controls *who may open it*; the key still gates every
-operation. Leave it at `0600` unless you specifically need group access.
+Install the shipped example and fill in your IDs:
+
+```sh
+sudo install -D -m 0644 access.conf.example /etc/nemclass/access.conf
+sudoedit /etc/nemclass/access.conf                 # add your uid/gid
+cat /proc/nemclass/acl                             # confirm the policy loaded
+```
+
+Rules of the gate:
+
+- **root / `CAP_SYS_ADMIN` is always allowed** and can never be locked out.
+- A missing, empty, or unparsable config **fails closed** — everyone except root
+  is denied.
+- The allowlist only controls *who may open* `attach`; the symmetric **key still
+  gates every operation** ([§4](#4-loading-the-module--the-key)).
+- A different path / poll interval can be set at load:
+  `modprobe nemclass_mod key=… access_config=/etc/nemclass/access.conf access_poll_ms=2000`
+  (`access_poll_ms=0` loads once and stops watching).
+
+> Denied with `EACCES` on open? `dmesg` prints `open denied for uid N`; add that
+> uid (or a gid the user is in) to the config — it takes effect within
+> `access_poll_ms`, no reload.
 
 ---
 
@@ -173,8 +199,8 @@ sudo ./install-dkms.sh uninstall       # dkms remove + delete the symlink
 sudo dkms remove -m nemclass_mod -v 2.0 --all
 sudo rm -f /usr/src/nemclass_mod-2.0
 sudo rm -f /etc/modules-load.d/nemclass_mod.conf \
-           /etc/modprobe.d/nemclass_mod.conf \
-           /etc/udev/rules.d/99-nemclass.rules
+           /etc/modprobe.d/nemclass_mod.conf
+sudo rm -f /etc/nemclass/access.conf              # the access allowlist
 ```
 
 ---
@@ -185,9 +211,10 @@ sudo rm -f /etc/modules-load.d/nemclass_mod.conf \
 |---|---|
 | `insmod: ... Invalid module format` | Built against a different kernel. `make clean && make`, or `dkms build` for the running kernel. |
 | `modprobe: module not found` after DKMS | `dkms install` didn't run `depmod`, or wrong kernel. Check `dkms status`; run `sudo depmod -a`. |
+| `open()` returns `EACCES` | Caller's uid/gid isn't in `/etc/nemclass/access.conf` (and isn't root). `dmesg` shows `open denied for uid N`; add it, or `cat /proc/nemclass/acl`. |
 | gated ioctl returns `EACCES` | Module loaded without `key=`, or the client's key doesn't match. Check `dmesg` for "loaded without key". |
 | `dkms build` produces nothing | Ensure the symlink target has a clean tree (`make clean`); confirm `/usr/src/nemclass_mod-2.0/dkms.conf` resolves through the symlink. |
-| `/dev/nemclass` missing after load | Load failed — check `dmesg`; confirm `misc` + udev are working. |
+| `/proc/nemclass/` missing after load | Load failed — check `dmesg` for the init error. |
 | Load refused under Secure Boot | Sign the module ([§7](#7-secure-boot--module-signing)) or disable Secure Boot. |
 
 Verify a healthy install:
@@ -195,5 +222,5 @@ Verify a healthy install:
 ```sh
 modinfo nemclass_mod | grep -E 'filename|version|vermagic|parm'
 lsmod | grep nemclass_mod
-ls -l /dev/nemclass
+ls -l /proc/nemclass/ && cat /proc/nemclass/acl
 ```

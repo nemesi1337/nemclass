@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * nemclient — userspace exerciser for /dev/nemclass.
+ * nemclient — userspace exerciser for /proc/nemclass/attach.
  *
  * Usage:
  *   nemclient <keyhex> version
@@ -129,9 +129,9 @@ int main(int argc, char **argv)
 	keyhex = argv[1];
 	cmd = argv[2];
 
-	fd = open("/dev/nemclass", O_RDWR);
+	fd = open("/proc/nemclass/attach", O_RDWR);
 	if (fd < 0) {
-		perror("open /dev/nemclass");
+		perror("open /proc/nemclass/attach");
 		return 1;
 	}
 

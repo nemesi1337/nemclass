@@ -1,5 +1,6 @@
 # kbuild / module build artifacts
 *.o
+.*.o.d
 *.ko
 *.mod
 *.mod.c

@@ -1,6 +1,6 @@
 # nemclass_mod — manual test harness
 
-Two small programs to exercise `/dev/nemclass` end-to-end:
+Two small programs to exercise `/proc/nemclass/attach` end-to-end:
 
 - **`fixture`** — a target process. Holds `nem_secret` and `nem_counter` at stable
   addresses, prints its pid + those addresses, then increments `nem_counter` every
@@ -17,13 +17,13 @@ make -C linux/nemclass_mod/test       # fixture + nemclient
 
 ## Load the module
 
-`/dev/nemclass` is created mode 0600 (root). The `key=` value is the shared secret
+`/proc/nemclass/attach` is created mode 0600 (root). The `key=` value is the shared secret
 clients must present; it is raw hex (no `0x`). Add `allow_ptrace_hide=1` only if you
 intend to test the experimental hide path.
 
 ```sh
 sudo insmod linux/nemclass_mod/nemclass_mod.ko key=deadbeefcafe
-dmesg | tail -3          # expect: "loaded: /dev/nemclass (abi 1)"
+dmesg | tail -3          # expect: "loaded: /proc/nemclass/attach (abi 1)"
 ```
 
 Run `nemclient` as root (the device is root-only; the key gates *what* an

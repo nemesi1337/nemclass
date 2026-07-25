@@ -1,7 +1,7 @@
 # Kbuild fragment: the kernel build system reads these when it includes this
 # file via `make -C $(KDIR) M=$(CURDIR) modules`.
 obj-m += nemclass_mod.o
-nemclass_mod-y := src/main.o src/memory_access.o src/debugger.o
+nemclass_mod-y := src/main.o src/memory_access.o src/debugger.o src/access.o
 ccflags-y += -I$(src)/include/uapi
 
 # Standalone / DKMS driver targets. Do NOT gate `all` on KERNELRELEASE: DKMS runs

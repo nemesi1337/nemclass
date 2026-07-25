@@ -50,6 +50,7 @@ cat <<EOF
 
 Installed $PKG/$VER for kernel $(uname -r).
 Load it:   sudo modprobe $PKG key=<hex-secret>
-Check:     modinfo $PKG && ls -l /dev/nemclass   # /dev/nemclass appears after load
+Access:    sudo install -D -m 0644 access.conf.example /etc/nemclass/access.conf  # then add your uid/gid
+Check:     modinfo $PKG && cat /proc/nemclass/acl   # /proc/nemclass/ appears after load
 Remove:    sudo $0 uninstall
 EOF
