@@ -23,15 +23,35 @@ pub use internal::{
     Module,
     // Process enumeration.
     ProcessIterator,
-    // Disassembler wrapper (iced-x86).
+    // Disassembler wrapper (iced-x86). `FlowKind` is the per-instruction
+    // control-flow class the dissector/analysis layer reasons about.
     InstructionData,
+    FlowKind,
     disassemble_instructions,
+    // Memory-dissection analysis (M5.1): address classification, string
+    // detection, and pointer/vtable classification. The pure cores
+    // (`RegionIndex::from_sections`, `detect_strings`, `classify_value`) are
+    // platform-neutral; `disassemble_function`/`classify_in_process` are
+    // re-exported below under `#[cfg(target_os = "linux")]`.
+    AddrClass,
+    RegionIndex,
+    StrKind,
+    StringRun,
+    detect_strings,
+    string_at,
+    PointerClass,
+    classify_value,
     // PE utilities (shared between Wine detection and a future Windows backend).
     pe,
     // Exported-symbol resolution (PE export directory / ELF `.dynsym`).
     Symbol,
     symbols,
 };
+
+// Linux-only analysis conveniences that touch a live `Process`/`/proc`: the
+// linear function walk and the in-process pointer classifier.
+#[cfg(target_os = "linux")]
+pub use internal::{FunctionDisasm, classify_in_process, disassemble_function};
 
 // Native Linux provider (`process_vm_readv` + `/proc`), Linux-only, plus the
 // backend-name constants (`"linux-native"` / `"linux-kernel"`) a UI keys off.

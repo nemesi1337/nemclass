@@ -1,6 +1,11 @@
 mod decoder;
 mod process;
 
+// Memory-dissection analysis (M5.1): region classification, string detection,
+// pointer/vtable classification, and (Linux) live-process function walks. Layers
+// on top of `decoder` + `process`; its pure core is platform-neutral.
+mod analysis;
+
 // Re-export the curated public surface from the platform-specific submodules so
 // `lib.rs` can lift it to the crate root. The `process` module tree itself stays
 // private — callers use these names, not `internal::process::…` paths.
@@ -31,4 +36,15 @@ pub use process::{
 };
 
 // Disassembler wrapper (iced-x86) — consumed by the future scanner/host APIs.
-pub use decoder::{InstructionData, disassemble_instructions};
+// `FlowKind` is the coarse control-flow class carried on each `InstructionData`.
+pub use decoder::{FlowKind, InstructionData, disassemble_instructions};
+
+// Memory-dissection analysis surface (M5.1). The `analysis` module tree stays
+// private; callers use these curated names. `disasm`'s live-process walk and the
+// `from_pid`/`classify_in_process` conveniences are Linux-only.
+pub use analysis::{
+    AddrClass, PointerClass, RegionIndex, StrKind, StringRun, classify_value, detect_strings,
+    string_at,
+};
+#[cfg(target_os = "linux")]
+pub use analysis::{FunctionDisasm, classify_in_process, disassemble_function};

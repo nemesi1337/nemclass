@@ -308,7 +308,7 @@ fn parse_maps_modules(maps: &str) -> Vec<RawModule> {
 /// [`SectionType::Image`] and carry their module file name; anonymous mappings
 /// are [`SectionType::Mapped`]. Sections are returned in `maps` order.
 #[cfg(target_os = "linux")]
-fn parse_maps_sections(maps: &str) -> Vec<Section> {
+pub(crate) fn parse_maps_sections(maps: &str) -> Vec<Section> {
     let mut out = Vec::new();
 
     for line in maps.lines() {
