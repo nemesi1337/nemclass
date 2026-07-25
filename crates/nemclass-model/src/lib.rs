@@ -7,6 +7,7 @@
 pub mod address;
 pub mod class;
 pub mod codegen;
+pub mod dissect;
 pub mod enums;
 pub mod error;
 pub mod node;
