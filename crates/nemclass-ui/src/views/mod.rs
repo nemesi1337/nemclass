@@ -25,7 +25,7 @@ pub use debugger_panel::DebuggerPanel;
 pub use memory_viewer::MemoryViewer;
 pub use disassembly::DisassemblyPanel;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,58 @@ struct NodeSnapshot {
     name: String,
     comment: String,
     _memory_size: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Live child rows injected below VTable / Function / FunctionPtr nodes
+// (Linux only — on other platforms these type_tags render their static value)
+// ---------------------------------------------------------------------------
+
+/// One live child row for a VTable node: a single vtable slot.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct VtableMethodRow {
+    /// Index of this slot in the vtable array (0-based).
+    slot: usize,
+    /// Absolute address of the function pointer this slot holds.
+    fn_ptr: u64,
+    /// Resolved symbol name, if `resolve_symbol` succeeded.
+    symbol: Option<String>,
+}
+
+/// One live child row for a Function / FunctionPtr node: a single instruction.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct DisasmRow {
+    /// Virtual address of the instruction.
+    address: u64,
+    /// Hex-formatted bytes of the instruction (space-separated, e.g. "48 89 e5").
+    bytes_hex: String,
+    /// Formatted assembly text (e.g. "push rbp").
+    instruction: String,
+    /// For call/jmp with a resolved target: the target address, so the UI can
+    /// render a "disasm" link.
+    target: Option<u64>,
+}
+
+/// The live-row cache entry for one node.
+#[cfg(target_os = "linux")]
+enum LiveEntry {
+    Vtable(Vec<VtableMethodRow>),
+    Disasm(Vec<DisasmRow>),
+    /// No process attached — placeholder shown when the node is expanded.
+    NotAttached,
+}
+
+/// Augmented view row: either an index into `node_snapshots` or a live child.
+enum ViewRow {
+    Snap(usize),
+    #[cfg(target_os = "linux")]
+    VtableMethod { _parent_id: String, depth: usize, row: VtableMethodRow },
+    #[cfg(target_os = "linux")]
+    DisasmInsn   { _parent_id: String, depth: usize, row: DisasmRow },
+    #[cfg(target_os = "linux")]
+    NotAttached  { _parent_id: String, depth: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +211,17 @@ pub struct NemclassApp {
     collapsed: HashSet<String>,
     edit_state: Option<EditState>,
 
+    /// Live child-row cache for VTable/Function/FunctionPtr nodes.
+    /// Keyed by `id_path`; populated on each snapshot tick for expanded nodes.
+    /// Guarded by cfg so we don't carry dead fields on Windows.
+    #[cfg(target_os = "linux")]
+    live_cache: HashMap<String, LiveEntry>,
+    /// Pending "open disassembly at this address" request collected during the
+    /// draw phase of show_class_view; applied after the table body closes to
+    /// avoid borrow conflicts.
+    #[cfg(target_os = "linux")]
+    pending_disasm_goto: Option<u64>,
+
     // Scripting seam
     event_bus: EventBus,
 
@@ -219,6 +282,10 @@ impl NemclassApp {
             snapshot_interval: Duration::from_millis(100),
             collapsed: HashSet::new(),
             edit_state: None,
+            #[cfg(target_os = "linux")]
+            live_cache: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            pending_disasm_goto: None,
             event_bus: EventBus::new(),
             file_dialog: None,
             status_msg: Some("Demo project loaded. Use File > New or Open to load a project.".into()),
@@ -477,6 +544,8 @@ impl NemclassApp {
         self.mem_buf = buf;
 
         self.rebuild_snapshots_from_buf(uuid);
+        #[cfg(target_os = "linux")]
+        self.refresh_live_cache();
         self.last_snapshot = Some(Instant::now());
     }
 
@@ -493,6 +562,178 @@ impl NemclassApp {
                 String::new(),
                 &mut self.node_snapshots,
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Live child-row cache — VTable / Function / FunctionPtr expansion
+    // (Linux only; on other platforms these nodes just show their static value)
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    fn refresh_live_cache(&mut self) {
+        use nemclass_core::{
+            RegionIndex, classify_in_process, disassemble_function,
+            PointerClass,
+        };
+
+        // Local helper: read 8 bytes as a little-endian u64.
+        fn read_u64(proc: &Process, addr: usize) -> Option<u64> {
+            let mut buf = [0u8; 8];
+            let n = proc.read_buf(addr, &mut buf).unwrap_or(0);
+            if n >= 8 { Some(u64::from_le_bytes(buf)) } else { None }
+        }
+
+        // Remove entries for nodes that are now collapsed or no longer present.
+        let snapshots = &self.node_snapshots;
+        let collapsed  = &self.collapsed;
+        self.live_cache.retain(|id, _| {
+            snapshots.iter().any(|s| s.id_path == *id)
+                && !collapsed.contains(id)
+        });
+
+        let proc = match &self.process {
+            Some(p) => p,
+            None => {
+                // No process: populate NotAttached for every expanded
+                // VTable/Function/FunctionPtr that is not already cached.
+                for snap in &self.node_snapshots {
+                    if !matches!(snap.type_tag, "VTable" | "Function" | "FunctionPtr") {
+                        continue;
+                    }
+                    if collapsed.contains(&snap.id_path) {
+                        continue;
+                    }
+                    self.live_cache
+                        .entry(snap.id_path.clone())
+                        .or_insert(LiveEntry::NotAttached);
+                }
+                return;
+            }
+        };
+
+        // Build a RegionIndex once per refresh (one /proc/<pid>/maps parse).
+        let pid = proc.pid();
+        let region_index = match RegionIndex::from_pid(pid) {
+            Ok(idx) => idx,
+            Err(_) => return,
+        };
+
+        // Clone the snapshot list metadata we need (addresses + type tags).
+        // We need to avoid holding &self.process while also calling &mut self.live_cache.
+        let targets: Vec<(String, &'static str, usize)> = self
+            .node_snapshots
+            .iter()
+            .filter(|s| matches!(s.type_tag, "VTable" | "Function" | "FunctionPtr"))
+            .filter(|s| !collapsed.contains(&s.id_path))
+            .map(|s| (s.id_path.clone(), s.type_tag, s.address))
+            .collect();
+
+        for (id_path, type_tag, node_addr) in targets {
+            // Only refresh if not already cached (cache cleared above on collapse).
+            if self.live_cache.contains_key(&id_path) {
+                continue;
+            }
+
+            match type_tag {
+                "VTable" => {
+                    // Read the 8-byte vptr stored at node_addr.
+                    let vtable_addr = match read_u64(proc, node_addr) {
+                        Some(v) if v != 0 => v,
+                        _ => {
+                            self.live_cache.insert(id_path, LiveEntry::Vtable(Vec::new()));
+                            continue;
+                        }
+                    };
+
+                    // Walk the vtable array: read up to 64 function pointers,
+                    // stopping at the first non-executable entry.
+                    const MAX_VTABLE_METHODS: usize = 64;
+                    let mut methods = Vec::new();
+                    for slot in 0..MAX_VTABLE_METHODS {
+                        let entry_addr = match (vtable_addr as usize).checked_add(slot * 8) {
+                            Some(a) => a,
+                            None => break,
+                        };
+                        let fn_ptr = match read_u64(proc, entry_addr) {
+                            Some(v) if v != 0 => v,
+                            _ => break,
+                        };
+                        // Stop if not executable (non-code pointer ends the vtable).
+                        let fn_usize = match usize::try_from(fn_ptr) {
+                            Ok(a) => a,
+                            Err(_) => break,
+                        };
+                        let class = classify_in_process(fn_ptr, &region_index, proc);
+                        if !matches!(class, PointerClass::CodePtr) {
+                            break;
+                        }
+                        // Try to resolve a symbol name.
+                        let symbol = proc
+                            .resolve_symbol(fn_usize)
+                            .ok()
+                            .flatten();
+                        methods.push(VtableMethodRow { slot, fn_ptr, symbol });
+                    }
+                    self.live_cache.insert(id_path, LiveEntry::Vtable(methods));
+                }
+
+                "Function" | "FunctionPtr" => {
+                    // For FunctionPtr: the node holds a pointer-to-function;
+                    // read that pointer first, then disassemble at it.
+                    // For Function: the node address is the code address directly.
+                    let code_addr = if type_tag == "FunctionPtr" {
+                        match read_u64(proc, node_addr) {
+                            Some(v) if v != 0 => v,
+                            _ => {
+                                self.live_cache.insert(id_path, LiveEntry::Disasm(Vec::new()));
+                                continue;
+                            }
+                        }
+                    } else {
+                        node_addr as u64
+                    };
+
+                    if code_addr == 0 {
+                        self.live_cache.insert(id_path, LiveEntry::Disasm(Vec::new()));
+                        continue;
+                    }
+
+                    const MAX_BYTES: usize = 512;
+                    let disasm = match disassemble_function(proc, code_addr, MAX_BYTES) {
+                        Ok(d) => d,
+                        Err(_) => {
+                            self.live_cache.insert(id_path, LiveEntry::Disasm(Vec::new()));
+                            continue;
+                        }
+                    };
+
+                    // Cap at 32 instructions for inline display.
+                    const MAX_INLINE_INSNS: usize = 32;
+                    let rows: Vec<DisasmRow> = disasm
+                        .instructions
+                        .into_iter()
+                        .take(MAX_INLINE_INSNS)
+                        .map(|ins| {
+                            let bytes_hex = ins
+                                .data
+                                .iter()
+                                .map(|b| format!("{b:02X}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            DisasmRow {
+                                address: ins.address,
+                                bytes_hex,
+                                instruction: ins.instruction,
+                                target: ins.target,
+                            }
+                        })
+                        .collect();
+                    self.live_cache.insert(id_path, LiveEntry::Disasm(rows));
+                }
+
+                _ => {}
+            }
         }
     }
 
@@ -1028,6 +1269,8 @@ impl NemclassApp {
             && let Some(uuid) = self.selected_class
         {
             self.rebuild_snapshots_from_buf(uuid);
+            #[cfg(target_os = "linux")]
+            self.refresh_live_cache();
         }
 
         if self.node_snapshots.is_empty() {
@@ -1035,11 +1278,24 @@ impl NemclassApp {
             return;
         }
 
-        let visible: Vec<usize> =
-            build_visible_rows(&self.node_snapshots, &self.collapsed);
+        // Build the augmented visible-row list.  Normal nodes come from
+        // `build_visible_rows`; after each expanded VTable/Function/FunctionPtr
+        // we inject live child rows from the cache.  This leaves the static
+        // flatten/collapse logic completely untouched.
+        let view_rows = build_augmented_rows(
+            &self.node_snapshots,
+            &self.collapsed,
+            #[cfg(target_os = "linux")]
+            &self.live_cache,
+        );
 
         let text_height = ui.text_style_height(&egui::TextStyle::Body);
         let row_height = text_height + 4.0;
+
+        // Collect a pending disasm-goto request during the table draw and apply
+        // it after the closure exits (avoids the borrow conflict on `self`).
+        #[cfg(target_os = "linux")]
+        { self.pending_disasm_goto = None; }
 
         TableBuilder::new(ui)
             .striped(true)
@@ -1059,87 +1315,191 @@ impl NemclassApp {
                 header.col(|ui| { ui.strong("Comment"); });
             })
             .body(|body| {
-                body.rows(row_height, visible.len(), |mut row| {
+                body.rows(row_height, view_rows.len(), |mut row| {
                     let row_idx = row.index();
-                    let Some(&snap_idx) = visible.get(row_idx) else { return; };
-                    let snap = &self.node_snapshots[snap_idx];
+                    let Some(view_row) = view_rows.get(row_idx) else { return; };
 
-                    let address     = snap.address;
-                    let offset      = snap.offset;
-                    let type_tag    = snap.type_tag;
-                    let name        = snap.name.clone();
-                    let comment     = snap.comment.clone();
-                    let value       = snap.rendered.value.clone();
-                    let depth       = snap.depth;
-                    let has_children = snap.has_children;
-                    let id_path     = snap.id_path.clone();
+                    match view_row {
+                        ViewRow::Snap(snap_idx) => {
+                            let snap = &self.node_snapshots[*snap_idx];
 
-                    row.col(|ui| { ui.monospace(format!("0x{address:016X}")); });
-                    row.col(|ui| { ui.monospace(format!("+{offset:#06X}")); });
-                    row.col(|ui| { ui.label(type_tag); });
+                            let address      = snap.address;
+                            let offset       = snap.offset;
+                            let type_tag     = snap.type_tag;
+                            let name         = snap.name.clone();
+                            let comment      = snap.comment.clone();
+                            let value        = snap.rendered.value.clone();
+                            let depth        = snap.depth;
+                            let has_children = snap.has_children;
+                            let id_path      = snap.id_path.clone();
 
-                    row.col(|ui| {
-                        ui.horizontal(|ui| {
-                            let indent = depth as f32 * 12.0;
-                            if indent > 0.0 { ui.add_space(indent); }
+                            // For live-expandable nodes, we treat them as
+                            // containers (has_children for collapse toggle) even
+                            // if the static model has no children.
+                            #[cfg(target_os = "linux")]
+                            let is_live_container = matches!(
+                                type_tag, "VTable" | "Function" | "FunctionPtr"
+                            );
+                            #[cfg(not(target_os = "linux"))]
+                            let is_live_container = false;
 
-                            if has_children {
-                                let collapsed = self.collapsed.contains(&id_path);
-                                let arrow = if collapsed { "▶" } else { "▼" };
-                                if ui.small_button(arrow).clicked() {
-                                    if collapsed {
-                                        self.collapsed.remove(&id_path);
+                            row.col(|ui| { ui.monospace(format!("0x{address:016X}")); });
+                            row.col(|ui| { ui.monospace(format!("+{offset:#06X}")); });
+                            row.col(|ui| { ui.label(type_tag); });
+
+                            row.col(|ui| {
+                                ui.horizontal(|ui| {
+                                    let indent = depth as f32 * 12.0;
+                                    if indent > 0.0 { ui.add_space(indent); }
+
+                                    if has_children || is_live_container {
+                                        let collapsed = self.collapsed.contains(&id_path);
+                                        let arrow = if collapsed { "▶" } else { "▼" };
+                                        if ui.small_button(arrow).clicked() {
+                                            if collapsed {
+                                                self.collapsed.remove(&id_path);
+                                            } else {
+                                                self.collapsed.insert(id_path.clone());
+                                            }
+                                        }
                                     } else {
-                                        self.collapsed.insert(id_path.clone());
+                                        ui.add_space(16.0);
                                     }
-                                }
-                            } else {
-                                ui.add_space(16.0);
-                            }
-                            ui.label(&name);
-                        });
-                    });
+                                    ui.label(&name);
+                                });
+                            });
 
-                    row.col(|ui| {
-                        let editing = self
-                            .edit_state
-                            .as_ref()
-                            .is_some_and(|e| e.node_id == id_path);
+                            row.col(|ui| {
+                                let editing = self
+                                    .edit_state
+                                    .as_ref()
+                                    .is_some_and(|e| e.node_id == id_path);
 
-                        if is_editable(type_tag) && self.process.is_some() {
-                            if editing {
-                                let resp = ui.text_edit_singleline(
-                                    &mut self.edit_state.as_mut().unwrap().text,
-                                );
-                                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                                if resp.lost_focus() || enter {
-                                    self.commit_edit();
-                                } else if escape {
-                                    self.edit_state = None;
+                                if is_editable(type_tag) && self.process.is_some() {
+                                    if editing {
+                                        let resp = ui.text_edit_singleline(
+                                            &mut self.edit_state.as_mut().unwrap().text,
+                                        );
+                                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                        if resp.lost_focus() || enter {
+                                            self.commit_edit();
+                                        } else if escape {
+                                            self.edit_state = None;
+                                        }
+                                    } else {
+                                        let resp = ui.selectable_label(false, &value);
+                                        if resp.double_clicked() {
+                                            let seed = value
+                                                .strip_prefix("0x")
+                                                .or_else(|| value.strip_prefix("0X"))
+                                                .unwrap_or(&value)
+                                                .to_owned();
+                                            self.edit_state = Some(EditState {
+                                                node_id: id_path.clone(),
+                                                text: seed,
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    ui.label(&value);
                                 }
-                            } else {
-                                let resp = ui.selectable_label(false, &value);
-                                if resp.double_clicked() {
-                                    let seed = value
-                                        .strip_prefix("0x")
-                                        .or_else(|| value.strip_prefix("0X"))
-                                        .unwrap_or(&value)
-                                        .to_owned();
-                                    self.edit_state = Some(EditState {
-                                        node_id: id_path.clone(),
-                                        text: seed,
-                                    });
-                                }
-                            }
-                        } else {
-                            ui.label(&value);
+                            });
+
+                            row.col(|ui| { ui.label(&comment); });
                         }
-                    });
 
-                    row.col(|ui| { ui.label(&comment); });
+                        #[cfg(target_os = "linux")]
+                        ViewRow::NotAttached { depth, _parent_id: _ } => {
+                            row.col(|ui| { ui.label(""); });
+                            row.col(|ui| { ui.label(""); });
+                            row.col(|ui| { ui.label(""); });
+                            row.col(|ui| {
+                                ui.horizontal(|ui| {
+                                    let indent = (*depth as f32 + 1.0) * 12.0;
+                                    if indent > 0.0 { ui.add_space(indent); }
+                                    ui.colored_label(
+                                        egui::Color32::DARK_GRAY,
+                                        "attach to inspect",
+                                    );
+                                });
+                            });
+                            row.col(|ui| { ui.label(""); });
+                            row.col(|ui| { ui.label(""); });
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        ViewRow::VtableMethod { depth, row: method, _parent_id: _ } => {
+                            let addr = method.fn_ptr;
+                            let slot = method.slot;
+                            let sym  = method.symbol.clone();
+
+                            row.col(|ui| { ui.monospace(format!("0x{addr:016X}")); });
+                            row.col(|ui| {
+                                ui.monospace(format!("+{:#06X}", slot * 8));
+                            });
+                            row.col(|ui| { ui.label("VMethod"); });
+                            row.col(|ui| {
+                                ui.horizontal(|ui| {
+                                    let indent = (*depth as f32 + 1.0) * 12.0;
+                                    if indent > 0.0 { ui.add_space(indent); }
+                                    ui.add_space(16.0); // leaf — no arrow
+                                    let label = sym.as_deref()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    ui.label(format!("[{slot}] {label}"));
+                                });
+                            });
+                            row.col(|ui| {
+                                // "disasm" link — stored as pending to avoid
+                                // mutably borrowing self inside the body closure.
+                                if ui.small_button("disasm").clicked() {
+                                    self.pending_disasm_goto = Some(addr);
+                                }
+                            });
+                            row.col(|ui| { ui.label(""); });
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        ViewRow::DisasmInsn { depth, row: insn, _parent_id: _ } => {
+                            let addr    = insn.address;
+                            let bytes   = insn.bytes_hex.clone();
+                            let text    = insn.instruction.clone();
+                            let target  = insn.target;
+
+                            row.col(|ui| { ui.monospace(format!("0x{addr:016X}")); });
+                            row.col(|ui| { ui.label(""); });
+                            row.col(|ui| { ui.label(""); });
+                            row.col(|ui| {
+                                ui.horizontal(|ui| {
+                                    let indent = (*depth as f32 + 1.0) * 12.0;
+                                    if indent > 0.0 { ui.add_space(indent); }
+                                    ui.add_space(16.0);
+                                    ui.monospace(&bytes);
+                                });
+                            });
+                            row.col(|ui| {
+                                if let Some(tgt) = target {
+                                    // Clickable link for call/jmp with a resolved target.
+                                    if ui.link(&text).clicked() {
+                                        self.pending_disasm_goto = Some(tgt);
+                                    }
+                                } else {
+                                    ui.monospace(&text);
+                                }
+                            });
+                            row.col(|ui| { ui.label(""); });
+                        }
+                    }
                 });
             });
+
+        // Apply any pending disasm navigation collected during the draw phase.
+        #[cfg(target_os = "linux")]
+        if let Some(addr) = self.pending_disasm_goto.take() {
+            self.central_tab = CentralTab::Disassembly;
+            self.disassembly_panel.goto(addr as usize);
+        }
     }
 }
 
@@ -1213,6 +1573,64 @@ fn build_visible_rows(
         visible.push(i);
     }
     visible
+}
+
+/// Build an augmented row list that interleaves live child rows (VTable slots,
+/// disassembly lines) right after each expanded live-container snapshot.
+///
+/// On non-Linux platforms the live_cache parameter is absent and this reduces
+/// to a plain `build_visible_rows` wrapper.
+fn build_augmented_rows(
+    snapshots: &[NodeSnapshot],
+    collapsed: &HashSet<String>,
+    #[cfg(target_os = "linux")]
+    live_cache: &HashMap<String, LiveEntry>,
+) -> Vec<ViewRow> {
+    let snap_indices = build_visible_rows(snapshots, collapsed);
+    let mut out: Vec<ViewRow> = Vec::with_capacity(snap_indices.len() * 2);
+
+    for snap_idx in snap_indices {
+        out.push(ViewRow::Snap(snap_idx));
+
+        let snap = &snapshots[snap_idx];
+
+        // Only inject live rows for the three live-expandable type tags,
+        // and only when the node is not collapsed.
+        #[cfg(target_os = "linux")]
+        if matches!(snap.type_tag, "VTable" | "Function" | "FunctionPtr")
+            && !collapsed.contains(&snap.id_path)
+        {
+            match live_cache.get(&snap.id_path) {
+                Some(LiveEntry::Vtable(methods)) => {
+                    for m in methods {
+                        out.push(ViewRow::VtableMethod {
+                            _parent_id: snap.id_path.clone(),
+                            depth: snap.depth,
+                            row: m.clone(),
+                        });
+                    }
+                }
+                Some(LiveEntry::Disasm(insns)) => {
+                    for insn in insns {
+                        out.push(ViewRow::DisasmInsn {
+                            _parent_id: snap.id_path.clone(),
+                            depth: snap.depth,
+                            row: insn.clone(),
+                        });
+                    }
+                }
+                Some(LiveEntry::NotAttached) => {
+                    out.push(ViewRow::NotAttached {
+                        _parent_id: snap.id_path.clone(),
+                        depth: snap.depth,
+                    });
+                }
+                None => {}
+            }
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
