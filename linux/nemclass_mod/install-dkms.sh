@@ -43,13 +43,17 @@ ln -sfn "$SRC_DIR" "$LINK"
 echo "symlinked $LINK -> $SRC_DIR"
 
 dkms status -m "$PKG" -v "$VER" | grep -q . || dkms add -m "$PKG" -v "$VER"
-dkms build   -m "$PKG" -v "$VER"
+# --force on BOTH: PACKAGE_VERSION never bumps across source edits, so a plain
+# `dkms build` would see the cached object for this version and skip — silently
+# reinstalling a STALE .ko. Force the rebuild so re-running always ships the
+# current tree (the symlink already points DKMS at these live sources).
+dkms build   -m "$PKG" -v "$VER" --force
 dkms install -m "$PKG" -v "$VER" --force
 
 cat <<EOF
 
 Installed $PKG/$VER for kernel $(uname -r).
-Load it:   sudo modprobe $PKG key=<hex-secret>
+Load it:   sudo modprobe $PKG key=\$(head -c 32 /dev/urandom | xxd -p -c 64)   # random hex key
 Access:    sudo install -D -m 0644 access.conf.example /etc/nemclass/access.conf  # then add your uid/gid
 Check:     modinfo $PKG && cat /proc/nemclass/acl   # /proc/nemclass/ appears after load
 Remove:    sudo $0 uninstall

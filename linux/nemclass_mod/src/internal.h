@@ -29,6 +29,7 @@ extern bool nemclass_allow_ptrace_hide;
  */
 struct nemclass_session {
 	bool			authed;
+	unsigned int		auth_failures;	/* per-fd failed AUTH count (throttle) */
 	struct mutex		lock;		/* guards `slots` + `next_slot` */
 	struct list_head	slots;		/* struct nemclass_slot.node */
 	int			next_slot;
@@ -59,6 +60,7 @@ struct nemclass_slot {
 	loff_t			offset;
 	struct uprobe		*uprobe;
 	struct uprobe_consumer	uc;
+	struct mm_struct	*target_mm;	/* mmgrab'd; filter scopes hits to it */
 };
 
 /* --- memory_access.c -------------------------------------------------- */

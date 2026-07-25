@@ -17,12 +17,13 @@ make -C linux/nemclass_mod/test       # fixture + nemclient
 
 ## Load the module
 
-`/proc/nemclass/attach` is created mode 0600 (root). The `key=` value is the shared secret
-clients must present; it is raw hex (no `0x`). Add `allow_ptrace_hide=1` only if you
-intend to test the experimental hide path.
+Opening `/proc/nemclass/attach` is gated by the uid/gid allowlist (root always
+allowed). The `key=` value is the shared secret clients must present; it is raw
+hex (no `0x`), up to 64 bytes (use a random one in real use). Add
+`allow_ptrace_hide=1` only if you intend to test the experimental hide path.
 
 ```sh
-sudo insmod linux/nemclass_mod/nemclass_mod.ko key=deadbeefcafe
+sudo insmod linux/nemclass_mod/nemclass_mod.ko key=000102030405060708090a0b0c0d0e0f
 dmesg | tail -3          # expect: "loaded: /proc/nemclass/attach (abi 1)"
 ```
 
@@ -35,7 +36,7 @@ authenticated client may do, not who may open the node).
 cd linux/nemclass_mod/test
 ./fixture &             # note: pid=..., secret_addr=0x..., counter_addr=0x...
 
-KEY=deadbeefcafe
+KEY=000102030405060708090a0b0c0d0e0f     # must equal the module's key=
 PID=<pid from fixture>
 SEC=<secret_addr>
 CNT=<counter_addr>
@@ -59,15 +60,16 @@ involved. Pass a 4th arg (`x|w|r|rw`) to change the trigger type.
 # In another shell, attach a tracer so TracerPid is set:
 sudo gdb -p $PID
 sudo ./nemclient $KEY ptrace $PID              # -> traced=1 tracer_pid=<gdb>
-# Only if loaded with allow_ptrace_hide=1 (destabilises a live tracer — see note):
-sudo ./nemclient $KEY hide   $PID
-cat /proc/$PID/status | grep TracerPid         # -> 0
+# hide REFUSES while a real external tracer is attached (only with allow_ptrace_hide=1):
+sudo ./nemclient $KEY hide   $PID              # -> EBUSY (external tracer would be raced)
 ```
 
-> **Warning:** `hide` clears the target's ptrace flag without unlinking the tracer
-> (a safe unlink needs `tasklist_lock`/`__ptrace_unlink`, not exported to modules).
-> Against a live external tracer this is racy and can destabilise it. It is meant
-> for targets that self-`PTRACE_TRACEME` as anti-debug, and is off by default.
+> **Note:** `hide` clears the target's ptrace flag word without unlinking the
+> tracer (a safe unlink needs `tasklist_lock`/`__ptrace_unlink`, not exported to
+> modules), so it is racy against a live external tracer and can destabilise it.
+> The module therefore **refuses** (`EBUSY`) when the tracer is in another thread
+> group — as with the `gdb` above — and only permits the spoof for a process that
+> ptraces *itself* as anti-debug. Off by default (`allow_ptrace_hide=1`).
 
 ## Unload
 

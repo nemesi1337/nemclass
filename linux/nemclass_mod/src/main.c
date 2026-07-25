@@ -13,6 +13,7 @@
  */
 #define pr_fmt(fmt) "nemclass: " fmt
 
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/hex.h>
 #include <linux/init.h>
@@ -49,6 +50,9 @@ MODULE_PARM_DESC(allow_ptrace_hide,
 static u8  nemclass_key[NEMCLASS_KEY_MAX];
 static u32 nemclass_key_len;
 
+/* Latch a fd's AUTH shut after this many wrong guesses (brute-force backstop). */
+#define NEMCLASS_AUTH_MAX_FAILURES	16u
+
 static long nemclass_do_auth(struct nemclass_session *sess, void __user *arg)
 {
 	struct nemclass_auth a;
@@ -62,12 +66,31 @@ static long nemclass_do_auth(struct nemclass_session *sess, void __user *arg)
 		ret = -EACCES;
 		goto out;
 	}
+	/*
+	 * Once a fd has burned through its guess budget it stays locked: the
+	 * client must reopen (which is itself gated by the uid/gid allowlist).
+	 */
+	if (sess->auth_failures >= NEMCLASS_AUTH_MAX_FAILURES) {
+		pr_warn_ratelimited("AUTH locked on this fd after %u failures; reopen to retry\n",
+				    sess->auth_failures);
+		ret = -EACCES;
+		goto out;
+	}
 	if (a.key_len != nemclass_key_len ||
 	    crypto_memneq(a.key, nemclass_key, nemclass_key_len)) {
+		sess->auth_failures++;
+		/*
+		 * Escalating throttle. The compare is already constant-time; this
+		 * blunts online brute force by making each wrong guess cost real
+		 * wall-clock. Because the caller sleeps here, it also slows the
+		 * open-many-fds variant, not just repeats on one fd.
+		 */
+		msleep(min_t(unsigned int, sess->auth_failures * 100u, 2000u));
 		ret = -EACCES;
 		goto out;
 	}
 	sess->authed = true;
+	sess->auth_failures = 0;
 out:
 	memzero_explicit(&a, sizeof(a));
 	return ret;
@@ -94,6 +117,17 @@ static long nemclass_ioctl(struct file *file, unsigned int cmd,
 
 	/* Everything else requires a successful handshake on this fd. */
 	if (!sess->authed)
+		return -EACCES;
+
+	/*
+	 * Re-assert the open-time allowlist against the *current* caller on every
+	 * privileged ioctl. Access is checked once in ->open, but an authenticated
+	 * fd can be handed to another process (SCM_RIGHTS) or inherited across
+	 * fork/exec by a lower-privileged child; re-checking here denies a holder
+	 * that is not itself allowlisted (CAP_SYS_ADMIN still always passes), and
+	 * also picks up a live allowlist edit that has since removed the caller.
+	 */
+	if (nemclass_access_check_open())
 		return -EACCES;
 
 	switch (cmd) {
@@ -191,13 +225,21 @@ static int __init nemclass_parse_key(void)
 	if (slen % 2 || (slen / 2) > NEMCLASS_KEY_MAX) {
 		pr_err("invalid key: need even-length hex, <= %u bytes\n",
 		       NEMCLASS_KEY_MAX);
+		memzero_explicit(key, slen);
 		return -EINVAL;
 	}
 	if (hex2bin(nemclass_key, key, slen / 2)) {
 		pr_err("invalid key: not valid hex\n");
+		memzero_explicit(key, slen);
 		return -EINVAL;
 	}
 	nemclass_key_len = slen / 2;
+	/*
+	 * Scrub the raw hex string now that we hold the parsed bytes: the charp
+	 * param otherwise keeps the secret in kernel memory for the module's
+	 * lifetime (and readable via /sys/module/.../parameters/key, mode 0400).
+	 */
+	memzero_explicit(key, slen);
 	pr_info("auth key configured (%u bytes)\n", nemclass_key_len);
 	return 0;
 }

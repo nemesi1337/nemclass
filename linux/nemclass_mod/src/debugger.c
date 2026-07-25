@@ -25,6 +25,7 @@
 #include <linux/printk.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -152,11 +153,27 @@ static int nemclass_uprobe_handler(struct uprobe_consumer *self,
 	return 0;
 }
 
+/*
+ * uprobe_register() installs on the inode+offset, so absent a filter the probe
+ * fires for EVERY process that executes that page (e.g. a libc offset) and would
+ * leak unrelated tasks' register snapshots to this fd. Restrict insertion to the
+ * target's address space by identity: only the mm we pinned at arm time passes.
+ * (Returning true tells uprobes to install in that mm; false skips it.)
+ */
+static bool nemclass_uprobe_filter(struct uprobe_consumer *self,
+				   struct mm_struct *mm)
+{
+	struct nemclass_slot *slot = container_of(self, struct nemclass_slot, uc);
+
+	return mm == slot->target_mm;
+}
+
 static long nemclass_arm_uprobe(struct nemclass_slot *slot,
 				struct nemclass_bp_set *req,
 				struct task_struct *task)
 {
 	struct inode *inode = NULL;
+	struct mm_struct *mm;
 	loff_t off = 0;
 	long ret;
 
@@ -164,14 +181,32 @@ static long nemclass_arm_uprobe(struct nemclass_slot *slot,
 	if (ret)
 		return ret;
 
+	/*
+	 * Pin the target mm so the filter can scope hits to this process. mmgrab
+	 * takes an mm_count (structure) reference, not mm_users, so the pointer
+	 * stays valid (and its identity unique) even after the target exits —
+	 * without keeping its address space alive. Released in slot_reclaim.
+	 */
+	mm = get_task_mm(task);
+	if (!mm) {
+		iput(inode);
+		return -ESRCH;
+	}
+	mmgrab(mm);
+	mmput(mm);
+	slot->target_mm = mm;
+
 	slot->inode = inode;
 	slot->offset = off;
 	slot->uc.handler = nemclass_uprobe_handler;
+	slot->uc.filter  = nemclass_uprobe_filter;
 
 	slot->uprobe = uprobe_register(inode, off, 0, &slot->uc);
 	if (IS_ERR(slot->uprobe)) {
 		ret = PTR_ERR(slot->uprobe);
 		slot->uprobe = NULL;
+		mmdrop(slot->target_mm);
+		slot->target_mm = NULL;
 		iput(inode);
 		slot->inode = NULL;
 		return ret;
@@ -221,6 +256,10 @@ static void nemclass_slot_reclaim(struct nemclass_slot *slot)
 	if (slot->inode) {
 		iput(slot->inode);
 		slot->inode = NULL;
+	}
+	if (slot->target_mm) {
+		mmdrop(slot->target_mm);
+		slot->target_mm = NULL;
 	}
 	kfree(slot);
 }

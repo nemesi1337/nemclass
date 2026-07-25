@@ -12,6 +12,36 @@ removal.
 
 ---
 
+## 0. Security model — read before loading
+
+`nemclass_mod` is a deliberate **Yama `ptrace_scope` bypass**: it reads and
+**writes** any process's memory via `access_process_vm()` (with `FOLL_FORCE`, so
+even read-only `.text`), and performs no `ptrace_may_access()` or ownership
+check. Understand the blast radius before loading it:
+
+- **Any allowlisted uid that presents the key gets root-equivalent power.** It
+  can read and write the memory of *any* pid on the system — including
+  root-owned processes (init, sshd, sudo, other users). Writing another
+  process's memory is a direct privilege-escalation primitive.
+- **Never load this on a multi-user or production host.** It is for a
+  single-user reverse-engineering workstation.
+- **Use a long random key and a minimal allowlist.** The key (§4) is the only
+  online gate on that power. Keep the uid/gid allowlist (§5) as small as
+  possible.
+- **An authenticated fd is a capability.** It can be passed to another process
+  (`SCM_RIGHTS`) or inherited across `fork`/`exec`. The module re-checks the
+  allowlist on every privileged ioctl, so a *non*-allowlisted recipient is
+  denied — but any allowlisted recipient inherits full access.
+- **Breakpoints are scoped to the target process.** HW breakpoints are per-task
+  and uprobe software breakpoints are filtered to the target's address space, so
+  a probe on a shared-library offset does not leak other processes' registers to
+  you.
+- **`allow_ptrace_hide=1` is experimental, off by default,** and only attempts a
+  best-effort TracerPid spoof against a process that ptraces *itself* as
+  anti-debug; it refuses when a real external tracer is attached.
+
+---
+
 ## 1. Prerequisites
 
 - Kernel build tree for the running kernel at `/lib/modules/$(uname -r)/build`
@@ -41,9 +71,10 @@ Best while iterating — build in-tree and load the `.ko` directly.
 ```sh
 cd linux/nemclass_mod
 make                                  # -> nemclass_mod.ko
-sudo insmod ./nemclass_mod.ko key=deadbeefcafe
+KEY=$(head -c 32 /dev/urandom | xxd -p -c 64)   # 32-byte (256-bit) random key
+sudo insmod ./nemclass_mod.ko key=$KEY
 dmesg | tail -3                       # "loaded: /proc/nemclass/attach (abi 1)"
-# ... use it ...
+# ... use it (clients present $KEY via the AUTH handshake) ...
 sudo rmmod nemclass_mod
 ```
 
@@ -91,13 +122,20 @@ sudo dkms status  nemclass_mod                 # -> nemclass_mod/2.0, <kernel>: 
 
 The module **fails closed**: with no `key=`, every gated ioctl returns
 `-EACCES`. The key is raw hex (no `0x`), up to 64 bytes, and must match what
-clients present via the AUTH handshake.
+clients present via the AUTH handshake. The handshake is an online oracle, so a
+weak key is brute-forceable — use a long random one, never a memorable value:
 
 ```sh
-sudo modprobe nemclass_mod key=deadbeefcafe
-# optional, experimental, off by default:
-sudo modprobe nemclass_mod key=deadbeefcafe allow_ptrace_hide=1
+KEY=$(head -c 32 /dev/urandom | xxd -p -c 64)   # 32-byte (256-bit) random key
+sudo modprobe nemclass_mod key=$KEY
+# optional, experimental, off by default (see §0):
+sudo modprobe nemclass_mod key=$KEY allow_ptrace_hide=1
 ```
+
+> **Secret hygiene:** passing the key as a `modprobe`/`insmod` argument makes it
+> briefly visible in `ps`/audit and (typed literally) in shell history. For an
+> unattended host prefer the root-only `/etc/modprobe.d` options file below —
+> `modprobe` reads the key from that file, so it never appears in a command line.
 
 ### Load automatically at boot
 
@@ -105,8 +143,9 @@ sudo modprobe nemclass_mod key=deadbeefcafe allow_ptrace_hide=1
 # 1. auto-load the module on boot
 echo nemclass_mod | sudo tee /etc/modules-load.d/nemclass_mod.conf
 
-# 2. supply the key (and options) to modprobe
-printf 'options nemclass_mod key=deadbeefcafe allow_ptrace_hide=0\n' \
+# 2. supply the key (and options) to modprobe — use your own random hex key
+printf 'options nemclass_mod key=%s allow_ptrace_hide=0\n' \
+  "$(head -c 32 /dev/urandom | xxd -p -c 64)" \
   | sudo tee /etc/modprobe.d/nemclass_mod.conf
 sudo chmod 600 /etc/modprobe.d/nemclass_mod.conf   # the key is a secret
 ```

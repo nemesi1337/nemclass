@@ -17,6 +17,7 @@
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -50,6 +51,15 @@ static long nemclass_transfer(void __user *arg, bool write_to_target)
 	if (copy_from_user(&rw, arg, sizeof(rw)))
 		return -EFAULT;
 
+	/*
+	 * Reject a request whose target or user range would wrap u64: otherwise
+	 * `rw.addr + done` / `rw.ubuf + done` below could silently roll over and
+	 * target a different address. (access_process_vm / copy_*_user would fail
+	 * the wrapped access anyway, but rejecting up front is clearer.)
+	 */
+	if (rw.len > U64_MAX - rw.addr || rw.len > U64_MAX - rw.ubuf)
+		return -EINVAL;
+
 	task = nemclass_get_task(rw.pid);
 	if (!task)
 		return -ESRCH;
@@ -67,6 +77,17 @@ static long nemclass_transfer(void __user *arg, bool write_to_target)
 		int this = min_t(u64, rw.len - done, NEM_CHUNK);
 		void __user *uptr = (void __user *)(unsigned long)(rw.ubuf + done);
 		int n;
+
+		/*
+		 * rw.len is an unbounded u64: a multi-GB transfer would otherwise
+		 * spin in the kernel uninterruptibly. Bail on a pending signal and
+		 * yield each chunk so this can't trip soft-lockup / RCU-stall.
+		 */
+		if (signal_pending(current)) {
+			ret = -EINTR;
+			break;
+		}
+		cond_resched();
 
 		if (write_to_target) {
 			if (copy_from_user(kbuf, uptr, this)) {
@@ -241,7 +262,7 @@ long nemclass_do_ptrace_query(void __user *arg)
 long nemclass_do_ptrace_hide(void __user *arg)
 {
 	struct nemclass_ptrace req;
-	struct task_struct *task;
+	struct task_struct *task, *tracer;
 	unsigned int old;
 
 	if (!nemclass_allow_ptrace_hide) {
@@ -261,6 +282,23 @@ long nemclass_do_ptrace_hide(void __user *arg)
 		put_task_struct(task);
 		return 0;
 	}
+	/*
+	 * Refuse when a tracer in a *different* thread group is attached: clearing
+	 * the flag word out from under a live external tracer races the ptrace
+	 * state machine (we hold neither tasklist_lock nor the tracee siglock,
+	 * neither exported to modules) and can corrupt it. Only let through the
+	 * same-process self-ptrace anti-debug case this is actually meant for.
+	 */
+	rcu_read_lock();
+	tracer = ptrace_parent(task);
+	if (tracer && !same_thread_group(tracer, task)) {
+		rcu_read_unlock();
+		pr_warn_ratelimited("PTRACE_HIDE pid=%d refused: external tracer attached (would race it)\n",
+				    req.pid);
+		put_task_struct(task);
+		return -EBUSY;
+	}
+	rcu_read_unlock();
 	/*
 	 * EXPERIMENTAL, HIGH RISK. Best-effort spoof: clear the ptrace flag word
 	 * so /proc/<pid>/status TracerPid renders 0, defeating self-check

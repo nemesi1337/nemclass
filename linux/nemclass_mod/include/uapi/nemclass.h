@@ -94,11 +94,16 @@ struct nemclass_bp_clear {
 /*
  * A breakpoint/uprobe hit. Register snapshot is x86_64; execution is NOT
  * halted — this records "what accessed/executed here" and continues.
+ *
+ * `pid` is the target the breakpoint was requested on; `tid` is the thread that
+ * actually hit it. Both breakpoint kinds are scoped to the target process (HW
+ * breakpoints are per-task; uprobes are filtered to the target's mm), so `tid`
+ * always belongs to `pid`'s thread group.
  */
 struct nemclass_event {
 	__s32 slot;
-	__s32 pid;
-	__s32 tid;
+	__s32 pid;		/* requested target pid */
+	__s32 tid;		/* thread that hit (a thread of `pid`) */
 	__u32 kind;		/* NEMCLASS_BP_KIND_* */
 	__u64 addr;		/* watched/probe address */
 	__u64 ip;
