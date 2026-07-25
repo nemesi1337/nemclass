@@ -216,6 +216,7 @@ pub fn pe_exports<R: Read>(mut read: R, module_base: usize) -> crate::Result<Vec
     //   +0x1C AddressOfFunctions     (u32 RVA)
     //   +0x20 AddressOfNames         (u32 RVA)
     //   +0x24 AddressOfNameOrdinals  (u32 RVA)
+    let number_of_functions = read_u32(read, add(export_dir, 0x14)?)? as usize;
     let number_of_names = read_u32(read, add(export_dir, 0x18)?)? as usize;
     let functions_rva = read_u32(read, add(export_dir, 0x1C)?)? as usize;
     let names_rva = read_u32(read, add(export_dir, 0x20)?)? as usize;
@@ -229,7 +230,15 @@ pub fn pe_exports<R: Read>(mut read: R, module_base: usize) -> crate::Result<Vec
     // is a "OtherDll.SomeFunc" forwarder string, not a real code address.
     let forwarder_end = export_rva.checked_add(export_size).ok_or(Error::InvalidAddress)?;
 
-    let mut out = Vec::with_capacity(number_of_names);
+    // `number_of_names` is read straight from the (untrusted) target image, so a
+    // corrupt or hostile export directory can set it to ~4 billion. Never
+    // pre-reserve from it directly: `Vec::with_capacity` on an over-large request
+    // calls `handle_alloc_error`, which *aborts the process* and cannot be caught
+    // by the surrounding `Result`. Cap the reservation hint — a real export table
+    // never has millions of names, and the per-name loop grows past the hint fine
+    // if a genuinely huge (but valid) table ever shows up.
+    const MAX_EXPORTS_HINT: usize = 64 * 1024;
+    let mut out = Vec::with_capacity(number_of_names.min(MAX_EXPORTS_HINT));
     for i in 0..number_of_names {
         // name pointer i: AddressOfNames[i] is an RVA to the name string.
         let name_rva = read_u32(read, add(names, i * 4)?)? as usize;
@@ -239,6 +248,13 @@ pub fn pe_exports<R: Read>(mut read: R, module_base: usize) -> crate::Result<Vec
         // AddressOfFunctions (already biased; the export `Base` does NOT apply
         // to this index).
         let ordinal = read_u16(read, add(ordinals, i * 2)?)? as usize;
+        // The ordinal indexes AddressOfFunctions, which holds exactly
+        // `number_of_functions` entries. A corrupt table can point past the end;
+        // reject it (like an out-of-range RVA) rather than performing a wild read
+        // that only happens to error when the address is unmapped.
+        if ordinal >= number_of_functions {
+            return Err(Error::InvalidAddress);
+        }
         let func_rva = read_u32(read, add(functions, ordinal * 4)?)? as usize;
 
         // Skip forwarder exports (func RVA inside the export directory range).

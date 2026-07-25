@@ -167,14 +167,18 @@ impl Process {
         }
         // Back the batch with one flat byte buffer, then split it into per-value
         // sub-slices to hand the backend as `(address, &mut [u8])` regions.
-        let mut bytes = vec![0u8; size * addresses.len()];
+        // `checked_mul` guards the (unreachable in practice, but unchecked)
+        // `size * len` overflow rather than silently under-allocating.
+        let requested = size
+            .checked_mul(addresses.len())
+            .ok_or(Error::InvalidAddress)?;
+        let mut bytes = vec![0u8; requested];
         {
             let mut regions: Vec<(usize, &mut [u8])> = addresses
                 .iter()
                 .copied()
                 .zip(bytes.chunks_mut(size.max(1)))
                 .collect();
-            let requested = size * addresses.len();
             let read = self.backend.read_buf_batch(&mut regions)?;
             if read != requested {
                 return Err(Error::PartialTransfer {

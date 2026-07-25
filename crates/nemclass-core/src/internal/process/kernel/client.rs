@@ -190,10 +190,14 @@ impl KernelClient {
         let mut total = 0usize;
         while total < buf.len() {
             let chunk = &mut buf[total..];
+            // `addr + total` must not wrap: a read that runs off the top of the
+            // address space would otherwise fold to a low address and issue an
+            // ioctl against the wrong target range.
+            let target = addr.checked_add(total).ok_or(Error::InvalidAddress)?;
             let mut arg = abi::nemclass_rw {
                 pid,
                 _pad: 0,
-                addr: (addr + total) as u64,
+                addr: target as u64,
                 len: chunk.len() as u64,
                 ubuf: chunk.as_mut_ptr() as u64,
                 done: 0,
@@ -216,10 +220,13 @@ impl KernelClient {
         let mut total = 0usize;
         while total < buf.len() {
             let chunk = &buf[total..];
+            // See `read_mem`: guard against `addr + total` wrapping the address
+            // space and targeting the wrong range.
+            let target = addr.checked_add(total).ok_or(Error::InvalidAddress)?;
             let mut arg = abi::nemclass_rw {
                 pid,
                 _pad: 0,
-                addr: (addr + total) as u64,
+                addr: target as u64,
                 len: chunk.len() as u64,
                 // The kernel only reads from `ubuf` for a WRITE; casting away
                 // const is sound because the module never writes through it.
@@ -283,7 +290,13 @@ impl KernelClient {
                 continue;
             }
 
-            records.truncate(arg.count as usize);
+            // Clamp the module-reported count to our actual buffer length before
+            // truncating. `arg.total <= cap` above only bounds the *total*; a
+            // buggy or hostile module could still report `count > cap`, which
+            // would leave the zero-initialized tail records in the result as
+            // fabricated `{ from: 0, to: 0 }` regions.
+            let count = (arg.count as usize).min(cap);
+            records.truncate(count);
             return Ok(records
                 .into_iter()
                 .map(|r| MemoryRegion {
@@ -294,11 +307,9 @@ impl KernelClient {
                 })
                 .collect());
         }
-        // Fell out of the retry loop: report a stale/short read as a partial.
-        Err(Error::PartialTransfer {
-            requested: probe.total as usize,
-            actual: cap,
-        })
+        // Fell out of the retry loop: the target's region set kept growing on
+        // every pass, so we never captured a consistent snapshot.
+        Err(Error::EnumerationUnstable)
     }
 
     // --- debugger (GD interop) --------------------------------------------

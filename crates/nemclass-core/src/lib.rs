@@ -117,6 +117,12 @@ pub enum Error {
     /// A short transfer: fewer bytes were read/written than requested.
     #[error("partial memory transfer: {actual} of {requested} bytes")]
     PartialTransfer { requested: usize, actual: usize },
+    /// Enumerating the target's memory regions never converged: the region set
+    /// kept growing across every retry, so no consistent snapshot could be
+    /// taken. Distinct from [`Error::PartialTransfer`], which is a byte-count
+    /// shortfall, not a failure to stabilize a variable-length result.
+    #[error("region enumeration did not converge")]
+    EnumerationUnstable,
     /// The `nemclass` kernel /proc interface (`/proc/nemclass/attach`) could not be opened —
     /// the module is not loaded, or the caller lacks permission on the node.
     #[error("kernel device unavailable: {0}")]
