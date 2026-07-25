@@ -128,6 +128,9 @@ pub struct NemclassApp {
     kernel_key: String,
     process_list: Vec<ProcessEntry>,
     process_list_status: String,
+    /// Case-insensitive substring the process list is filtered by (matches the
+    /// process name or pid). Empty shows everything.
+    process_filter: String,
     selected_process_idx: Option<usize>,
     process: Option<Process>,
     attached_name: Option<String>,
@@ -188,6 +191,7 @@ impl NemclassApp {
             kernel_key: String::new(),
             process_list: Vec::new(),
             process_list_status: "Press Refresh to enumerate processes.".into(),
+            process_filter: String::new(),
             selected_process_idx: None,
             process: None,
             attached_name: None,
@@ -222,7 +226,17 @@ impl NemclassApp {
             return;
         };
         match provider.enumerate_processes() {
-            Ok(list) => {
+            Ok(mut list) => {
+                // Sort by name (case-insensitive), pid as a stable tiebreak, so a
+                // busy machine — and especially a Wine prefix, where the game and
+                // Wine's service processes share the loader — lists predictably
+                // and is easy to scan.
+                list.sort_by(|a, b| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                        .then(a.id.cmp(&b.id))
+                });
                 self.process_list_status = format!("{} processes", list.len());
                 self.process_list = list;
                 self.selected_process_idx = None;
@@ -792,17 +806,45 @@ impl NemclassApp {
         });
         ui.label(&self.process_list_status);
 
+        // Filter box: type part of a process name (e.g. the game's `.exe`) or a
+        // pid to narrow a long list.
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.process_filter)
+                    .desired_width(140.0)
+                    .hint_text("name or pid"),
+            );
+            if !self.process_filter.is_empty() && ui.small_button("✕").clicked() {
+                self.process_filter.clear();
+            }
+        });
+
+        let filter = self.process_filter.to_ascii_lowercase();
         egui::ScrollArea::vertical()
             .id_salt("proc_list")
             .max_height(180.0)
             .show(ui, |ui| {
                 let mut new_sel = self.selected_process_idx;
+                let mut shown = 0usize;
                 for (i, entry) in self.process_list.iter().enumerate() {
-                    let label = format!("{} ({})", entry.name, entry.id);
+                    // Match against the name or the pid; keep the original index
+                    // `i` so selection still resolves into `process_list`.
+                    if !filter.is_empty()
+                        && !entry.name.to_ascii_lowercase().contains(&filter)
+                        && !entry.id.to_string().contains(&filter)
+                    {
+                        continue;
+                    }
+                    shown += 1;
+                    let label = format!("{}   [pid {}]", entry.name, entry.id);
                     let selected = self.selected_process_idx == Some(i);
                     if ui.selectable_label(selected, &label).clicked() {
                         new_sel = Some(i);
                     }
+                }
+                if shown == 0 && !self.process_list.is_empty() {
+                    ui.weak("(no processes match the filter)");
                 }
                 self.selected_process_idx = new_sel;
             });
