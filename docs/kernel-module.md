@@ -32,6 +32,43 @@ sudo modprobe nemclass_mod key=1337
 Userspace reaches the module through `/proc/nemclass/attach`, gated by a
 live-reloaded UID/GID allowlist.
 
+## The auth key file
+
+nemclass keeps the module's auth key in a small file so tooling and the UI can
+find it without you re-typing it:
+
+```text
+$HOME/.local/data/nemclass_kernel_key      # default; override with NEMCLASS_KEY_FILE
+```
+
+The file holds the key as **raw hex, no `0x` prefix** — exactly what `modprobe`
+and the UI expect. It is optional: nothing breaks if it is absent, you just
+supply the key by hand.
+
+Generate one (16 random bytes → 32 hex chars, `chmod 600`):
+
+```text
+cargo make gen-key            # writes the key file; FORCE=1 to overwrite
+```
+
+Then the lifecycle tasks read it automatically:
+
+```text
+cargo make kmod-install       # DKMS register + build + install (once)
+cargo make kmod-load          # modprobe nemclass_mod key=<file contents>
+cargo make kmod-status        # is it installed / loaded?
+cargo make kmod-unload        # modprobe -r (idempotent)
+```
+
+The desktop UI also **auto-loads this file** into the auth-key fields (the
+`linux-kernel` backend key and the Debugger key) when it exists, so attaching via
+the kernel backend needs no manual key entry. See
+[memory-backends.md](memory-backends.md).
+
+> **Secret hygiene:** the key file is created `0600`. Regenerating it (`FORCE=1`)
+> invalidates the key a currently-loaded module was started with — reload the
+> module afterwards (`cargo make kmod-reload`).
+
 ## The client API (`nemclass-core`)
 
 Two layers sit on top of the module's ioctl ABI:

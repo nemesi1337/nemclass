@@ -1,5 +1,44 @@
 # Building & testing
 
+## Task runner (cargo-make)
+
+The repo ships a `Makefile.toml` for
+[cargo-make](https://github.com/sagiegurari/cargo-make) — the quickest way to run
+everything, including the kernel-module lifecycle.
+
+```text
+cargo install cargo-make        # one-time
+cargo make --list-all-steps     # see every task with its description
+cargo make                      # default: build the workspace
+cargo make ci                   # the pre-commit gate: fmt-check + clippy + test
+cargo make test                 # all workspace tests
+cargo make test-symbols         # nemclass-core tests with the `symbols` feature
+cargo make clippy               # lint, warnings denied
+cargo make run -- <args>        # run the desktop app (args pass through)
+cargo make doc                  # build the API docs
+cargo make windows-check        # cross-check nemclass-core for Windows
+```
+
+Kernel-module tasks (Linux; the privileged ones invoke `sudo`):
+
+| Task | Does |
+|------|------|
+| `cargo make kmod-build` | Build `nemclass_mod.ko` for the running kernel. |
+| `cargo make kmod-clean` | Clean the module build artifacts. |
+| `cargo make kmod-install` | Register + build + install via DKMS. |
+| `cargo make kmod-uninstall` | Remove it from DKMS. |
+| `cargo make kmod-load` | Load the module with the auth key from the key file. |
+| `cargo make kmod-unload` | Unload it (idempotent). |
+| `cargo make kmod-reload` | Unload, then reload with the current key. |
+| `cargo make kmod-status` | DKMS + load status. |
+| `cargo make gen-key` | Generate the auth key file (optional; `FORCE=1` to overwrite). |
+
+The auth key lives at `$HOME/.local/data/nemclass_kernel_key` (override with the
+`NEMCLASS_KEY_FILE` environment variable) — see
+[kernel-module.md](kernel-module.md#the-auth-key-file).
+
+The sections below document the underlying `cargo` commands each task wraps.
+
 ## Build
 
 ```text
