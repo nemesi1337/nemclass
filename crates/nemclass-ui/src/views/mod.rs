@@ -19,6 +19,7 @@ mod scanner_panel;
 mod debugger_panel;
 mod memory_viewer;
 mod disassembly;
+mod key_file;
 
 pub use scanner_panel::ScannerPanel;
 pub use debugger_panel::DebuggerPanel;
@@ -288,11 +289,25 @@ impl NemclassApp {
         // Pre-select the first (demo) class.
         let selected_class = project.classes_in_order().next().map(|c| c.uuid);
 
+        // Auto-load the kernel auth-key from the well-known file (or env
+        // override).  The fields remain freely editable; this just saves a
+        // paste step for users who have already run `cargo make gen-key`.
+        let (kernel_key, key_status) = match key_file::read_kernel_key() {
+            Some(k) => {
+                let path_str = key_file::kernel_key_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let msg = format!("Loaded kernel auth key from {}.", path_str);
+                (k, Some(msg))
+            }
+            None => (String::new(), None),
+        };
+
         Self {
             registry,
             backend_names,
             selected_backend,
-            kernel_key: String::new(),
+            kernel_key: kernel_key.clone(),
             process_list: Vec::new(),
             process_list_status: "Press Refresh to enumerate processes.".into(),
             process_filter: String::new(),
@@ -320,10 +335,11 @@ impl NemclassApp {
             pending_disasm_goto: None,
             event_bus: EventBus::new(),
             file_dialog: None,
-            status_msg: Some("Demo project loaded. Use File > New or Open to load a project.".into()),
+            status_msg: key_status
+                .or_else(|| Some("Demo project loaded. Use File > New or Open to load a project.".into())),
             central_tab: CentralTab::MemoryView,
             scanner_panel: ScannerPanel::new(),
-            debugger_panel: DebuggerPanel::new(),
+            debugger_panel: DebuggerPanel::with_key(kernel_key),
             memory_viewer: MemoryViewer::new(),
             disassembly_panel: DisassemblyPanel::new(),
         }

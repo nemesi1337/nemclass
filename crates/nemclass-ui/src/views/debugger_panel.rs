@@ -161,8 +161,14 @@ mod linux {
 
     impl DebuggerPanel {
         pub fn new() -> Self {
+            Self::with_key(String::new())
+        }
+
+        /// Like `new()` but pre-populates the auth-key field.  The field
+        /// remains freely editable by the user.
+        pub fn with_key(key: String) -> Self {
             Self {
-                key_hex:      String::new(),
+                key_hex:      key,
                 debugger:     None,
                 attach_err:   None,
                 bp_addr_text: String::new(),
@@ -507,6 +513,9 @@ mod stub {
 
     impl DebuggerPanel {
         pub fn new() -> Self { Self }
+        /// Like `new()` — key is accepted for API symmetry but ignored on
+        /// non-Linux targets (the panel is a stub here).
+        pub fn with_key(_key: String) -> Self { Self }
         pub fn tick_events(&mut self) {}
         pub fn on_detach(&mut self) {}
         pub fn show(&mut self, ui: &mut egui::Ui, _pid: Option<i32>) {
