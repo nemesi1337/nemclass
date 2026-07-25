@@ -1,0 +1,26 @@
+# nemclass access control — who may open /proc/nemclass/attach
+#
+# Install this as the path the module watches (default below); the module
+# re-reads it automatically within `access_poll_ms` of any change — no reload:
+#
+#     sudo install -D -m 0644 access.conf.example /etc/nemclass/access.conf
+#
+# The kernel cannot resolve user/group *names* (that is a userspace/NSS
+# concept), so entries are NUMERIC ids only. Look them up with:
+#
+#     id -u <username>              # -> the uid to list below
+#     getent group <groupname>      # -> field 3 is the gid to list below
+#
+# Rules:
+#   * one entry per line: `uid <N>` or `gid <N>`
+#   * `#` starts a comment; blank lines are ignored
+#   * a `gid` grants access to every member of that group
+#   * root / CAP_SYS_ADMIN is always allowed and cannot be locked out
+#   * if this file is missing, empty, or unparsable, everyone except
+#     CAP_SYS_ADMIN is denied (fail closed)
+
+# Example: allow the user with uid 1000
+uid 1000
+
+# Example: allow everyone in the group with gid 1001 (e.g. a "nemclass" group)
+gid 1001
