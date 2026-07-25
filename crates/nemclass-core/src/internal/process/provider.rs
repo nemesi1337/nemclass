@@ -20,7 +20,7 @@ use crate::internal::process::{
 use crate::internal::process::{
     ProcessIterator,
     SectionType,
-    kernel::KernelBackend,
+    kernel::{KernelBackend, KernelClient},
 };
 
 /// Name of the default, built-in provider registered by
@@ -111,12 +111,63 @@ impl ProcessProvider for LinuxProvider {
 /// can offer this as a higher-privilege fallback and fall back to
 /// `"linux-native"` when it is absent.
 ///
+/// # Authentication
+///
+/// The module fails **closed**: every privileged ioctl (`READ`/`WRITE`/
+/// `ENUM_REGIONS`) requires a successful `NEMCLASS_IOC_AUTH` handshake on the
+/// fd first, or it returns `EACCES`. So this provider carries the module's
+/// [`key`](KernelProvider::key) and authenticates each fd it opens — the same
+/// handshake [`crate::Debugger::attach`] performs. The default (keyless)
+/// provider registered by [`ProviderRegistry::default`] can enumerate
+/// processes (a `/proc` walk needs no auth) but [`open`](ProcessProvider::open)
+/// will fail with `EACCES` until a key is supplied via [`with_key`]; a UI
+/// should re-register a keyed provider once the user enters the key.
+///
 /// The kernel-side debugger (hardware breakpoints / uprobes) lives on
 /// [`KernelBackend::client`], reachable via the opened [`Process`]'s backend;
 /// it is not part of the [`ProcessProvider`] contract.
+///
+/// [`with_key`]: KernelProvider::with_key
 #[cfg(target_os = "linux")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct KernelProvider;
+#[derive(Debug, Default, Clone)]
+pub struct KernelProvider {
+    /// Raw auth-key bytes the module was loaded with (`key=<hex>` decoded to
+    /// bytes). Empty means "no key" — [`open`](ProcessProvider::open) still
+    /// attempts the handshake and surfaces the module's fail-closed `EACCES`.
+    key: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl KernelProvider {
+    /// A keyless provider — the form registered by
+    /// [`ProviderRegistry::default`]. It can enumerate processes, but opening a
+    /// target fails with `EACCES` until a key is supplied; use [`with_key`] for
+    /// a usable provider.
+    ///
+    /// [`with_key`]: KernelProvider::with_key
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A provider that authenticates every fd it opens with `key` — the raw
+    /// bytes the module was loaded with (`key=<hex>` decoded to bytes).
+    pub fn with_key(key: Vec<u8>) -> Self {
+        Self { key }
+    }
+
+    /// Opens `/dev/nemclass`, verifies the module's ABI, and authenticates with
+    /// the configured key — the handshake every privileged ioctl requires.
+    /// Mirrors [`crate::Debugger::attach`]. Returns the authed client so callers
+    /// can reuse the one fd for both memory IO and enumeration.
+    fn open_authed_client(&self) -> crate::Result<KernelClient> {
+        let client = KernelClient::open()?;
+        // ABI check first: a mismatched module could lay out every subsequent
+        // ioctl struct differently.
+        client.check_abi()?;
+        client.auth(&self.key)?;
+        Ok(client)
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl ProcessProvider for KernelProvider {
@@ -125,13 +176,18 @@ impl ProcessProvider for KernelProvider {
     }
 
     fn enumerate_processes(&self) -> crate::Result<Vec<ProcessEntry>> {
-        // Process discovery is a `/proc` walk regardless of the IO backend.
+        // Process discovery is a `/proc` walk regardless of the IO backend, so
+        // it needs no device access or auth.
         Ok(ProcessIterator::new()?.collect())
     }
 
     fn open(&self, pid: Pid) -> crate::Result<Process> {
-        // Opens `/dev/nemclass`; surfaces `DeviceUnavailable` if not loaded.
-        let backend = KernelBackend::open(pid)?;
+        // Open + ABI-check + authenticate, then bind the *authed* client to the
+        // backend so reads/writes don't hit the module's fail-closed `EACCES`.
+        // Surfaces `DeviceUnavailable` if the module is not loaded, `AbiMismatch`
+        // on a version skew, or `EACCES` if the key is absent/wrong.
+        let client = self.open_authed_client()?;
+        let backend = KernelBackend::with_client(client, pid);
         Ok(Process::from_backend(pid, Box::new(backend)))
     }
 
@@ -144,9 +200,9 @@ impl ProcessProvider for KernelProvider {
         // record carries no backing-file name, so every section is classified
         // `Mapped` with no module — module aggregation stays with the native
         // `/proc/<pid>/maps` path (`Process::modules`), used here for parity.
-        let backend = KernelBackend::open(pid)?;
-        let sections = backend
-            .client()
+        // `enum_regions` is a privileged ioctl, so open an *authed* client.
+        let client = self.open_authed_client()?;
+        let sections = client
             .enum_regions(pid)?
             .into_iter()
             .map(|r| Section {
@@ -214,7 +270,9 @@ impl Default for ProviderRegistry {
         #[cfg(target_os = "linux")]
         {
             registry.register(Box::new(LinuxProvider));
-            registry.register(Box::new(KernelProvider));
+            // Keyless by default: it can enumerate, but a UI must re-register a
+            // `KernelProvider::with_key(..)` before opening a target succeeds.
+            registry.register(Box::new(KernelProvider::new()));
         }
         #[cfg(windows)]
         {
@@ -244,6 +302,22 @@ mod tests {
         let registry = ProviderRegistry::default();
         assert!(registry.get(LINUX_KERNEL).is_some());
         assert_eq!(registry.get(LINUX_KERNEL).unwrap().name(), LINUX_KERNEL);
+    }
+
+    #[test]
+    fn keyed_kernel_provider_keeps_its_name() {
+        // A UI supplies the module's auth key by re-registering a keyed provider
+        // over the keyless default; it must register under the same name so the
+        // backend picker's selection still resolves it.
+        let keyed = KernelProvider::with_key(vec![0x13, 0x37]);
+        assert_eq!(keyed.name(), LINUX_KERNEL);
+
+        let mut registry = ProviderRegistry::default();
+        registry.register(Box::new(keyed));
+        assert_eq!(registry.get(LINUX_KERNEL).unwrap().name(), LINUX_KERNEL);
+        // Still exactly the two Linux providers — the keyed one replaced the
+        // keyless default rather than adding a duplicate.
+        assert_eq!(registry.names().count(), 2);
     }
 
     /// Live typed read/write against *our own* memory. A process may always

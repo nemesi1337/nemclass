@@ -10,14 +10,15 @@ pub use process::{
     pe, symbols,
 };
 
-// Native Linux provider (`process_vm_readv` backend + `/proc` enumeration).
+// Native Linux provider (`process_vm_readv` backend + `/proc` enumeration) plus
+// the backend-name constants a UI backend picker keys off of.
 #[cfg(target_os = "linux")]
-pub use process::LinuxProvider;
+pub use process::{LINUX_KERNEL, LINUX_NATIVE, LinuxProvider};
 
 // Native Windows backend + provider (`ReadProcessMemory`/`OpenProcess`/...),
 // the `#[cfg(windows)]` mirror of `LinuxProvider`.
 #[cfg(windows)]
-pub use process::{WindowsBackend, WindowsProvider};
+pub use process::{WINDOWS_NATIVE, WindowsBackend, WindowsProvider};
 
 // Kernel-device client + privileged backend/provider (Linux-only). Speaks the
 // `nemclass_mod` ioctl ABI over `/dev/nemclass` for ptrace-free memory IO and

@@ -33,14 +33,15 @@ pub use internal::{
     symbols,
 };
 
-// Native Linux provider (`process_vm_readv` + `/proc`), Linux-only.
+// Native Linux provider (`process_vm_readv` + `/proc`), Linux-only, plus the
+// backend-name constants (`"linux-native"` / `"linux-kernel"`) a UI keys off.
 #[cfg(target_os = "linux")]
-pub use internal::LinuxProvider;
+pub use internal::{LINUX_KERNEL, LINUX_NATIVE, LinuxProvider};
 
 // Native Windows backend + provider, the `#[cfg(windows)]` mirror of the Linux
 // native provider. Gated so non-Windows builds never pull in `windows-sys`.
 #[cfg(windows)]
-pub use internal::{WindowsBackend, WindowsProvider};
+pub use internal::{WINDOWS_NATIVE, WindowsBackend, WindowsProvider};
 
 // Kernel-module client, privileged backend/provider, and debugger types
 // (Linux-only): ptrace-free memory IO plus hardware breakpoints/uprobes over
