@@ -75,7 +75,16 @@ args = ["fmt", "--all", "--", "--check"]
 [tasks.doc]
 description = "Build the API docs (no dependencies)."
 command = "cargo"
-args = ["doc", "--workspace", "--no-deps"]
+args = [
+    "doc",
+    "--no-deps",
+    "-p", "nemclass-core",
+    "-p", "nemclass-model",
+    "-p", "nemclass-script",
+    "-p", "nemclass-scan",
+    "-p", "nemclass-ui",
+    "-p", "nemclass-app",
+]
 
 [tasks.run]
 description = "Run the desktop app (nemclass-app). Extra args pass through."
