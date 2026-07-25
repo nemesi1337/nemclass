@@ -1,3 +1,4 @@
+#![doc = include_str!("detailed_docs.md")]
 //! nemclass-model: domain model for the RE tool.
 //!
 //! Nodes (the ReClass node hierarchy), classes, project, enums, the

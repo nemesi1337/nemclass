@@ -1,3 +1,4 @@
+#![doc = include_str!("detailed_docs.md")]
 //! nemclass-ui: egui/eframe views and widgets.
 //!
 //! Implements the M1 vertical slice:

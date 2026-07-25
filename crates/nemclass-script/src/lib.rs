@@ -1,3 +1,4 @@
+#![doc = include_str!("detailed_docs.md")]
 //! nemclass-script: event bus + scripting/plugin layer.
 //!
 //! **M1** shipped traits + scaffolding: the [`Event`] model, the [`EventBus`],

@@ -1,3 +1,4 @@
+#![doc = include_str!("detailed_docs.md")]
 //! `nemclass-app` — `eframe` entry point for the NemClass RE tool.
 //!
 //! This binary is the thin launcher: it sets up `NativeOptions`, calls

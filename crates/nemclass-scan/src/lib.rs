@@ -1,3 +1,4 @@
+#![doc = include_str!("detailed_docs.md")]
 //! Cheat-Engine-style memory scanner for nemclass.
 //!
 //! A faithful port of ReClass.NET's `MemoryScanner` (`ScanValueType`,
