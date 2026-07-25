@@ -129,6 +129,11 @@ pub struct MemoryViewer {
 
     // ── status message ────────────────────────────────────────────────────
     pub status_msg: Option<String>,
+
+    // ── disassemble request ───────────────────────────────────────────────
+    /// Set when the user clicks "Disassemble here"; consumed by the parent via
+    /// `take_disassemble_request()`.
+    pending_disassemble: Option<usize>,
 }
 
 impl MemoryViewer {
@@ -152,6 +157,7 @@ impl MemoryViewer {
             region_index: None,
 
             status_msg: None,
+            pending_disassemble: None,
         }
     }
 
@@ -167,8 +173,9 @@ impl MemoryViewer {
         self.last_snapshot = None;
         self.string_runs.clear();
         self.history.clear();
-        self.address_error = None;
-        self.status_msg    = None;
+        self.address_error  = None;
+        self.status_msg     = None;
+        self.pending_disassemble = None;
 
         #[cfg(target_os = "linux")]
         { self.region_index = None; }
@@ -189,6 +196,16 @@ impl MemoryViewer {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = process; // suppress unused warning on Windows
+    }
+
+    // -----------------------------------------------------------------------
+    // Disassemble-here request (consumed by parent NemclassApp)
+    // -----------------------------------------------------------------------
+
+    /// Returns the address to disassemble, if the user clicked the button this
+    /// frame. Consumes the pending request (returns `None` on the next call).
+    pub fn take_disassemble_request(&mut self) -> Option<usize> {
+        self.pending_disassemble.take()
     }
 
     // -----------------------------------------------------------------------
@@ -287,13 +304,15 @@ impl MemoryViewer {
         // ── hex table ────────────────────────────────────────────────────
         self.show_hex_table(ui, process);
 
-        // ── placeholder action buttons ────────────────────────────────────
+        // ── action buttons ────────────────────────────────────────────────
         ui.separator();
         ui.horizontal(|ui| {
             ui.add_enabled(false, egui::Button::new("Dissect as class here (TODO)"))
                 .on_disabled_hover_text("Not yet implemented — will dissect the current address as a class node");
-            ui.add_enabled(false, egui::Button::new("Disassemble here (TODO)"))
-                .on_disabled_hover_text("Not yet implemented — will open the disassembly view at this address");
+            let addr = self.address;
+            if ui.button("Disassemble here").clicked() {
+                self.pending_disassemble = Some(addr);
+            }
         });
 
         // ── status line ──────────────────────────────────────────────────

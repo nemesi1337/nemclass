@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-nemclass-core.workspace = true
+nemclass-core = { workspace = true, features = ["symbols"] }
 nemclass-model.workspace = true
 nemclass-script.workspace = true
 nemclass-scan.workspace = true

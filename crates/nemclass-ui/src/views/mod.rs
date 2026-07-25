@@ -18,10 +18,12 @@
 mod scanner_panel;
 mod debugger_panel;
 mod memory_viewer;
+mod disassembly;
 
 pub use scanner_panel::ScannerPanel;
 pub use debugger_panel::DebuggerPanel;
 pub use memory_viewer::MemoryViewer;
+pub use disassembly::DisassemblyPanel;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -52,6 +54,7 @@ enum CentralTab {
     Scanner,
     Debugger,
     MemoryViewer,
+    Disassembly,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +178,9 @@ pub struct NemclassApp {
 
     // Raw hex memory viewer panel
     memory_viewer: MemoryViewer,
+
+    // Disassembly panel
+    disassembly_panel: DisassemblyPanel,
 }
 
 impl NemclassApp {
@@ -220,6 +226,7 @@ impl NemclassApp {
             scanner_panel: ScannerPanel::new(),
             debugger_panel: DebuggerPanel::new(),
             memory_viewer: MemoryViewer::new(),
+            disassembly_panel: DisassemblyPanel::new(),
         }
     }
 
@@ -924,10 +931,11 @@ impl NemclassApp {
     fn show_central_panel(&mut self, ui: &mut egui::Ui) {
         // Tab bar.
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.central_tab, CentralTab::MemoryView,  "Memory View");
-            ui.selectable_value(&mut self.central_tab, CentralTab::Scanner,     "Scanner");
-            ui.selectable_value(&mut self.central_tab, CentralTab::Debugger,    "Debugger");
+            ui.selectable_value(&mut self.central_tab, CentralTab::MemoryView,   "Memory View");
+            ui.selectable_value(&mut self.central_tab, CentralTab::Scanner,      "Scanner");
+            ui.selectable_value(&mut self.central_tab, CentralTab::Debugger,     "Debugger");
             ui.selectable_value(&mut self.central_tab, CentralTab::MemoryViewer, "Memory");
+            ui.selectable_value(&mut self.central_tab, CentralTab::Disassembly,  "Disassembly");
         });
         ui.separator();
 
@@ -936,6 +944,7 @@ impl NemclassApp {
             CentralTab::Scanner      => self.show_scanner_tab(ui),
             CentralTab::Debugger     => self.show_debugger_tab(ui),
             CentralTab::MemoryViewer => self.show_memory_viewer(ui),
+            CentralTab::Disassembly  => self.show_disassembly_tab(ui),
         }
     }
 
@@ -984,6 +993,15 @@ impl NemclassApp {
 
     fn show_memory_viewer(&mut self, ui: &mut egui::Ui) {
         self.memory_viewer.show(ui, self.process.as_ref());
+        // If the "Disassemble here" button was clicked, switch tabs and navigate.
+        if let Some(addr) = self.memory_viewer.take_disassemble_request() {
+            self.central_tab = CentralTab::Disassembly;
+            self.disassembly_panel.goto(addr);
+        }
+    }
+
+    fn show_disassembly_tab(&mut self, ui: &mut egui::Ui) {
+        self.disassembly_panel.show(ui, self.process.as_ref());
     }
 
     // -----------------------------------------------------------------------
