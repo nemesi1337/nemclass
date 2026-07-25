@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use crate::internal::process::ProcessEntry;
 #[cfg(target_os = "linux")]
-use crate::internal::process::windows::windows_exe_name;
+use crate::internal::process::windows::wine_program_name;
 
 /// An iterator over the system's processes as [`ProcessEntry`]s.
 ///
@@ -53,13 +53,16 @@ impl ProcessIterator {
                 let parent_id = get_parent_id(&entry)?;
 
                 // A Wine process's ELF image is just the loader (wine-preloader,
-                // wine64-preloader, ...), so every Wine game lists under the same
-                // useless name. Surface the actual Windows program it runs. Gate
-                // on the loader name so we only scan maps for likely candidates.
+                // wine64-preloader, ...), so every Wine program in a prefix lists
+                // under the same useless loader name. Replace it with the actual
+                // Windows program the loader runs (e.g. `Terraria.exe`) so the
+                // picker shows distinct, recognisable names. Gate on the loader
+                // name so we only probe likely candidates; keep the loader name
+                // when no program can be resolved yet (e.g. `wineserver`).
                 if name.to_ascii_lowercase().starts_with("wine")
-                    && let Some(exe) = windows_exe_name(id)
+                    && let Some(program) = wine_program_name(id)
                 {
-                    name = format!("{name} ({exe})");
+                    name = program;
                 }
 
                 Some(ProcessEntry {
