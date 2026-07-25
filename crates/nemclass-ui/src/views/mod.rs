@@ -38,6 +38,8 @@ use nemclass_core::{KernelProvider, LINUX_KERNEL};
 #[cfg(target_os = "linux")]
 use crate::views::debugger_panel::parse_hex_key;
 use nemclass_model::{ClassNode, ModelError, Node, NodeRegistry, Project, RenderedValue, resolve_formula};
+#[cfg(target_os = "linux")]
+use nemclass_model::serialize::NodeDef;
 use nemclass_script::{Event, EventBus};
 use uuid::Uuid;
 
@@ -144,6 +146,25 @@ struct EditState {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-dissect preview state
+// ---------------------------------------------------------------------------
+
+/// Pending preview from a completed `auto_dissect` call.
+///
+/// Displayed as an inline panel in the Memory View tab; the user can Accept
+/// (replaces the class body) or Cancel (discards).
+#[cfg(target_os = "linux")]
+struct AutoDissectPreview {
+    /// The NodeDefs returned by `auto_dissect`.
+    defs: Vec<NodeDef>,
+    /// The class UUID this dissect was run against (so Accept always targets
+    /// the right class even if the user switches selection mid-preview).
+    target_class: Uuid,
+    /// Summary counts per type tag, e.g. `[("Pointer", 3), ("Int64", 5), …]`.
+    summary: Vec<(String, usize)>,
+}
+
+// ---------------------------------------------------------------------------
 // File dialog state
 // ---------------------------------------------------------------------------
 
@@ -210,6 +231,14 @@ pub struct NemclassApp {
     snapshot_interval: Duration,
     collapsed: HashSet<String>,
     edit_state: Option<EditState>,
+
+    // Auto-dissect controls (Memory View toolbar)
+    /// Number of bytes to dissect (hex or decimal, user-editable).
+    dissect_len_text: String,
+    /// Pending dissect preview (Linux only; always-compiled field would need
+    /// a unit-struct placeholder on other platforms, so we cfg-gate it).
+    #[cfg(target_os = "linux")]
+    dissect_preview: Option<AutoDissectPreview>,
 
     /// Live child-row cache for VTable/Function/FunctionPtr nodes.
     /// Keyed by `id_path`; populated on each snapshot tick for expanded nodes.
@@ -282,6 +311,9 @@ impl NemclassApp {
             snapshot_interval: Duration::from_millis(100),
             collapsed: HashSet::new(),
             edit_state: None,
+            dissect_len_text: "0x100".to_owned(),
+            #[cfg(target_os = "linux")]
+            dissect_preview: None,
             #[cfg(target_os = "linux")]
             live_cache: HashMap::new(),
             #[cfg(target_os = "linux")]
@@ -1239,10 +1271,203 @@ impl NemclassApp {
             self.central_tab = CentralTab::Disassembly;
             self.disassembly_panel.goto(addr);
         }
+        // If the "Dissect as class here" button was clicked, switch to the
+        // Memory View tab and run auto-dissect at the viewer's current address.
+        // The length comes from the existing dissect_len_text field.
+        #[cfg(target_os = "linux")]
+        if let Some(addr) = self.memory_viewer.take_dissect_request() {
+            self.central_tab = CentralTab::MemoryView;
+            self.run_auto_dissect(addr);
+        }
     }
 
     fn show_disassembly_tab(&mut self, ui: &mut egui::Ui) {
         self.disassembly_panel.show(ui, self.process.as_ref());
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-dissect helpers
+    // -----------------------------------------------------------------------
+
+    /// Parse `dissect_len_text` as hex (0x…) or decimal.  Returns a sensible
+    /// default (256) if the field is empty or unparseable.
+    fn parse_dissect_len(&self) -> usize {
+        let s = self.dissect_len_text.trim();
+        if s.is_empty() {
+            return 256;
+        }
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            usize::from_str_radix(hex, 16).unwrap_or(256)
+        } else {
+            s.parse::<usize>().unwrap_or(256)
+        }
+    }
+
+    /// Run `auto_dissect` at `base` with the length from `dissect_len_text`
+    /// and store the result in `dissect_preview`.  Errors are routed through
+    /// `last_error`.  No-op on non-Linux targets (the caller is cfg-gated).
+    #[cfg(target_os = "linux")]
+    fn run_auto_dissect(&mut self, base: usize) {
+        use nemclass_model::dissect::auto_dissect;
+
+        let Some(uuid) = self.selected_class else {
+            self.last_error = Some("Auto-dissect: no class selected".into());
+            return;
+        };
+        let Some(proc) = &self.process else {
+            self.last_error = Some("Auto-dissect: no process attached".into());
+            return;
+        };
+
+        let len = self.parse_dissect_len();
+        match auto_dissect(proc, base, len) {
+            Err(e) => {
+                self.last_error = Some(format!("Auto-dissect failed: {e}"));
+            }
+            Ok(defs) => {
+                // Build a compact type-count summary for the preview banner.
+                let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+                for d in &defs {
+                    *counts.entry(d.type_tag.as_str()).or_insert(0) += 1;
+                }
+                let mut summary: Vec<(String, usize)> = counts
+                    .into_iter()
+                    .map(|(t, n)| (t.to_owned(), n))
+                    .collect();
+                summary.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                self.dissect_preview = Some(AutoDissectPreview {
+                    defs,
+                    target_class: uuid,
+                    summary,
+                });
+                self.last_error = None;
+            }
+        }
+    }
+
+    /// Accept the pending auto-dissect preview: convert each NodeDef to a live
+    /// node via the registry, replace the target class's children, and
+    /// invalidate the snapshot so the new layout renders immediately.
+    #[cfg(target_os = "linux")]
+    fn accept_auto_dissect(&mut self) {
+        let Some(preview) = self.dissect_preview.take() else { return; };
+
+        let mut live_nodes: Vec<Box<dyn Node>> = Vec::with_capacity(preview.defs.len());
+        for def in preview.defs {
+            match self.node_registry.deserialize_node(def) {
+                Ok(node) => live_nodes.push(node),
+                Err(e) => {
+                    self.last_error = Some(format!("Auto-dissect accept: {e}"));
+                    return;
+                }
+            }
+        }
+
+        if let Some(class) = self.project.get_class_mut(&preview.target_class) {
+            class.children = live_nodes;
+        } else {
+            self.last_error = Some("Auto-dissect accept: class no longer exists".into());
+            return;
+        }
+
+        // Invalidate the snapshot so the new nodes are rendered immediately.
+        self.last_snapshot = None;
+        self.clear_memory_state();
+        self.status_msg = Some("Auto-dissect applied.".into());
+    }
+
+    /// Draw the auto-dissect toolbar row (button + length input) and the
+    /// preview panel when a result is pending.  Called from `show_class_view`
+    /// before the memory table.
+    ///
+    /// On non-Linux the method is a no-op so the toolbar stays clean.
+    fn show_auto_dissect_controls(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_os = "linux")]
+        {
+            // -----------------------------------------------------------------
+            // Toolbar row: [Auto-dissect]  Length: [____]
+            // -----------------------------------------------------------------
+            let has_process = self.process.is_some();
+            let has_base    = self.class_base.is_some();
+            let enabled     = has_process && has_base;
+
+            // Collect actions into locals so we can mutate `self` after the
+            // draw closure (same collect-during-draw, apply-after pattern used
+            // throughout this file).
+            let mut do_dissect = false;
+
+            ui.horizontal(|ui| {
+                let btn = ui.add_enabled(enabled, egui::Button::new("Auto-dissect"));
+                if !enabled {
+                    btn.on_disabled_hover_text(if !has_process {
+                        "Attach to a process first"
+                    } else {
+                        "Class base address not resolved (set the address formula)"
+                    });
+                } else if btn.clicked() {
+                    do_dissect = true;
+                }
+
+                ui.label("Length:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.dissect_len_text)
+                        .desired_width(70.0)
+                        .hint_text("0x100"),
+                );
+            });
+
+            if do_dissect {
+                let base = self.class_base.unwrap();
+                self.run_auto_dissect(base);
+            }
+
+            // -----------------------------------------------------------------
+            // Preview panel — only shown while a result is pending.
+            // Collect the user's decision (accept / cancel) as a local bool,
+            // then apply it after the frame closure releases its borrow.
+            // -----------------------------------------------------------------
+            let mut do_accept = false;
+            let mut do_cancel = false;
+
+            if let Some(preview) = &self.dissect_preview {
+                let node_count   = preview.defs.len();
+                let summary_text: String = preview.summary.iter()
+                    .map(|(tag, n)| format!("{n}×{tag}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let target_uuid  = preview.target_class;
+                let class_name   = self.project.get_class(&target_uuid)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| target_uuid.to_string());
+
+                ui.separator();
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(30, 40, 55))
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(format!("Auto-dissect: {node_count} nodes"));
+                            ui.weak(format!("({summary_text})"));
+                        });
+                        ui.label(format!("Target: {class_name}  — replaces all children"));
+                        ui.horizontal(|ui| {
+                            if ui.button("Accept").clicked() { do_accept = true; }
+                            if ui.button("Cancel").clicked() { do_cancel = true; }
+                        });
+                    });
+            }
+
+            // Apply decision outside the frame closure.
+            if do_accept {
+                self.accept_auto_dissect();
+            } else if do_cancel {
+                self.dissect_preview = None;
+            }
+        }
+        // Non-Linux: show nothing — the button is entirely absent so the
+        // toolbar stays uncluttered on Windows/macOS builds.
+        #[cfg(not(target_os = "linux"))]
+        let _ = ui; // suppress unused warning
     }
 
     // -----------------------------------------------------------------------
@@ -1275,8 +1500,15 @@ impl NemclassApp {
 
         if self.node_snapshots.is_empty() {
             ui.label("No nodes in this class.");
+            // Still show the dissect controls even when the class is empty so
+            // the user can populate it via Auto-dissect.
+            self.show_auto_dissect_controls(ui);
             return;
         }
+
+        // Auto-dissect toolbar (button + length input + preview panel).
+        self.show_auto_dissect_controls(ui);
+        ui.separator();
 
         // Build the augmented visible-row list.  Normal nodes come from
         // `build_visible_rows`; after each expanded VTable/Function/FunctionPtr

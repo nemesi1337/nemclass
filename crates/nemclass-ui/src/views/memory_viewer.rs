@@ -134,6 +134,11 @@ pub struct MemoryViewer {
     /// Set when the user clicks "Disassemble here"; consumed by the parent via
     /// `take_disassemble_request()`.
     pending_disassemble: Option<usize>,
+
+    // ── dissect request ───────────────────────────────────────────────────
+    /// Set when the user clicks "Dissect as class here"; consumed by the parent
+    /// via `take_dissect_request()`.  Carries the current viewer address.
+    pending_dissect: Option<usize>,
 }
 
 impl MemoryViewer {
@@ -158,6 +163,7 @@ impl MemoryViewer {
 
             status_msg: None,
             pending_disassemble: None,
+            pending_dissect: None,
         }
     }
 
@@ -176,6 +182,7 @@ impl MemoryViewer {
         self.address_error  = None;
         self.status_msg     = None;
         self.pending_disassemble = None;
+        self.pending_dissect = None;
 
         #[cfg(target_os = "linux")]
         { self.region_index = None; }
@@ -206,6 +213,12 @@ impl MemoryViewer {
     /// frame. Consumes the pending request (returns `None` on the next call).
     pub fn take_disassemble_request(&mut self) -> Option<usize> {
         self.pending_disassemble.take()
+    }
+
+    /// Returns the address to auto-dissect, if the user clicked "Dissect as
+    /// class here" this frame.  Consumes the pending request.
+    pub fn take_dissect_request(&mut self) -> Option<usize> {
+        self.pending_dissect.take()
     }
 
     // -----------------------------------------------------------------------
@@ -307,9 +320,20 @@ impl MemoryViewer {
         // ── action buttons ────────────────────────────────────────────────
         ui.separator();
         ui.horizontal(|ui| {
-            ui.add_enabled(false, egui::Button::new("Dissect as class here (TODO)"))
-                .on_disabled_hover_text("Not yet implemented — will dissect the current address as a class node");
             let addr = self.address;
+            // "Dissect as class here" — Linux only at runtime; on other
+            // platforms the button is shown disabled with a hover note.
+            #[cfg(target_os = "linux")]
+            {
+                if ui.button("Dissect as class here").clicked() {
+                    self.pending_dissect = Some(addr);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                ui.add_enabled(false, egui::Button::new("Dissect as class here"))
+                    .on_disabled_hover_text("Auto-dissect is Linux-only");
+            }
             if ui.button("Disassemble here").clicked() {
                 self.pending_disassemble = Some(addr);
             }
