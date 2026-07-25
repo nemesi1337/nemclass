@@ -16,7 +16,7 @@ mod windows;
 #[cfg(windows)]
 mod win_backend;
 
-// Client for the `nemclass_mod` kernel char device: a privileged memory backend
+// Client for the `nemclass_mod` kernel /proc interface: a privileged memory backend
 // plus a non-ptrace debugger. Speaks a Linux ioctl ABI, so it is Linux-only —
 // the shared `MemoryBackend` seam stays platform-neutral for a Windows backend.
 #[cfg(target_os = "linux")]

@@ -1,4 +1,4 @@
-//! Userspace debugger controller driving the `nemclass_mod` char device.
+//! Userspace debugger controller driving the `nemclass_mod` /proc interface.
 //!
 //! [`Debugger`] is an ergonomic layer over [`KernelClient`](super::KernelClient):
 //! it owns the authenticated device fd bound to a single target `pid`, keeps
@@ -22,7 +22,7 @@
 //! # The flow
 //!
 //! ```text
-//! attach(pid, key)  ── open /dev/nemclass, VERSION-check ABI, AUTH ──▶ Debugger
+//! attach(pid, key)  ── open /proc/nemclass/attach, VERSION-check ABI, AUTH ──▶ Debugger
 //!        │
 //!        ├─ set_breakpoint(spec) ─▶ BreakpointId          (BP_SET)
 //!        │
@@ -42,7 +42,7 @@
 //! # Platform
 //!
 //! Linux-only and kernel-module-only: it speaks a Linux ioctl ABI over
-//! `/dev/nemclass`. The whole `kernel` module is gated `#[cfg(target_os =
+//! `/proc/nemclass/attach`. The whole `kernel` module is gated `#[cfg(target_os =
 //! "linux")]`, so a future Windows debugger can slot in behind an equivalent
 //! surface without touching callers.
 
@@ -303,7 +303,7 @@ pub struct Debugger {
 }
 
 impl Debugger {
-    /// Attaches to `pid`: opens `/dev/nemclass`, verifies the module speaks
+    /// Attaches to `pid`: opens `/proc/nemclass/attach`, verifies the module speaks
     /// [`abi::NEMCLASS_ABI_VERSION`], and authenticates with `key`.
     ///
     /// `key` is the raw key bytes the module was loaded with (`key=<hex>`
@@ -766,7 +766,7 @@ mod tests {
 
     // --- live device test (skips cleanly without the module) --------------
 
-    /// End-to-end against a real `/dev/nemclass`: attach to ourselves, set an
+    /// End-to-end against a real `/proc/nemclass/attach`: attach to ourselves, set an
     /// execute breakpoint, and tear it down. `#[ignore]` by default because the
     /// module is not loaded in CI/dev; when run, it SKIPs cleanly if the device
     /// is absent or auth is refused rather than failing the suite.
@@ -774,7 +774,7 @@ mod tests {
     /// Run with the key the module was loaded with:
     /// `NEMCLASS_KEY=<hex> cargo test -p nemclass-core -- --ignored live_attach`.
     #[test]
-    #[ignore = "requires the nemclass kernel module loaded at /dev/nemclass (set NEMCLASS_KEY)"]
+    #[ignore = "requires the nemclass kernel module loaded at /proc/nemclass/attach (set NEMCLASS_KEY)"]
     fn live_attach_set_clear_breakpoint() {
         let pid = std::process::id() as libc::pid_t;
 
@@ -793,7 +793,7 @@ mod tests {
         let mut dbg = match Debugger::attach(pid, &key) {
             Ok(d) => d,
             Err(Error::DeviceUnavailable(_)) => {
-                eprintln!("SKIP: /dev/nemclass not present");
+                eprintln!("SKIP: /proc/nemclass/attach not present");
                 return;
             }
             Err(Error::AbiMismatch { .. }) => {

@@ -31,7 +31,7 @@ pub use process::{LINUX_KERNEL, LINUX_NATIVE, LinuxProvider};
 pub use process::{WINDOWS_NATIVE, WindowsBackend, WindowsProvider};
 
 // Kernel-device client + privileged backend/provider (Linux-only). Speaks the
-// `nemclass_mod` ioctl ABI over `/dev/nemclass` for ptrace-free memory IO and
+// `nemclass_mod` ioctl ABI over `/proc/nemclass/attach` for ptrace-free memory IO and
 // the non-ptrace debugger; the `kernel` module holds the `#[repr(C)]` ABI and
 // the `Debugger` controller layered over the client.
 #[cfg(target_os = "linux")]

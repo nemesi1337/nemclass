@@ -1,4 +1,4 @@
-//! Client for the `nemclass_mod` Linux kernel char device (`/dev/nemclass`).
+//! Client for the `nemclass_mod` Linux kernel /proc interface (`/proc/nemclass/attach`).
 //!
 //! The module exposes an ioctl ABI providing (a) kernel-side remote process
 //! memory read/write that bypasses ptrace/Yama, and (b) a non-ptrace,

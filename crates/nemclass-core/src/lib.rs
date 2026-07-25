@@ -72,7 +72,7 @@ pub use internal::{WINDOWS_NATIVE, WindowsBackend, WindowsProvider};
 
 // Kernel-module client, privileged backend/provider, and debugger types
 // (Linux-only): ptrace-free memory IO plus hardware breakpoints/uprobes over
-// the `nemclass_mod` char device. The `Debugger` controller (attach → auth →
+// the `nemclass_mod` /proc interface. The `Debugger` controller (attach → auth →
 // set bp → wait → inspect → clear) sits on top of `KernelClient`. Gated so
 // non-Linux builds stay clean.
 #[cfg(target_os = "linux")]
@@ -117,7 +117,7 @@ pub enum Error {
     /// A short transfer: fewer bytes were read/written than requested.
     #[error("partial memory transfer: {actual} of {requested} bytes")]
     PartialTransfer { requested: usize, actual: usize },
-    /// The `nemclass` kernel char device (`/dev/nemclass`) could not be opened —
+    /// The `nemclass` kernel /proc interface (`/proc/nemclass/attach`) could not be opened —
     /// the module is not loaded, or the caller lacks permission on the node.
     #[error("kernel device unavailable: {0}")]
     DeviceUnavailable(String),

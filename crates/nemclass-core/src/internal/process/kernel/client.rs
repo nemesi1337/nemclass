@@ -1,4 +1,4 @@
-//! Userspace client for the `nemclass_mod` char device (`/dev/nemclass`).
+//! Userspace client for the `nemclass_mod` /proc interface (`/proc/nemclass/attach`).
 //!
 //! [`KernelClient`] opens the device and drives its ioctl ABI (see [`super::abi`])
 //! to provide two capabilities that bypass ptrace/Yama:
@@ -25,8 +25,11 @@ use crate::internal::process::MemoryBackend;
 use crate::internal::process::kernel::abi;
 use crate::internal::process::{MemoryRegion, Protection};
 
-/// Default device node created by the module.
-pub const NEMCLASS_DEVICE: &str = "/dev/nemclass";
+/// Default interface exposed by the module. Historically a `/dev` char device;
+/// the module now publishes the ioctl endpoint under `/proc` and gates `open()`
+/// on a uid/gid allowlist (see the module's `access.conf`), so a non-root user
+/// listed there can open it directly.
+pub const NEMCLASS_DEVICE: &str = "/proc/nemclass/attach";
 
 /// A register-snapshot delivered when a breakpoint/uprobe fires. A
 /// platform-neutral view of [`abi::nemclass_event`]; the target is **not**
@@ -84,7 +87,7 @@ pub struct PtraceStatus {
     pub tracer_pid: i32,
 }
 
-/// A handle to the `nemclass` kernel char device.
+/// A handle to the `nemclass` kernel /proc interface.
 ///
 /// Holds the open [`File`] (RAII closes the fd on drop) and its [`RawFd`] for
 /// ioctl. Constructing one only opens the node; call [`KernelClient::auth`]
@@ -525,16 +528,16 @@ mod tests {
             Ok(_) => {
                 // On a host that actually has the module loaded this is fine;
                 // don't fail the suite there.
-                eprintln!("SKIP: /dev/nemclass is present on this host");
+                eprintln!("SKIP: /proc/nemclass/attach is present on this host");
             }
         }
     }
 
     /// Exercises the full memory path (read + write round-trip and region
     /// enumeration) against our own pid. Requires the module; ignored by
-    /// default because it cannot run without `/dev/nemclass`.
+    /// default because it cannot run without `/proc/nemclass/attach`.
     #[test]
-    #[ignore = "requires the nemclass kernel module loaded at /dev/nemclass"]
+    #[ignore = "requires the nemclass kernel module loaded at /proc/nemclass/attach"]
     fn kernel_backend_self_round_trip() {
         let pid = std::process::id() as libc::pid_t;
         let backend = KernelBackend::open(pid).expect("open device");

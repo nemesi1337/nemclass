@@ -30,7 +30,7 @@ pub const LINUX_NATIVE: &str = "linux-native";
 
 /// Name of the privileged, kernel-module-backed provider registered by
 /// [`ProviderRegistry::default`] on Linux. Reads/writes go through
-/// `/dev/nemclass` (bypassing ptrace/Yama) instead of `process_vm_readv`.
+/// `/proc/nemclass/attach` (bypassing ptrace/Yama) instead of `process_vm_readv`.
 #[cfg(target_os = "linux")]
 pub const LINUX_KERNEL: &str = "linux-kernel";
 
@@ -101,7 +101,7 @@ impl ProcessProvider for LinuxProvider {
     }
 }
 
-/// Privileged Linux provider backed by the `nemclass_mod` kernel char device.
+/// Privileged Linux provider backed by the `nemclass_mod` kernel /proc interface.
 ///
 /// Enumeration reuses `/proc` (process listing) exactly like [`LinuxProvider`];
 /// the difference is [`open`](ProcessProvider::open), which wires the target's
@@ -155,7 +155,7 @@ impl KernelProvider {
         Self { key }
     }
 
-    /// Opens `/dev/nemclass`, verifies the module's ABI, and authenticates with
+    /// Opens `/proc/nemclass/attach`, verifies the module's ABI, and authenticates with
     /// the configured key — the handshake every privileged ioctl requires.
     /// Mirrors [`crate::Debugger::attach`]. Returns the authed client so callers
     /// can reuse the one fd for both memory IO and enumeration.
