@@ -72,12 +72,21 @@ description = "Check formatting without writing (CI-friendly)."
 command = "cargo"
 args = ["fmt", "--all", "--", "--check"]
 
+# Clears target/doc so stale external-crate docs from earlier (pre --no-deps)
+# builds don't linger in the sidebar/search index.
+[tasks.doc-clean]
+description = "Remove stale doc output before building API docs."
+command = "cargo"
+args = ["clean", "--doc"]
+
 [tasks.doc]
-description = "Build the API docs (no dependencies)."
+description = "Build the API docs (workspace crates only, no dependencies)."
+dependencies = ["doc-clean"]
 command = "cargo"
 args = [
     "doc",
     "--no-deps",
+    "--open",
     "-p", "nemclass-core",
     "-p", "nemclass-model",
     "-p", "nemclass-script",
