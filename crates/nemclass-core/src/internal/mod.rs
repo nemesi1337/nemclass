@@ -52,4 +52,7 @@ pub use analysis::{
     string_at,
 };
 #[cfg(target_os = "linux")]
-pub use analysis::{FunctionDisasm, classify_in_process, disassemble_function};
+pub use analysis::{
+    DissectResult, FunctionDisasm, classify_in_process, disassemble_function, disassemble_range,
+    dissect_regions, module_exec_regions,
+};

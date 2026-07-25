@@ -53,6 +53,12 @@ pub struct InstructionData {
     /// (register/memory operands) and for non-branch instructions — those carry
     /// no statically resolvable destination.
     pub target: Option<u64>,
+    /// The effective address of a RIP-relative memory operand, e.g. the `[rip+x]`
+    /// in `lea rdi, [rip+x]` or `mov rax, [rip+x]` — the common form of a
+    /// data/string reference in position-independent code. Used by the dissector
+    /// to build cross-reference maps (which strings/data an instruction loads).
+    /// `None` for instructions without a RIP-relative memory operand.
+    pub mem_target: Option<u64>,
 }
 
 /// Maps an iced-x86 [`FlowControl`] to our coarse [`FlowKind`].
@@ -94,6 +100,18 @@ fn near_branch_target(instruction: &Instruction) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// Extracts the effective address of a RIP-relative memory operand, if any.
+///
+/// `lea reg, [rip+disp]` / `mov reg, [rip+disp]` and friends encode a
+/// data/string reference relative to the *next* instruction's address; iced-x86
+/// resolves it for us. Non-RIP memory operands (base/index register forms) have
+/// no statically resolvable address, so we return `None`.
+fn ip_rel_memory_target(instruction: &Instruction) -> Option<u64> {
+    instruction
+        .is_ip_rel_memory_operand()
+        .then(|| instruction.ip_rel_memory_address())
 }
 
 fn are_operands_static(instruction: &Instruction) -> bool {
@@ -174,7 +192,15 @@ fn get_static_instruction_bytes(instruction: &Instruction) -> i32 {
     for i in 0..instruction.op_count() {
         match instruction.op_kind(i) {
             OpKind::Memory => {
-                dynamic_bytes += instruction.memory_displ_size();
+                // For RIP/EIP-relative operands iced reports an 8-byte
+                // `memory_displ_size` (the effective-address width) even though
+                // only a 4-byte displacement is actually encoded. Counting 8
+                // here would over-count and underflow the subtraction below.
+                if instruction.is_ip_rel_memory_operand() {
+                    dynamic_bytes += 4;
+                } else {
+                    dynamic_bytes += instruction.memory_displ_size();
+                }
             }
             OpKind::Immediate32 | OpKind::Immediate32to64 => {
                 dynamic_bytes += 4;
@@ -189,7 +215,9 @@ fn get_static_instruction_bytes(instruction: &Instruction) -> i32 {
         }
     }
 
-    (instruction.len() as u32 - dynamic_bytes) as i32
+    // Saturating: a mis-sized displacement/immediate estimate must never panic
+    // the disassembly loop — clamp to zero static bytes instead.
+    (instruction.len() as u32).saturating_sub(dynamic_bytes) as i32
 }
 
 /// Disassembles a safe slice of bytes.
@@ -243,9 +271,10 @@ pub fn disassemble_instructions<F>(
             &code[offset..]
         };
 
-        let (instruction_str, static_bytes, kind, target) = if instruction.is_invalid() {
+        let (instruction_str, static_bytes, kind, target, mem_target) = if instruction.is_invalid()
+        {
             // An invalid decode carries no meaningful flow: `Other`, no target.
-            (String::from("???"), -1, FlowKind::Other, None)
+            (String::from("???"), -1, FlowKind::Other, None, None)
         } else {
             let mut formatted_str = String::new();
             formatter.format(&instruction, &mut formatted_str);
@@ -261,6 +290,7 @@ pub fn disassemble_instructions<F>(
                 static_b,
                 flow_kind_of(&instruction),
                 near_branch_target(&instruction),
+                ip_rel_memory_target(&instruction),
             )
         };
 
@@ -272,6 +302,7 @@ pub fn disassemble_instructions<F>(
             instruction: instruction_str,
             kind,
             target,
+            mem_target,
         };
 
         // Pass to the UI/caller closure. Stop if it returns false.
@@ -370,5 +401,23 @@ mod tests {
         let ins = decode_one(&[0xFF, 0xD0]);
         assert_eq!(ins.kind, FlowKind::Call);
         assert_eq!(ins.target, None);
+    }
+
+    #[test]
+    fn lea_rip_relative_yields_mem_target() {
+        // 48 8D 05 78 56 34 12: `lea rax, [rip+0x12345678]`.
+        // Effective address = next-insn IP (VA + 7) + disp (0x12345678).
+        let ins = decode_one(&[0x48, 0x8D, 0x05, 0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(ins.length, 7);
+        assert_eq!(ins.mem_target, Some(VA + 7 + 0x1234_5678));
+        // A data reference is not a branch.
+        assert_eq!(ins.target, None);
+    }
+
+    #[test]
+    fn register_operand_has_no_mem_target() {
+        // B8 01000000: `mov eax, 1` — no memory operand.
+        let ins = decode_one(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(ins.mem_target, None);
     }
 }

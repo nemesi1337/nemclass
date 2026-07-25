@@ -26,12 +26,19 @@ pub mod strings;
 #[cfg(target_os = "linux")]
 pub mod disasm;
 
+// Cross-reference "dissect code" scan — reads from a `Process` + `/proc`, Linux-only.
+#[cfg(target_os = "linux")]
+pub mod dissect;
+
 pub use pointer::{PointerClass, classify_value};
 pub use region_index::{AddrClass, RegionIndex};
 pub use strings::{StrKind, StringRun, detect_strings, string_at};
 
 #[cfg(target_os = "linux")]
-pub use disasm::{FunctionDisasm, disassemble_function};
+pub use disasm::{FunctionDisasm, disassemble_function, disassemble_range};
+
+#[cfg(target_os = "linux")]
+pub use dissect::{DissectResult, dissect_regions, module_exec_regions};
 
 #[cfg(target_os = "linux")]
 pub use pointer::classify_in_process;

@@ -86,6 +86,53 @@ pub fn disassemble_function(
     Ok(result)
 }
 
+/// Disassembles a *range* of code at `addr` in `process`, reading up to `len`
+/// bytes and decoding them linearly.
+///
+/// Unlike [`disassemble_function`], this does **not** stop at the first
+/// `ret`/`int3` — it decodes the whole window, which is what a module-level
+/// (continuous) disassembly view wants: `.text` is full of `ret`s between
+/// functions, and stopping at the first one would show only a single function.
+///
+/// It still tolerates a short read (an unmapped tail simply bounds the buffer)
+/// and stops on an invalid / zero-length decode, since that means we have run
+/// off the end of real code (e.g. into data or a hole in the mapping).
+///
+/// Windowing / paging over a large module is the caller's job: pass a bounded
+/// `len` (a screenful) and advance `addr` past the last decoded instruction.
+pub fn disassemble_range(
+    process: &crate::Process,
+    addr: u64,
+    len: usize,
+) -> crate::Result<Vec<InstructionData>> {
+    let mut out = Vec::new();
+    if len == 0 {
+        return Ok(out);
+    }
+
+    // Snapshot up to `len` bytes. A short read (partly-unmapped region, target
+    // died) just gives us fewer bytes to decode — not an error.
+    let start = usize::try_from(addr).map_err(|_| crate::Error::InvalidAddress)?;
+    let mut buf = vec![0u8; len];
+    let read = process.read_buf(start, &mut buf)?;
+    buf.truncate(read);
+    if buf.is_empty() {
+        return Ok(out);
+    }
+
+    // Decode linearly, keeping every instruction. Stop only on an invalid /
+    // zero-length decode (running off the end of code), never on ret/int3.
+    disassemble_instructions(&buf, addr, true, |ins| {
+        if ins.length == 0 || ins.instruction == "???" {
+            return false;
+        }
+        out.push(ins);
+        true
+    });
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     // `disassemble_function` needs a live target, so it has no self-contained

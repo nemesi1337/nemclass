@@ -58,7 +58,10 @@ pub use internal::{SymbolResolver, symbol_resolver};
 // Linux-only analysis conveniences that touch a live `Process`/`/proc`: the
 // linear function walk and the in-process pointer classifier.
 #[cfg(target_os = "linux")]
-pub use internal::{FunctionDisasm, classify_in_process, disassemble_function};
+pub use internal::{
+    DissectResult, FunctionDisasm, classify_in_process, disassemble_function, disassemble_range,
+    dissect_regions, module_exec_regions,
+};
 
 // Native Linux provider (`process_vm_readv` + `/proc`), Linux-only, plus the
 // backend-name constants (`"linux-native"` / `"linux-kernel"`) a UI keys off.
