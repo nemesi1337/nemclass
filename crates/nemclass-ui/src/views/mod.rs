@@ -29,6 +29,10 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use nemclass_core::{ModuleInfoWithName, Process, ProcessEntry, ProviderRegistry};
+#[cfg(target_os = "linux")]
+use nemclass_core::{KernelProvider, LINUX_KERNEL};
+#[cfg(target_os = "linux")]
+use crate::views::debugger_panel::parse_hex_key;
 use nemclass_model::{ClassNode, ModelError, Node, NodeRegistry, Project, RenderedValue, resolve_formula};
 use nemclass_script::{Event, EventBus};
 use uuid::Uuid;
@@ -120,6 +124,8 @@ pub struct NemclassApp {
     registry: ProviderRegistry,
     backend_names: Vec<String>,
     selected_backend: String,
+    /// Hex text of the auth key the user typed; used by the kernel backend only.
+    kernel_key: String,
     process_list: Vec<ProcessEntry>,
     process_list_status: String,
     selected_process_idx: Option<usize>,
@@ -179,6 +185,7 @@ impl NemclassApp {
             registry,
             backend_names,
             selected_backend,
+            kernel_key: String::new(),
             process_list: Vec::new(),
             process_list_status: "Press Refresh to enumerate processes.".into(),
             selected_process_idx: None,
@@ -227,7 +234,24 @@ impl NemclassApp {
         }
     }
 
+    /// Re-registers a keyed `KernelProvider` when the linux-kernel backend is
+    /// selected.  Called at the start of `do_attach` so the freshly-entered key
+    /// is in effect before the provider's `open()` is called.  Idempotent and
+    /// a no-op on non-Linux targets.
+    #[cfg(target_os = "linux")]
+    fn ensure_kernel_key_registered(&mut self) {
+        if self.selected_backend == LINUX_KERNEL {
+            self.registry.register(Box::new(
+                KernelProvider::with_key(parse_hex_key(&self.kernel_key)),
+            ));
+        }
+    }
+
     fn do_attach(&mut self) {
+        // Ensure the keyed provider is in the registry before we look it up.
+        #[cfg(target_os = "linux")]
+        self.ensure_kernel_key_registered();
+
         let Some(idx) = self.selected_process_idx else {
             self.last_error = Some("No process selected.".into());
             return;
@@ -736,6 +760,20 @@ impl NemclassApp {
                     ui.selectable_value(&mut self.selected_backend, name.clone(), name.as_str());
                 }
             });
+
+        // Auth-key row — only shown when the kernel backend is selected (Linux
+        // only: the module gates all memory ops behind NEMCLASS_IOC_AUTH).
+        #[cfg(target_os = "linux")]
+        if self.selected_backend == LINUX_KERNEL {
+            ui.horizontal(|ui| {
+                ui.label("Auth key (hex):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.kernel_key)
+                        .desired_width(160.0)
+                        .hint_text("hex key the module was loaded with"),
+                );
+            });
+        }
 
         ui.separator();
 

@@ -479,7 +479,7 @@ mod linux {
 
     /// Parses an optional hex string (e.g. `"deadbeef"` or `"DE AD BE EF"`)
     /// into raw bytes for the auth key. Empty / whitespace → empty `Vec`.
-    fn parse_hex_key(s: &str) -> Vec<u8> {
+    pub(crate) fn parse_hex_key(s: &str) -> Vec<u8> {
         let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
         if hex.is_empty() {
             return Vec::new();
@@ -525,6 +525,8 @@ mod stub {
 // ─── Public re-export ────────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
 pub use linux::DebuggerPanel;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::parse_hex_key;
 
 #[cfg(not(target_os = "linux"))]
 pub use stub::DebuggerPanel;
