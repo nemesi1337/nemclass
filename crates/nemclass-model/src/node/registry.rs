@@ -203,6 +203,60 @@ fn register_builtins(reg: &mut NodeRegistry) {
         reg.register("Utf16Text", ctor, de);
     }
 
+    // VTableNode (container) — recursive via registry; children are VMethodNodes
+    {
+        use crate::node::vtable::VTableNode;
+        fn ctor() -> Box<dyn Node> { Box::new(VTableNode::new("")) }
+        fn de(def: NodeDef, reg: &NodeRegistry) -> Result<Box<dyn Node>> {
+            let mut n = VTableNode::new(def.name);
+            n.comment = def.comment;
+            for child_def in def.nodes {
+                n.children.push(reg.deserialize_node_inner(child_def)?);
+            }
+            Ok(Box::new(n))
+        }
+        reg.register("VTable", ctor, de);
+    }
+
+    // VMethodNode — leaf; name carries the resolved/user method name
+    {
+        use crate::node::vtable::VMethodNode;
+        fn ctor() -> Box<dyn Node> { Box::new(VMethodNode::new("")) }
+        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
+            let mut n = VMethodNode::new(def.name);
+            n.comment = def.comment;
+            Ok(Box::new(n))
+        }
+        reg.register("VMethod", ctor, de);
+    }
+
+    // FunctionNode — leaf with an editable `signature` attr
+    {
+        use crate::node::function::FunctionNode;
+        fn ctor() -> Box<dyn Node> { Box::new(FunctionNode::new("")) }
+        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
+            let mut n = FunctionNode::new(def.name);
+            n.comment = def.comment;
+            if let Some(TV::String(s)) = def.attrs.get("signature") {
+                n.signature = s.clone();
+            }
+            Ok(Box::new(n))
+        }
+        reg.register("Function", ctor, de);
+    }
+
+    // FunctionPtrNode — leaf; no extra attrs
+    {
+        use crate::node::function::FunctionPtrNode;
+        fn ctor() -> Box<dyn Node> { Box::new(FunctionPtrNode::new("")) }
+        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
+            let mut n = FunctionPtrNode::new(def.name);
+            n.comment = def.comment;
+            Ok(Box::new(n))
+        }
+        reg.register("FunctionPtr", ctor, de);
+    }
+
     // ClassNode (container) — recursive via registry
     {
         fn ctor() -> Box<dyn Node> { Box::new(ClassNode::new("")) }

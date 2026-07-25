@@ -4,6 +4,8 @@ use crate::address::{MemoryReader, ModuleResolver, resolve_formula};
 use crate::class::ClassNode;
 use crate::enums::EnumDescription;
 use crate::node::builtins::*;
+use crate::node::function::{FunctionNode, FunctionPtrNode};
+use crate::node::vtable::{VMethodNode, VTableNode};
 use crate::node::Node;
 use crate::project::Project;
 use crate::NodeRegistry;
@@ -437,4 +439,293 @@ fn deserialize_rejects_overdeep_tree_instead_of_overflowing() {
         matches!(result, Err(ModelError::MaxDepthExceeded(_))),
         "expected MaxDepthExceeded"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M5.4 — VTable / VMethod / Function / FunctionPtr nodes
+// ---------------------------------------------------------------------------
+
+// --- memory_size() ---
+
+#[test]
+fn vtable_memory_size_is_8() {
+    assert_eq!(VTableNode::new("").memory_size(), 8);
+}
+
+#[test]
+fn vmethod_memory_size_is_8() {
+    assert_eq!(VMethodNode::new("").memory_size(), 8);
+}
+
+#[test]
+fn function_node_memory_size_is_8() {
+    assert_eq!(FunctionNode::new("").memory_size(), 8);
+}
+
+#[test]
+fn function_ptr_node_memory_size_is_8() {
+    assert_eq!(FunctionPtrNode::new("").memory_size(), 8);
+}
+
+// --- render() from fixture buffer ---
+
+/// Build an 8-byte little-endian buffer from a known u64 address.
+fn ptr_buf(addr: u64) -> [u8; 8] {
+    addr.to_le_bytes()
+}
+
+#[test]
+fn vtable_render_nonzero_pointer() {
+    let buf = ptr_buf(0x00007FF8_AABB0000);
+    let r = VTableNode::new("vtable").render(&buf, 0);
+    assert_eq!(r.value, "-> 0x00007FF8AABB0000");
+    assert_eq!(r.type_tag, "VTable");
+    assert_eq!(r.memory_size, 8);
+}
+
+#[test]
+fn vtable_render_null_pointer() {
+    let buf = ptr_buf(0);
+    let r = VTableNode::new("vtable").render(&buf, 0);
+    assert_eq!(r.value, "-> null");
+}
+
+#[test]
+fn vtable_render_underrun_returns_placeholder() {
+    // Buffer too small — returns "<?>".
+    let r = VTableNode::new("vtable").render(&[0u8; 4], 0);
+    assert_eq!(r.value, "<?>");
+}
+
+#[test]
+fn vmethod_render_named() {
+    let buf = ptr_buf(0x0000_7FF8_DEAD_CAFE);
+    let mut n = VMethodNode::new("Update");
+    n.comment = "called every frame".to_string();
+    let r = n.render(&buf, 0);
+    assert_eq!(r.value, "Update -> 0x00007FF8DEADCAFE");
+    assert_eq!(r.type_tag, "VMethod");
+    assert_eq!(r.memory_size, 8);
+}
+
+#[test]
+fn vmethod_render_unnamed_shows_raw_address() {
+    // When name is empty the UI hasn't resolved the symbol yet — show raw addr.
+    let buf = ptr_buf(0x0000_1234_5678_9ABC);
+    let r = VMethodNode::new("").render(&buf, 0);
+    assert_eq!(r.value, "0x000012345678_9ABC".replace('_', ""));
+    assert_eq!(r.type_tag, "VMethod");
+}
+
+#[test]
+fn function_node_render() {
+    let buf = ptr_buf(0x0000_7FFE_CAFE_0000);
+    let mut n = FunctionNode::new("Update");
+    n.signature = "void Update(float dt)".to_string();
+    let r = n.render(&buf, 0);
+    assert_eq!(r.value, "void Update(float dt) @ 0x00007FFECAFE0000");
+    assert_eq!(r.type_tag, "Function");
+    assert_eq!(r.memory_size, 8);
+}
+
+#[test]
+fn function_ptr_node_render() {
+    let buf = ptr_buf(0x0000_DEAD_BEEF_0042);
+    let r = FunctionPtrNode::new("OnClick").render(&buf, 0);
+    assert_eq!(r.value, "0x0000DEADBEEF0042");
+    assert_eq!(r.type_tag, "FunctionPtr");
+    assert_eq!(r.memory_size, 8);
+}
+
+#[test]
+fn render_at_nonzero_offset_vtable() {
+    // Two pointer-sized values; read the second (offset 8).
+    let mut buf = ptr_buf(0x1111_1111_1111_1111).to_vec();
+    buf.extend_from_slice(&ptr_buf(0x0000_7FF8_AABB_CCDD));
+    let r = VTableNode::new("").render(&buf, 8);
+    assert_eq!(r.value, "-> 0x00007FF8AABBCCDD");
+}
+
+// --- construct-by-tag ---
+
+#[test]
+fn registry_construct_vtable() {
+    let reg = NodeRegistry::new().with_builtins();
+    let n = reg.construct("VTable").expect("VTable not registered");
+    assert_eq!(n.type_tag(), "VTable");
+}
+
+#[test]
+fn registry_construct_vmethod() {
+    let reg = NodeRegistry::new().with_builtins();
+    let n = reg.construct("VMethod").expect("VMethod not registered");
+    assert_eq!(n.type_tag(), "VMethod");
+}
+
+#[test]
+fn registry_construct_function() {
+    let reg = NodeRegistry::new().with_builtins();
+    let n = reg.construct("Function").expect("Function not registered");
+    assert_eq!(n.type_tag(), "Function");
+}
+
+#[test]
+fn registry_construct_function_ptr() {
+    let reg = NodeRegistry::new().with_builtins();
+    let n = reg.construct("FunctionPtr").expect("FunctionPtr not registered");
+    assert_eq!(n.type_tag(), "FunctionPtr");
+}
+
+// --- NodeDef round-trip ---
+
+/// Build a `VTableNode` containing 3 named `VMethodNode`s, one `FunctionNode`
+/// (with a custom signature), and one `FunctionPtrNode`, then assert that a
+/// TOML serialize → deserialize cycle is lossless: type_tags, names, comments,
+/// and the `signature` attr all survive.
+#[test]
+fn vtable_nodedef_round_trip() {
+    let reg = NodeRegistry::new().with_builtins();
+
+    // Build the tree.
+    let mut vtable = VTableNode::new("vtable_ptr");
+    vtable.comment = "main vtable".to_string();
+
+    let mut m0 = VMethodNode::new("Init");
+    m0.comment = "slot 0".to_string();
+    vtable.children.push(Box::new(m0));
+
+    let mut m1 = VMethodNode::new("Update");
+    m1.comment = "slot 1".to_string();
+    vtable.children.push(Box::new(m1));
+
+    let mut m2 = VMethodNode::new("Render");
+    m2.comment = "slot 2".to_string();
+    vtable.children.push(Box::new(m2));
+
+    let mut func = FunctionNode::new("destructor");
+    func.comment = "custom dtor".to_string();
+    func.signature = "void ~Obj()".to_string();
+    vtable.children.push(Box::new(func));
+
+    let mut fptr = FunctionPtrNode::new("callback");
+    fptr.comment = "event cb".to_string();
+    vtable.children.push(Box::new(fptr));
+
+    // Serialize: registry recursively walks the tree.
+    let def = reg.serialize_node_recursive(&vtable);
+
+    // Verify the serialized NodeDef structure before deserialization.
+    assert_eq!(def.type_tag, "VTable");
+    assert_eq!(def.name, "vtable_ptr");
+    assert_eq!(def.comment, "main vtable");
+    assert_eq!(def.nodes.len(), 5);
+
+    // VMethod children
+    assert_eq!(def.nodes[0].type_tag, "VMethod");
+    assert_eq!(def.nodes[0].name, "Init");
+    assert_eq!(def.nodes[0].comment, "slot 0");
+
+    assert_eq!(def.nodes[1].type_tag, "VMethod");
+    assert_eq!(def.nodes[1].name, "Update");
+
+    assert_eq!(def.nodes[2].type_tag, "VMethod");
+    assert_eq!(def.nodes[2].name, "Render");
+
+    // FunctionNode: signature attr must be present.
+    assert_eq!(def.nodes[3].type_tag, "Function");
+    assert_eq!(def.nodes[3].name, "destructor");
+    assert_eq!(
+        def.nodes[3].attrs.get("signature"),
+        Some(&toml::Value::String("void ~Obj()".to_string())),
+    );
+
+    // FunctionPtrNode: no extra attrs.
+    assert_eq!(def.nodes[4].type_tag, "FunctionPtr");
+    assert_eq!(def.nodes[4].name, "callback");
+    assert!(def.nodes[4].attrs.is_empty());
+
+    // Deserialize and verify structural equality.
+    let node_box = reg.deserialize_node(def).expect("deserialize failed");
+
+    assert_eq!(node_box.type_tag(), "VTable");
+    assert_eq!(node_box.name(), "vtable_ptr");
+    assert_eq!(node_box.comment(), "main vtable");
+    assert_eq!(node_box.memory_size(), 8);
+
+    let children = node_box.children();
+    assert_eq!(children.len(), 5, "VTable must have 5 children after round-trip");
+
+    assert_eq!(children[0].type_tag(), "VMethod");
+    assert_eq!(children[0].name(), "Init");
+    assert_eq!(children[0].comment(), "slot 0");
+    assert_eq!(children[0].memory_size(), 8);
+
+    assert_eq!(children[1].type_tag(), "VMethod");
+    assert_eq!(children[1].name(), "Update");
+    assert_eq!(children[1].comment(), "slot 1");
+
+    assert_eq!(children[2].type_tag(), "VMethod");
+    assert_eq!(children[2].name(), "Render");
+
+    // FunctionNode: check the signature survived (via render as proxy).
+    assert_eq!(children[3].type_tag(), "Function");
+    assert_eq!(children[3].name(), "destructor");
+    assert_eq!(children[3].comment(), "custom dtor");
+    let buf = ptr_buf(0x0000_7FFF_1234_5678);
+    let r3 = children[3].render(&buf, 0);
+    assert!(r3.value.starts_with("void ~Obj()"), "signature lost: {}", r3.value);
+
+    // FunctionPtrNode.
+    assert_eq!(children[4].type_tag(), "FunctionPtr");
+    assert_eq!(children[4].name(), "callback");
+    assert_eq!(children[4].comment(), "event cb");
+}
+
+/// TOML-level round-trip: encode via `toml::to_string` → decode via
+/// `toml::from_str`, then re-deserialize through the registry.  This exercises
+/// the `NodeDef` serde derive end-to-end (including the `#[serde(flatten)]`
+/// attrs map and the nested `nodes` array).
+#[test]
+fn vtable_toml_string_round_trip() {
+    use crate::serialize::NodeDef;
+
+    let reg = NodeRegistry::new().with_builtins();
+
+    let mut vtable = VTableNode::new("vptr");
+    let mut m = VMethodNode::new("Tick");
+    m.comment = "game tick".to_string();
+    vtable.children.push(Box::new(m));
+    let mut func = FunctionNode::new("init");
+    func.signature = "bool Init()".to_string();
+    vtable.children.push(Box::new(func));
+
+    let def = reg.serialize_node_recursive(&vtable);
+
+    // Wrap in a table so toml::to_string has a root map.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Wrapper { node: NodeDef }
+    let wrapper = Wrapper { node: def };
+    let toml_str = toml::to_string(&wrapper).expect("toml serialize failed");
+
+    // The TOML must contain the nested VMethod and Function entries.
+    assert!(toml_str.contains("type = \"VTable\""),   "missing VTable: {toml_str}");
+    assert!(toml_str.contains("type = \"VMethod\""),  "missing VMethod: {toml_str}");
+    assert!(toml_str.contains("type = \"Function\""), "missing Function: {toml_str}");
+    assert!(toml_str.contains("signature"),           "missing signature attr: {toml_str}");
+
+    let w2: Wrapper = toml::from_str(&toml_str).expect("toml deserialize failed");
+    let node = reg.deserialize_node(w2.node).expect("registry deserialize failed");
+
+    assert_eq!(node.type_tag(), "VTable");
+    assert_eq!(node.name(), "vptr");
+    let ch = node.children();
+    assert_eq!(ch.len(), 2);
+    assert_eq!(ch[0].type_tag(), "VMethod");
+    assert_eq!(ch[0].name(), "Tick");
+    assert_eq!(ch[0].comment(), "game tick");
+    assert_eq!(ch[1].type_tag(), "Function");
+    // Signature survives: render against a zero buffer (address shows as null ptr).
+    let buf = ptr_buf(0xCAFE_BABE_0000_0001);
+    let r = ch[1].render(&buf, 0);
+    assert!(r.value.starts_with("bool Init()"), "signature lost: {}", r.value);
 }
