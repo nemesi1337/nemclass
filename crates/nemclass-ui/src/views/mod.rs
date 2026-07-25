@@ -20,11 +20,19 @@ mod debugger_panel;
 mod memory_viewer;
 mod disassembly;
 mod key_file;
+mod script_host;
+mod script_log;
+mod scripts_panel;
+mod host_api_impl;
 
 pub use scanner_panel::ScannerPanel;
 pub use debugger_panel::DebuggerPanel;
 pub use memory_viewer::MemoryViewer;
 pub use disassembly::DisassemblyPanel;
+
+use script_host::ScriptHost;
+use script_log::{LogKind, ScriptLog, new_script_log};
+use scripts_panel::{ScriptsPanel, ScriptsPanelAction};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -41,7 +49,7 @@ use crate::views::debugger_panel::parse_hex_key;
 use nemclass_model::{ClassNode, ModelError, Node, NodeRegistry, Project, RenderedValue, resolve_formula};
 #[cfg(target_os = "linux")]
 use nemclass_model::serialize::NodeDef;
-use nemclass_script::{Event, EventBus};
+use nemclass_script::{ClassAddressQuery, Event, EventBus};
 use uuid::Uuid;
 
 use crate::process_reader::ProcessReader;
@@ -58,6 +66,7 @@ enum CentralTab {
     Debugger,
     MemoryViewer,
     Disassembly,
+    Scripts,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +91,9 @@ struct NodeSnapshot {
     name: String,
     comment: String,
     _memory_size: usize,
+    /// For pointer-to-class nodes: the UUID of the class the pointer targets, so
+    /// the UI can offer a "follow pointer → open target class" action.
+    pointer_target: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +265,24 @@ pub struct NemclassApp {
     pending_disasm_goto: Option<u64>,
 
     // Scripting seam
+    /// Compile-time `Plugin` seam. Lifecycle events are published here.
     event_bus: EventBus,
+    /// The JS engine (or a no-op `Disabled` host when the `scripting` feature is
+    /// off or the engine failed to spawn). Driven directly — not registered on
+    /// the bus — so `pump` stays reachable each frame.
+    script_host: ScriptHost,
+    /// Shared script log buffer, written by the per-frame `UiHostApi` and read by
+    /// the Scripts panel.
+    script_log: ScriptLog,
+    /// Transient UI state for the Scripts tab.
+    scripts_panel: ScriptsPanel,
+    /// A class base address supplied by a script resolver via the "Try resolve
+    /// (script)" button. When set, it takes precedence over the address formula
+    /// in `take_snapshot`; cleared on detach or when the formula is edited.
+    script_resolved_base: Option<usize>,
+    /// Pending "follow pointer" request collected during the class-table draw and
+    /// applied after the closure. `(target_addr, target_class_uuid)`.
+    pending_follow_pointer: Option<(usize, Option<Uuid>)>,
 
     // In-app file dialog
     file_dialog: Option<FileDialog>,
@@ -303,6 +332,11 @@ impl NemclassApp {
             None => (String::new(), None),
         };
 
+        // Spawn the JS engine (feature-gated; `Disabled` otherwise). Any spawn
+        // error is surfaced in the initial status message.
+        let (script_host, script_spawn_msg) = ScriptHost::spawn();
+        let script_log = new_script_log();
+
         Self {
             registry,
             backend_names,
@@ -334,8 +368,15 @@ impl NemclassApp {
             #[cfg(target_os = "linux")]
             pending_disasm_goto: None,
             event_bus: EventBus::new(),
+            script_host,
+            script_log,
+            scripts_panel: ScriptsPanel::new(),
+            script_resolved_base: None,
+            pending_follow_pointer: None,
             file_dialog: None,
-            status_msg: key_status
+            status_msg: script_spawn_msg
+                .map(|m| format!("Scripting: {m}"))
+                .or(key_status)
                 .or_else(|| Some("Demo project loaded. Use File > New or Open to load a project.".into())),
             central_tab: CentralTab::MemoryView,
             scanner_panel: ScannerPanel::new(),
@@ -408,11 +449,12 @@ impl NemclassApp {
 
         // Detach first.
         if self.process.is_some() {
-            self.event_bus.publish(&Event::OnDetach);
+            self.emit(Event::OnDetach);
             self.process = None;
             self.attached_name = None;
             self.clear_memory_state();
             self.memory_viewer.on_detach();
+            self.disassembly_panel.on_detach();
         }
 
         let Some(provider) = self.registry.get(&self.selected_backend) else {
@@ -428,10 +470,11 @@ impl NemclassApp {
                     name.clone()
                 });
                 self.memory_viewer.on_attach(&proc);
+                self.disassembly_panel.on_attach(&proc);
                 self.process = Some(proc);
                 self.last_error = None;
                 self.last_snapshot = None;
-                self.event_bus.publish(&Event::OnAttach {
+                self.emit(Event::OnAttach {
                     pid,
                     name: Some(name),
                 });
@@ -444,7 +487,7 @@ impl NemclassApp {
 
     fn do_detach(&mut self) {
         if self.process.is_some() {
-            self.event_bus.publish(&Event::OnDetach);
+            self.emit(Event::OnDetach);
             self.process = None;
             self.attached_name = None;
             self.clear_memory_state();
@@ -452,6 +495,7 @@ impl NemclassApp {
             self.scanner_panel.on_detach();
             self.debugger_panel.on_detach();
             self.memory_viewer.on_detach();
+            self.disassembly_panel.on_detach();
         }
     }
 
@@ -460,6 +504,17 @@ impl NemclassApp {
         self.node_snapshots.clear();
         self.mem_buf.clear();
         self.edit_state = None;
+        // A script-resolved base is tied to the previous attach/class; drop it so
+        // it doesn't leak across detach or project changes.
+        self.script_resolved_base = None;
+    }
+
+    /// Publishes a lifecycle event to BOTH the compile-time plugin bus and the
+    /// JS engine. Route every lifecycle publish through here so the two sinks
+    /// never drift.
+    fn emit(&mut self, ev: Event) {
+        self.event_bus.publish(&ev);
+        self.script_host.on_event(&ev);
     }
 
     // -----------------------------------------------------------------------
@@ -476,6 +531,27 @@ impl NemclassApp {
         self.clear_memory_state();
         self.last_snapshot = None;
         self.collapsed.clear();
+
+        // Notify the scripting layer and auto-load the project's scripts.
+        if let Some(dir) = self.project_dir.clone() {
+            self.emit(Event::OnProjectLoad {
+                path: dir.display().to_string(),
+            });
+            let src = dir.join("src");
+            match self.script_host.load_scripts(&src) {
+                Ok(()) if self.script_host.is_active() => script_log::push(
+                    &self.script_log,
+                    LogKind::Lifecycle,
+                    format!("Loaded scripts from {}", src.display()),
+                ),
+                Ok(()) => {}
+                Err(e) => script_log::push(
+                    &self.script_log,
+                    LogKind::Error,
+                    format!("Load scripts failed: {e}"),
+                ),
+            }
+        }
     }
 
     /// Execute the New action: create a blank project at `dir`.
@@ -562,7 +638,12 @@ impl NemclassApp {
             .map(|c| c.address_formula.clone())
             .unwrap_or_default();
 
-        let base = if formula.trim().is_empty() {
+        // A script-resolved base (from the "Try resolve (script)" button) takes
+        // precedence over the address formula and is sticky until the user edits
+        // the formula or detaches.
+        let base = if let Some(sb) = self.script_resolved_base {
+            Some(sb)
+        } else if formula.trim().is_empty() {
             None
         } else {
             let reader = ProcessReader::new(proc, modules);
@@ -837,7 +918,23 @@ impl eframe::App for NemclassApp {
         self.scanner_panel.tick_freeze();
         self.debugger_panel.tick_events();
 
-        if self.process.is_some() {
+        // Service host-API requests raised by worker-thread JS. Build a transient
+        // `UiHostApi` from disjoint field borrows (never `&mut self`) so the
+        // borrow checker is satisfied while the engine mutates the project/log.
+        #[cfg(feature = "scripting")]
+        {
+            let mut host = host_api_impl::UiHostApi {
+                project: &mut self.project,
+                process: self.process.as_ref(),
+                log: self.script_log.clone(),
+                last_error: &mut self.last_error,
+            };
+            self.script_host.pump(&mut host);
+        }
+
+        // Keep repainting while attached OR while a live engine is running (so
+        // pending host-API requests drain even when not attached).
+        if self.process.is_some() || self.script_host.is_active() {
             ctx.request_repaint_after(self.snapshot_interval);
         }
     }
@@ -1027,6 +1124,13 @@ impl NemclassApp {
     // -----------------------------------------------------------------------
 
     fn show_address_bar(&mut self, ui: &mut egui::Ui) {
+        // Collect actions during the draw and apply after the closure releases
+        // its borrow on `self` (the pattern used throughout this file).
+        let mut do_resolve = false;
+        let mut formula_changed = false;
+        let resolved_active = self.script_resolved_base.is_some();
+        let attached = self.process.is_some();
+
         ui.horizontal(|ui| {
             let class_name = self
                 .selected_class
@@ -1042,6 +1146,19 @@ impl NemclassApp {
                 Some(b) => { ui.monospace(format!("0x{b:016X}")); }
                 None    => { ui.label("–"); }
             }
+            if resolved_active {
+                ui.colored_label(egui::Color32::LIGHT_BLUE, "(script)");
+            }
+
+            // "Try get class address" via the script/plugin resolver chain.
+            if ui
+                .add_enabled(attached, egui::Button::new("Try resolve (script)"))
+                .on_hover_text("Ask a script's tryResolveClassAddress resolver for this class's base address")
+                .on_disabled_hover_text("Attach to a process first")
+                .clicked()
+            {
+                do_resolve = true;
+            }
             ui.separator();
 
             if let Some(uuid) = self.selected_class
@@ -1049,8 +1166,7 @@ impl NemclassApp {
             {
                     ui.strong("Formula:");
                     if ui.text_edit_singleline(&mut class.address_formula).changed() {
-                        self.last_snapshot = None;
-                        self.class_base = None;
+                        formula_changed = true;
                     }
             }
 
@@ -1061,6 +1177,44 @@ impl NemclassApp {
                 };
             });
         });
+
+        if formula_changed {
+            self.last_snapshot = None;
+            self.class_base = None;
+            // Editing the formula re-takes control from any script-resolved base.
+            self.script_resolved_base = None;
+        }
+        if do_resolve {
+            self.do_resolve_class_address();
+        }
+    }
+
+    /// Runs the script/plugin resolver chain for the selected class and, on
+    /// success, sets a sticky script-resolved base. Triggered only by the
+    /// explicit "Try resolve (script)" button — never per-frame — because the
+    /// live engine blocks the UI thread on the v8 worker reply.
+    fn do_resolve_class_address(&mut self) {
+        let (Some(uuid), Some(proc)) = (self.selected_class, self.process.as_ref()) else {
+            return;
+        };
+        let q = ClassAddressQuery { pid: proc.pid(), class: uuid };
+        match self.script_host.resolve_class_address(&q) {
+            Some(addr) => {
+                self.script_resolved_base = Some(addr);
+                self.class_base = Some(addr);
+                self.last_snapshot = None;
+                script_log::push(
+                    &self.script_log,
+                    LogKind::Lifecycle,
+                    format!("Resolved class {uuid} → 0x{addr:016X}"),
+                );
+            }
+            None => {
+                let msg = "No script resolver returned an address.".to_string();
+                script_log::push(&self.script_log, LogKind::Warn, msg.clone());
+                self.last_error = Some(msg);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1225,6 +1379,7 @@ impl NemclassApp {
             ui.selectable_value(&mut self.central_tab, CentralTab::Debugger,     "Debugger");
             ui.selectable_value(&mut self.central_tab, CentralTab::MemoryViewer, "Memory");
             ui.selectable_value(&mut self.central_tab, CentralTab::Disassembly,  "Disassembly");
+            ui.selectable_value(&mut self.central_tab, CentralTab::Scripts,      "Scripts");
         });
         ui.separator();
 
@@ -1234,6 +1389,74 @@ impl NemclassApp {
             CentralTab::Debugger     => self.show_debugger_tab(ui),
             CentralTab::MemoryViewer => self.show_memory_viewer(ui),
             CentralTab::Disassembly  => self.show_disassembly_tab(ui),
+            CentralTab::Scripts      => self.show_scripts_tab(ui),
+        }
+    }
+
+    /// The "Scripts" tab: engine status, script-file list, host functions, and
+    /// the shared log. Applies the panel's returned action after the draw.
+    fn show_scripts_tab(&mut self, ui: &mut egui::Ui) {
+        const HOST_FNS: &[&str] = &["pattern_scan", "declare_class", "declare_type", "log"];
+
+        let scripts_dir = self.project_dir.as_ref().map(|d| d.join("src"));
+        let engine_active = self.script_host.is_active();
+        let status = if engine_active {
+            String::new()
+        } else if cfg!(feature = "scripting") {
+            "Engine not running — spawn failed; see startup status.".to_string()
+        } else {
+            "Built without the `scripting` feature — rebuild with --features scripting for JS.".to_string()
+        };
+
+        let action = self.scripts_panel.show(
+            ui,
+            scripts_dir.as_deref(),
+            engine_active,
+            &status,
+            HOST_FNS,
+            &self.script_log,
+        );
+
+        match action {
+            ScriptsPanelAction::None => {}
+            ScriptsPanelAction::LoadAll => {
+                if let Some(dir) = scripts_dir {
+                    match self.script_host.load_scripts(&dir) {
+                        Ok(()) => script_log::push(
+                            &self.script_log,
+                            LogKind::Lifecycle,
+                            format!("Loaded scripts from {}", dir.display()),
+                        ),
+                        Err(e) => script_log::push(
+                            &self.script_log,
+                            LogKind::Error,
+                            format!("Load scripts failed: {e}"),
+                        ),
+                    }
+                }
+            }
+            ScriptsPanelAction::Reload(path) => {
+                // The engine loads a whole directory; reload the file's parent so
+                // a single-file reload still refreshes it.
+                let dir = path.parent().map(|p| p.to_path_buf());
+                if let Some(dir) = dir {
+                    match self.script_host.load_scripts(&dir) {
+                        Ok(()) => script_log::push(
+                            &self.script_log,
+                            LogKind::Lifecycle,
+                            format!("Reloaded {}", path.display()),
+                        ),
+                        Err(e) => script_log::push(
+                            &self.script_log,
+                            LogKind::Error,
+                            format!("Reload failed: {e}"),
+                        ),
+                    }
+                }
+            }
+            ScriptsPanelAction::Clear => {
+                self.script_log.borrow_mut().clear();
+            }
         }
     }
 
@@ -1580,6 +1803,7 @@ impl NemclassApp {
                             let depth        = snap.depth;
                             let has_children = snap.has_children;
                             let id_path      = snap.id_path.clone();
+                            let pointer_target = snap.pointer_target;
 
                             // For live-expandable nodes, we treat them as
                             // containers (has_children for collapse toggle) even
@@ -1650,7 +1874,31 @@ impl NemclassApp {
                                         }
                                     }
                                 } else {
-                                    ui.label(&value);
+                                    let resp = ui.label(&value);
+                                    // Pointer rows: right-click to follow the
+                                    // pointer and open its target class.
+                                    if type_tag == "Pointer" {
+                                        resp.context_menu(|ui| {
+                                            let target_addr = value
+                                                .strip_prefix("0x")
+                                                .or_else(|| value.strip_prefix("0X"))
+                                                .and_then(|h| usize::from_str_radix(h, 16).ok());
+                                            let enabled = target_addr.is_some_and(|a| a != 0);
+                                            if ui
+                                                .add_enabled(
+                                                    enabled,
+                                                    egui::Button::new("Follow pointer → open target"),
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(addr) = target_addr {
+                                                    self.pending_follow_pointer =
+                                                        Some((addr, pointer_target));
+                                                }
+                                                ui.close();
+                                            }
+                                        });
+                                    }
                                 }
                             });
 
@@ -1748,6 +1996,37 @@ impl NemclassApp {
             self.central_tab = CentralTab::Disassembly;
             self.disassembly_panel.goto(addr as usize);
         }
+
+        // Apply any pending "follow pointer" request collected during the draw.
+        if let Some((addr, target_uuid)) = self.pending_follow_pointer.take() {
+            self.follow_pointer(addr, target_uuid);
+        }
+    }
+
+    /// Opens a pointer's target: if the `PointerNode` names a target class, select
+    /// it and pin its base to the followed address (via the sticky script-resolved
+    /// base). Otherwise fall back to the raw Memory viewer at that address.
+    fn follow_pointer(&mut self, addr: usize, target_uuid: Option<Uuid>) {
+        match target_uuid {
+            Some(uuid) if self.project.get_class(&uuid).is_some() => {
+                self.selected_class = Some(uuid);
+                self.script_resolved_base = Some(addr);
+                self.class_base = Some(addr);
+                self.node_snapshots.clear();
+                self.mem_buf.clear();
+                self.edit_state = None;
+                self.last_snapshot = None;
+                self.central_tab = CentralTab::MemoryView;
+            }
+            _ => {
+                // No target class → show raw bytes at the pointed-to address.
+                self.central_tab = CentralTab::MemoryViewer;
+                #[cfg(target_os = "linux")]
+                self.memory_viewer.goto(addr);
+                self.status_msg =
+                    Some(format!("Pointer target 0x{addr:016X} (no class set)"));
+            }
+        }
     }
 }
 
@@ -1787,6 +2066,7 @@ fn flatten_nodes(
             name: node.name().to_owned(),
             comment: node.comment().to_owned(),
             _memory_size: size,
+            pointer_target: node.pointer_target_class(),
         });
 
         if has_children {

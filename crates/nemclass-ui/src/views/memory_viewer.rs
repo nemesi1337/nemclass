@@ -225,6 +225,13 @@ impl MemoryViewer {
     // Navigation helpers
     // -----------------------------------------------------------------------
 
+    /// Public entry point to jump the hex view to `addr` (e.g. from a "follow
+    /// pointer" action in the class view). Pushes the current address onto the
+    /// back-navigation history.
+    pub fn goto(&mut self, addr: usize) {
+        self.navigate_to(addr);
+    }
+
     fn navigate_to(&mut self, addr: usize) {
         if addr != self.address {
             // Push current address onto history (capped).
