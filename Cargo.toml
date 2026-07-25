@@ -20,12 +20,19 @@ bitflags = "2.4.0"
 obfstr = "0.4.3"
 libc = "0.2.189"
 bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
-serde = { version = "1", features = ["derive"] }
-toml = "1.1.3"
+# serde is pinned BELOW 1.0.220 DELIBERATELY. serde 1.0.220 split out `serde_core`
+# and removed the facade `serde::__private`, which the entire rustyscript/deno swc
+# tree (swc_config, swc_common, swc_ecma_*) still references. The deno tree itself
+# accepts any serde ("1"); only the newer `toml 1.1.x` chain (via serde_core) forced
+# serde up — so `toml` is held at 0.8 (pre-serde_core; the project only uses
+# to_string/from_str/Value, identical across versions). This lets `--features
+# scripting` compile the v8/JS engine. serde_json is matched (pre-serde_core).
+serde = { version = "=1.0.219", features = ["derive"] }
+toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 env_logger = "0.11"
-serde_json = "1"
+serde_json = "=1.0.140"
 # Win32 bindings for the native Windows memory backend (nemclass-core, cfg(windows)
 # only). windows-sys is the raw-FFI crate (no wrappers) — smaller and faster to
 # build than the higher-level `windows` crate. Feature list = only the namespaces
@@ -41,12 +48,14 @@ windows-sys = { version = "0.61.2", features = [
 # rustyscript wraps deno_core/v8 (the `scripting` feature of nemclass-script).
 # Heavy build — an optional dep, pinned. Enabled only via `--features scripting`.
 #
-# Pinned to 0.11.0 (deno_ast 0.43.3 / swc_config 0.1.15) DELIBERATELY: rustyscript
-# 0.12.x pulls deno_ast 0.49 -> swc_config =3.0.0, whose `use serde::__private::de`
-# no longer resolves against serde >= 1.0.220 (serde now mangles the private module
-# to `__private<patch>`), and the rest of that same deno tree hard-requires
-# serde >= 1.0.221 (serde_core / serde_bytes 0.11.19 / uuid) — mutually unsatisfiable.
-# 0.11.0 predates the broken swc_config and builds against current serde.
+# Pinned to 0.11.0. The `scripting` feature compiles and works — but ONLY because
+# serde is held below 1.0.220 (see the serde pin above). rustyscript's entire swc/deno
+# tree (swc_config, swc_common, swc_ecma_*) references the `serde::__private` facade
+# that serde 1.0.220+ removed; keeping serde at 1.0.219 keeps that facade present, so
+# the swc tree builds unmodified. Do NOT bump serde past 1.0.219 without confirming
+# the swc/deno tree no longer needs `serde::__private`, or the JS engine breaks again.
+# Also keep deno_media_type pinned (in Cargo.lock) to a version deno_ast 0.43.3's
+# exhaustive MediaType match handles (a bare `cargo update` floats it up and breaks).
 rustyscript = "=0.11.0"
 # Symbolication (nemclass-core `symbols` feature, M5.2). All optional in the
 # crate and target-scoped there — the base build never compiles them.

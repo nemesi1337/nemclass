@@ -3,6 +3,10 @@ name = "nemclass-app"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["scripting"]
+scripting = ["nemclass-ui/scripting", "nemclass-script/scripting"]
+
 [[bin]]
 name = "nemclass"
 path = "src/main.rs"

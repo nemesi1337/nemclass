@@ -3,6 +3,10 @@ name = "nemclass-ui"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+scripting = ["nemclass-script/scripting"]
+
 [dependencies]
 nemclass-core = { workspace = true, features = ["symbols"] }
 nemclass-model.workspace = true
