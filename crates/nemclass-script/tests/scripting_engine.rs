@@ -1,9 +1,18 @@
-//! Integration tests for the M2 `RustyScriptEngine` (v8), behind the `scripting`
+//! Integration test for the M2 `RustyScriptEngine` (v8), behind the `scripting`
 //! feature. Run with `cargo test -p nemclass-script --features scripting`.
 //!
-//! These spin the engine (a dedicated v8 worker thread), load an inline JS
-//! module, and drive it through the [`ScriptEngine`] contract while a **mock**
+//! This spins the engine (a dedicated v8 worker thread), loads inline JS modules,
+//! and drives them through the [`ScriptEngine`] contract while a **mock**
 //! [`HostApi`] stands in for the live process/project on the main thread.
+//!
+//! ## Why one test with one engine
+//!
+//! v8's platform is **process-global** and initializes once; spawning multiple
+//! `RustyScriptEngine`s in a single test process crashes (SIGSEGV). The real app
+//! only ever spawns one engine for its lifetime, so this test mirrors that: a
+//! single engine exercises every behaviour (event dispatch → host bridge, and
+//! the blocking class-address resolver for both the "returns a number" and
+//! "defers to None" cases).
 
 #![cfg(feature = "scripting")]
 
@@ -14,7 +23,7 @@ use nemclass_script::engine::ScriptEngine;
 use nemclass_script::events::{ClassAddressQuery, Event};
 use nemclass_script::{HostApi, LogLevel, RustyScriptEngine};
 
-/// Records everything scripts do through the host API, so tests can assert the
+/// Records everything scripts do through the host API, so the test can assert the
 /// bridge actually reached the (main-thread) host.
 #[derive(Default)]
 struct MockHost {
@@ -52,7 +61,7 @@ impl HostApi for MockHost {
 }
 
 /// Pumps host requests until `cond(host)` holds or `timeout` elapses. The worker
-/// (v8) thread blocks on host replies, so a test must service the bridge from
+/// (v8) thread blocks on host replies, so the test must service the bridge from
 /// this (main) thread — exactly as the UI does each frame.
 fn pump_until<F>(
     engine: &mut RustyScriptEngine,
@@ -83,12 +92,15 @@ fn pump_until<F>(
 }
 
 #[test]
-fn dispatch_onattach_runs_handler_and_reaches_host_fns() {
+fn engine_dispatch_host_bridge_and_resolver() {
     let host = Arc::new(Mutex::new(MockHost::default()));
     let mut engine = RustyScriptEngine::spawn().expect("spawn v8 engine");
 
-    // A script that, on attach, logs and declares a class + a type + a scan.
-    let script = r#"
+    // One script directory holding both an OnAttach handler (which drives all
+    // four host fns) and a class-address resolver whose answer depends on the
+    // query pid — letting a single handler cover both the "number" and "defer"
+    // cases without a second engine.
+    let attach_js = r#"
         nemclass.on("OnAttach", (e) => {
             nemclass.log("attached pid=" + e.pid);
             nemclass.declare_class("Player", '"game.exe"+0x10');
@@ -97,73 +109,48 @@ fn dispatch_onattach_runs_handler_and_reaches_host_fns() {
             nemclass.log("hits=" + hits.length);
         });
     "#;
+    let resolver_js = r#"
+        nemclass.on("tryResolveClassAddress", (q) => q.pid === 7 ? 0xDEAD : null);
+    "#;
 
-    // Write it into a temp `src/` and load the directory.
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("attach.js"), script).unwrap();
+    std::fs::write(dir.path().join("attach.js"), attach_js).unwrap();
+    std::fs::write(dir.path().join("resolver.js"), resolver_js).unwrap();
     engine.load_scripts(dir.path()).unwrap();
 
-    // Fire the event; the worker runs the handler which blocks on host replies.
+    // --- Event dispatch reaches every host fn ---------------------------------
     engine.on_event(&Event::OnAttach {
         pid: 4242,
         name: Some("game".into()),
     });
-
-    // Service the bridge until the class + type + scan + logs have all landed.
     pump_until(&mut engine, &host, Duration::from_secs(20), |h| {
         !h.declared_classes.is_empty()
             && !h.declared_types.is_empty()
             && !h.pattern_calls.is_empty()
             && h.logs.iter().any(|l| l.contains("hits=2"))
     });
+    {
+        let h = host.lock().unwrap();
+        assert_eq!(
+            h.declared_classes,
+            vec![("Player".to_string(), "\"game.exe\"+0x10".to_string())]
+        );
+        assert_eq!(h.declared_types, vec!["Team".to_string()]);
+        assert_eq!(
+            h.pattern_calls,
+            vec![("game.exe".to_string(), "48 8B ?? ??".to_string())]
+        );
+        // The event payload fields must reach the handler directly (e.pid, not
+        // e.data.pid) — regression guard for the adjacently-tagged Event unwrap.
+        assert!(h.logs.iter().any(|l| l.contains("attached pid=4242")));
+        assert!(h.logs.iter().any(|l| l.contains("hits=2")));
+    }
 
-    let h = host.lock().unwrap();
-    assert_eq!(
-        h.declared_classes,
-        vec![("Player".to_string(), "\"game.exe\"+0x10".to_string())]
-    );
-    assert_eq!(h.declared_types, vec!["Team".to_string()]);
-    assert_eq!(
-        h.pattern_calls,
-        vec![("game.exe".to_string(), "48 8B ?? ??".to_string())]
-    );
-    assert!(h.logs.iter().any(|l| l.contains("attached pid=4242")));
-    assert!(h.logs.iter().any(|l| l.contains("hits=2")));
-}
-
-#[test]
-fn try_resolve_class_address_returns_number_from_js() {
-    let host = Arc::new(Mutex::new(MockHost::default()));
-    let mut engine = RustyScriptEngine::spawn().expect("spawn v8 engine");
-
-    // A resolver that claims any class with a fixed address.
-    let script = r#"
-        nemclass.on("tryResolveClassAddress", (q) => 0xDEAD);
-    "#;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("resolver.js"), script).unwrap();
-    engine.load_scripts(dir.path()).unwrap();
-
-    // `resolve_class_address` blocks the main thread on the worker reply. The
-    // resolver does not call host fns, so no pumping is needed here.
+    // --- Resolver: returns a number when it claims the class ------------------
     let got = engine.resolve_class_address(&ClassAddressQuery::new(7, uuid::Uuid::nil()));
     assert_eq!(got, Some(0xDEAD));
 
-    // Sanity: a background pump drains any stray requests without hanging.
-    let mut h = host.lock().unwrap();
-    engine.pump_host_requests(&mut *h);
-}
-
-#[test]
-fn resolver_that_defers_yields_none() {
-    let mut engine = RustyScriptEngine::spawn().expect("spawn v8 engine");
-    let script = r#"
-        nemclass.on("tryResolveClassAddress", (q) => null);
-    "#;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("defer.js"), script).unwrap();
-    engine.load_scripts(dir.path()).unwrap();
-
-    let got = engine.resolve_class_address(&ClassAddressQuery::new(1, uuid::Uuid::nil()));
-    assert_eq!(got, None);
+    // --- Resolver: yields None when the handler defers (returns null) ---------
+    let deferred = engine.resolve_class_address(&ClassAddressQuery::new(1, uuid::Uuid::nil()));
+    assert_eq!(deferred, None);
 }

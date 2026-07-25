@@ -48,6 +48,11 @@
 //! `recv()` with no re-entrancy, which is trivially deadlock-free. The `.d.ts`
 //! documents the restriction (`tryResolveClassAddress` note).
 
+// rustyscript's `Error` is a large enum; every host-callback closure here returns
+// `Result<_, rustyscript::Error>`, so clippy's `result_large_err` fires broadly.
+// Boxing at each site would obscure the bridge for no real benefit.
+#![allow(clippy::result_large_err)]
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
@@ -171,7 +176,10 @@ pub enum HostRequest {
 
 /// Commands sent from the public handle (main thread) to the worker (v8) thread.
 enum Command {
-    /// Load a single script module from disk.
+    /// Load a single script module from disk. The single-file counterpart to
+    /// `LoadScriptsDir` — handled by the worker, reserved for a future
+    /// per-file reload path (the UI currently reloads the whole `src/` dir).
+    #[allow(dead_code)]
     LoadScript(PathBuf),
     /// Load every `*.js`/`*.ts` under a directory (the project's `src/`).
     LoadScriptsDir(PathBuf),
@@ -480,7 +488,14 @@ fn worker_main(
                 Err(e) => bridge_log(&bridge, LogLevel::Error, &format!("load dir {dir:?}: {e}")),
             },
             Command::Dispatch(event) => {
-                let payload = serde_json::to_value(&event).unwrap_or(Value::Null);
+                // `Event` is adjacently tagged (`#[serde(tag="kind", content="data")]`),
+                // so it serializes to `{"kind": "...", "data": {..fields}}`. JS
+                // handlers expect the fields directly (e.pid, not e.data.pid), so
+                // pass only the `data` content (Null for unit variants like OnDetach).
+                let payload = match serde_json::to_value(&event).unwrap_or(Value::Null) {
+                    Value::Object(mut map) => map.remove("data").unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
                 let kind = event.kind();
                 let _res: Result<(), _> = runtime.call_function(
                     Some(&dispatch_handle),
