@@ -17,9 +17,11 @@
 
 mod scanner_panel;
 mod debugger_panel;
+mod memory_viewer;
 
 pub use scanner_panel::ScannerPanel;
 pub use debugger_panel::DebuggerPanel;
+pub use memory_viewer::MemoryViewer;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -49,6 +51,7 @@ enum CentralTab {
     MemoryView,
     Scanner,
     Debugger,
+    MemoryViewer,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +172,9 @@ pub struct NemclassApp {
 
     // Debugger panel
     debugger_panel: DebuggerPanel,
+
+    // Raw hex memory viewer panel
+    memory_viewer: MemoryViewer,
 }
 
 impl NemclassApp {
@@ -213,6 +219,7 @@ impl NemclassApp {
             central_tab: CentralTab::MemoryView,
             scanner_panel: ScannerPanel::new(),
             debugger_panel: DebuggerPanel::new(),
+            memory_viewer: MemoryViewer::new(),
         }
     }
 
@@ -283,6 +290,7 @@ impl NemclassApp {
             self.process = None;
             self.attached_name = None;
             self.clear_memory_state();
+            self.memory_viewer.on_detach();
         }
 
         let Some(provider) = self.registry.get(&self.selected_backend) else {
@@ -297,6 +305,7 @@ impl NemclassApp {
                 } else {
                     name.clone()
                 });
+                self.memory_viewer.on_attach(&proc);
                 self.process = Some(proc);
                 self.last_error = None;
                 self.last_snapshot = None;
@@ -320,6 +329,7 @@ impl NemclassApp {
             self.last_error = None;
             self.scanner_panel.on_detach();
             self.debugger_panel.on_detach();
+            self.memory_viewer.on_detach();
         }
     }
 
@@ -914,16 +924,18 @@ impl NemclassApp {
     fn show_central_panel(&mut self, ui: &mut egui::Ui) {
         // Tab bar.
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.central_tab, CentralTab::MemoryView, "Memory View");
-            ui.selectable_value(&mut self.central_tab, CentralTab::Scanner,    "Scanner");
-            ui.selectable_value(&mut self.central_tab, CentralTab::Debugger,   "Debugger");
+            ui.selectable_value(&mut self.central_tab, CentralTab::MemoryView,  "Memory View");
+            ui.selectable_value(&mut self.central_tab, CentralTab::Scanner,     "Scanner");
+            ui.selectable_value(&mut self.central_tab, CentralTab::Debugger,    "Debugger");
+            ui.selectable_value(&mut self.central_tab, CentralTab::MemoryViewer, "Memory");
         });
         ui.separator();
 
         match self.central_tab {
-            CentralTab::MemoryView => self.show_class_view(ui),
-            CentralTab::Scanner    => self.show_scanner_tab(ui),
-            CentralTab::Debugger   => self.show_debugger_tab(ui),
+            CentralTab::MemoryView   => self.show_class_view(ui),
+            CentralTab::Scanner      => self.show_scanner_tab(ui),
+            CentralTab::Debugger     => self.show_debugger_tab(ui),
+            CentralTab::MemoryViewer => self.show_memory_viewer(ui),
         }
     }
 
@@ -968,6 +980,10 @@ impl NemclassApp {
         let pid: Option<i32> = None;
 
         self.debugger_panel.show(ui, pid);
+    }
+
+    fn show_memory_viewer(&mut self, ui: &mut egui::Ui) {
+        self.memory_viewer.show(ui, self.process.as_ref());
     }
 
     // -----------------------------------------------------------------------
