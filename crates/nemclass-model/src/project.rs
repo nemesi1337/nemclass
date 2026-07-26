@@ -45,6 +45,17 @@ impl Project {
         self.class_order.iter().filter_map(|id| self.classes.get(id))
     }
 
+    /// Resolved byte span of the class identified by `uuid`, expanding any inline
+    /// `ClassInstance` children against this project (cycle-guarded). Returns 0 if
+    /// the class is not present. Used by the UI to lay out fields that follow an
+    /// embedded class instance or a dereferenced pointer target.
+    pub fn resolved_class_size(&self, uuid: &Uuid) -> usize {
+        let Some(class) = self.classes.get(uuid) else { return 0 };
+        let mut visited: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        visited.insert(*uuid);
+        crate::codegen::resolved_class_size(class, self, &mut visited)
+    }
+
     /// Remove a class, returning `ClassReferenced` error if any other class references it.
     pub fn remove_class(&mut self, uuid: &Uuid) -> Result<ClassNode> {
         let class = self.classes.get(uuid).ok_or(ModelError::ClassNotFound(*uuid))?;

@@ -15,8 +15,16 @@ nemclass-scan.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
 eframe.workspace = true
+egui_dock.workspace = true
+rfd.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 uuid.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# MockMemoryBackend / from_backend_for_test seam for panel + analysis tests
+# against known bytes (no live /proc target needed).
+nemclass-core = { workspace = true, features = ["symbols", "test-util"] }

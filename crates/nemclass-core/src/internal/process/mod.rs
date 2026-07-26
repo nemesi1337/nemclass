@@ -46,6 +46,8 @@ pub use types::*;
 pub use protection::*;
 pub use provider::*;
 pub use memory::MemoryBackend;
+#[cfg(feature = "test-util")]
+pub use memory::MockMemoryBackend;
 pub use symbols::Symbol;
 
 // On-disk symbolication (M5.2), behind the optional `symbols` feature.
@@ -97,6 +99,16 @@ impl Process {
             #[cfg(all(feature = "symbols", target_os = "linux"))]
             symbol_cache: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Test-only constructor: wraps an arbitrary [`MemoryBackend`] (e.g. a
+    /// [`memory::MockMemoryBackend`]) in a `Process` so the ui/scan/analysis
+    /// layers can be exercised against known bytes without a live `/proc`
+    /// target. A public, thin pass-through to [`Process::from_backend`], gated
+    /// behind the `test-util` feature so it never ships in a release build.
+    #[cfg(feature = "test-util")]
+    pub fn from_backend_for_test(pid: Pid, backend: Box<dyn MemoryBackend>) -> Self {
+        Process::from_backend(pid, backend)
     }
 
     /// Attaches to the process with the given `pid` using the default native

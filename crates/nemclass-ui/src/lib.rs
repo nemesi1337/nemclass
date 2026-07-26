@@ -14,4 +14,4 @@ mod process_reader;
 pub mod project_io;
 mod views;
 
-pub use views::NemclassApp;
+pub use views::{NemclassApp, saved_window_size};

@@ -5,6 +5,9 @@ pub mod internal;
 // Curated crate-root API. The `internal` module tree stays private in spirit
 // (it holds the platform-specific machinery); everything the model/ui/script
 // layers build on is re-exported here so they never reach through `internal::`.
+#[cfg(feature = "test-util")]
+pub use internal::MockMemoryBackend;
+
 pub use internal::{
     // Backend seam (raw IO) + platform provider seam.
     MemoryBackend,

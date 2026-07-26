@@ -71,6 +71,21 @@ pdb-addr2line = "0.12.1"
 egui = "0.35.0"
 egui_extras = { version = "0.35.0", features = ["default"] }
 eframe = { version = "0.35.0", features = ["default"] }
+# Dockable panel layout (drag/float/tab/split, layout persisted). 0.20.x is the
+# egui-0.35 line. `serde` feature = DockState round-trips into settings.json; it
+# only needs derive, so it does NOT perturb the deliberate serde =1.0.219 pin.
+egui_dock = { version = "0.20", features = ["serde"] }
+# Native file dialogs (replaces the hand-rolled path-input window). Default Linux
+# backend is GTK3 (present on this host); no async runtime needed for blocking picks.
+rfd = "0.15"
+# XDG data dir → ~/.local/share/nemclass/settings.json
+dirs = "6"
+# NOTE: egui_kittest (the obvious headless-UI test harness) is intentionally NOT
+# used: egui_kittest 0.35 hard-depends on `toml ^1.0`, which pulls `serde_core`
+# and forces serde >= 1.0.225 — this breaks the deliberate `serde = "=1.0.219"`
+# pin the scripting/v8 tree needs (see the serde note above). UI verification
+# instead uses pure-logic tests over `MockMemoryBackend` + an eframe offscreen
+# screenshot smoke; neither pulls toml 1.x.
 
 # Internal
 nemclass-core = { path = "crates/nemclass-core" }

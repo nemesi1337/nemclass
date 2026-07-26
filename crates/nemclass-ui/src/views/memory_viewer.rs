@@ -52,7 +52,7 @@ const HISTORY_CAP: usize = 64;
 // ---------------------------------------------------------------------------
 
 /// How the hex dump group interprets each row of bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DisplayType {
     Bytes,
     Word,

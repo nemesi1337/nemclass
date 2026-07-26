@@ -152,8 +152,9 @@ impl ScannerPanel {
 
         ui.separator();
 
-        // Results table (always drawn, but empty when idle).
-        self.show_results(ui, &mut add_to_class_cb);
+        // Results table (always drawn, but empty when idle). Values update live
+        // from the attached process each frame, like Cheat Engine.
+        self.show_results(ui, process, &mut add_to_class_cb);
 
         ui.separator();
 
@@ -401,16 +402,15 @@ impl ScannerPanel {
     fn show_results(
         &mut self,
         ui: &mut egui::Ui,
+        process: Option<&Process>,
         add_to_class_cb: &mut dyn FnMut(usize),
     ) {
-        let visible: Vec<(usize, String)> = self
+        // (address, captured-bytes) for the displayed (capped) result set.
+        let visible: Vec<(usize, Vec<u8>)> = self
             .result_snapshot
             .iter()
             .take(MAX_DISPLAY)
-            .map(|(addr, bytes)| {
-                let val = format_value_bytes(bytes, self.value_type);
-                (*addr, val)
-            })
+            .map(|(addr, bytes)| (*addr, bytes.clone()))
             .collect();
 
         if visible.is_empty() {
@@ -421,6 +421,7 @@ impl ScannerPanel {
         let text_height = ui.text_style_height(&egui::TextStyle::Body);
         let row_height  = text_height + 4.0;
 
+        let value_type = self.value_type;
         let freeze_set  = &mut self.freeze_set;
         let freeze_entries = &mut self.freeze_entries;
 
@@ -428,7 +429,7 @@ impl ScannerPanel {
             .striped(true)
             .resizable(true)
             .column(Column::initial(160.0).at_least(100.0))  // Address
-            .column(Column::initial(100.0).at_least(60.0))   // Value
+            .column(Column::initial(100.0).at_least(60.0))   // Value (live)
             .column(Column::remainder().at_least(160.0))     // Actions
             .header(row_height + 2.0, |mut h| {
                 h.col(|ui| { ui.strong("Address"); });
@@ -438,31 +439,34 @@ impl ScannerPanel {
             .body(|body| {
                 body.rows(row_height, visible.len(), |mut row| {
                     let idx = row.index();
-                    let Some((addr, val)) = visible.get(idx) else { return; };
+                    let Some((addr, captured)) = visible.get(idx) else { return; };
                     let addr = *addr;
-                    let val  = val.clone();
+
+                    // Live value: re-read the address from the target each frame
+                    // (only visible rows are drawn). Fall back to the captured
+                    // scan-time bytes if the read fails or the type is variable.
+                    let live = read_live_value(process, addr, value_type)
+                        .unwrap_or_else(|| format_value_bytes(captured, value_type));
 
                     row.col(|ui| {
                         ui.monospace(format!("0x{addr:016X}"));
                     });
                     row.col(|ui| {
-                        ui.label(&val);
+                        ui.monospace(&live);
                     });
                     row.col(|ui| {
                         ui.horizontal(|ui| {
                             if ui.small_button("Freeze").clicked() {
-                                // Capture current bytes from the snapshot.
-                                if let Some((_, bytes)) = self.result_snapshot
-                                    .iter()
-                                    .find(|(a, _)| *a == addr)
-                                {
-                                    freeze_set.set(addr, bytes.clone());
-                                    freeze_entries.retain(|e| e.address != addr);
-                                    freeze_entries.push(FreezeEntry {
-                                        address: addr,
-                                        display: val.clone(),
-                                    });
-                                }
+                                // Freeze the current live value (falling back to
+                                // the captured scan-time bytes if unreadable).
+                                let bytes = read_live_bytes(process, addr, value_type)
+                                    .unwrap_or_else(|| captured.clone());
+                                freeze_set.set(addr, bytes);
+                                freeze_entries.retain(|e| e.address != addr);
+                                freeze_entries.push(FreezeEntry {
+                                    address: addr,
+                                    display: live.clone(),
+                                });
                             }
                             if ui.small_button("Add to class").clicked() {
                                 add_to_class_cb(addr);
@@ -509,6 +513,22 @@ impl Default for ScannerPanel {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+/// Reads the raw bytes of a fixed-width value live from the target. Returns
+/// `None` for variable-width types (Bytes/strings), on a short read, or when
+/// no process is attached.
+fn read_live_bytes(process: Option<&Process>, addr: usize, vt: ScanValueType) -> Option<Vec<u8>> {
+    let width = vt.fixed_width()?;
+    let process = process?;
+    let mut buf = vec![0u8; width];
+    let n = process.read_buf(addr, &mut buf).ok()?;
+    (n >= width).then_some(buf)
+}
+
+/// Reads and formats a value live from the target (see [`read_live_bytes`]).
+fn read_live_value(process: Option<&Process>, addr: usize, vt: ScanValueType) -> Option<String> {
+    read_live_bytes(process, addr, vt).map(|b| format_value_bytes(&b, vt))
+}
 
 fn format_value_bytes(bytes: &[u8], vt: ScanValueType) -> String {
     match vt {

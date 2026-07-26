@@ -95,7 +95,7 @@ pub(crate) fn sanitize_ident(name: &str) -> String {
 /// contribution for that node is 0 (emit a `// cyclic` fallback comment
 /// instead of recursing forever). Pointer-to-self is not a hazard — pointers
 /// are fixed 8 bytes — only inline `ClassInstance` embeds can recurse.
-pub(crate) fn resolved_class_size(
+pub fn resolved_class_size(
     class: &crate::class::ClassNode,
     project: &Project,
     visited: &mut HashSet<uuid::Uuid>,
@@ -107,7 +107,7 @@ pub(crate) fn resolved_class_size(
 
 /// Size that a single node contributes. For `ClassInstance`, recurses into the
 /// referenced class. For everything else, falls back to `Node::memory_size()`.
-pub(crate) fn resolved_node_size(
+pub fn resolved_node_size(
     node: &dyn crate::node::Node,
     project: &Project,
     visited: &mut HashSet<uuid::Uuid>,

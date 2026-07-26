@@ -19,6 +19,9 @@ mod scanner_panel;
 mod debugger_panel;
 mod memory_viewer;
 mod disassembly;
+mod dock;
+mod navigator;
+mod settings;
 mod key_file;
 mod script_host;
 mod script_log;
@@ -39,7 +42,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use egui_dock::DockState;
 use egui_extras::{Column, TableBuilder};
+
+use dock::TabKind;
 
 use nemclass_core::{ModuleInfoWithName, Process, ProcessEntry, ProviderRegistry};
 #[cfg(target_os = "linux")]
@@ -54,20 +60,6 @@ use uuid::Uuid;
 
 use crate::process_reader::ProcessReader;
 use crate::project_io::{create_project_at, load_project_from, save_project_to};
-
-// ---------------------------------------------------------------------------
-// Central-panel tab selector
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CentralTab {
-    MemoryView,
-    Scanner,
-    Debugger,
-    MemoryViewer,
-    Disassembly,
-    Scripts,
-}
 
 // ---------------------------------------------------------------------------
 // Flat snapshot of a node tree row
@@ -94,6 +86,12 @@ struct NodeSnapshot {
     /// For pointer-to-class nodes: the UUID of the class the pointer targets, so
     /// the UI can offer a "follow pointer → open target class" action.
     pointer_target: Option<Uuid>,
+    /// Which class owns this node (may differ from selected_class for future
+    /// cross-class inline expansion; currently always equals selected_class).
+    owner_class: Uuid,
+    /// Index path within owner_class — e.g. `[0]` for first child, `[0, 2]` for
+    /// third child of first child.  Used to locate the node for edits.
+    local_path: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,13 +147,60 @@ enum ViewRow {
 }
 
 // ---------------------------------------------------------------------------
+// Node edit operations (deferred to after the table-draw closure)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+enum NodeEditOp {
+    ChangeType   { owner: Uuid, path: Vec<usize>, new_tag: &'static str },
+    Delete       { owner: Uuid, path: Vec<usize> },
+    AddBytes     { owner: Uuid, path: Vec<usize>, count: usize },
+    InsertBytes  { owner: Uuid, path: Vec<usize>, count: usize },
+    SetName      { owner: Uuid, path: Vec<usize>, name: String },
+    SetComment   { owner: Uuid, path: Vec<usize>, comment: String },
+    SetPtrTarget { owner: Uuid, path: Vec<usize>, target: Option<Uuid> },
+    SetInstance  { owner: Uuid, path: Vec<usize>, target: Uuid },
+}
+
+// ---------------------------------------------------------------------------
+// Class-picker modal state
+// ---------------------------------------------------------------------------
+
+struct ClassPickerState {
+    filter: String,
+    purpose: PickerPurpose,
+}
+
+#[derive(Clone)]
+enum PickerPurpose {
+    SetPtrTarget     { owner: Uuid, path: Vec<usize> },
+    SetInstance      { owner: Uuid, path: Vec<usize> },
+    ChangeToInstance { owner: Uuid, path: Vec<usize> },
+}
+
+// ---------------------------------------------------------------------------
+// Add-bytes dialog state
+// ---------------------------------------------------------------------------
+
+struct AddBytesState {
+    owner: Uuid,
+    path: Vec<usize>,
+    count_text: String,
+    insert: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Active cell edit
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq)]
+enum EditField { Value, Name, Comment }
 
 #[derive(Clone)]
 struct EditState {
     node_id: String,
     text: String,
+    field: EditField,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,30 +226,12 @@ struct AutoDissectPreview {
 // File dialog state
 // ---------------------------------------------------------------------------
 
-/// Which file operation is pending.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FileOp {
-    /// Creating a new project — `path_buf` is the target directory.
-    New,
-    /// Opening an existing project file or directory.
-    Open,
-    /// Saving to a new directory (Save As / first save).
-    SaveAs,
-}
-
-/// State for the in-app path-input dialog.
-struct FileDialog {
-    op: FileOp,
-    /// The text the user is typing into the path field.
-    path_text: String,
-    /// Error message to show inside the dialog (e.g. parse/IO failure).
-    error: Option<String>,
-}
-
-impl FileDialog {
-    fn new(op: FileOp, initial: &str) -> Self {
-        Self { op, path_text: initial.to_owned(), error: None }
-    }
+/// The last-saved window inner size (`[width, height]`), if any. Called by the
+/// launcher before creating the window so it can restore the user's size.
+pub fn saved_window_size() -> Option<[f32; 2]> {
+    settings::Settings::load()
+        .window
+        .map(|w| [w.width, w.height])
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +270,7 @@ pub struct NemclassApp {
     last_snapshot: Option<Instant>,
     snapshot_interval: Duration,
     collapsed: HashSet<String>,
+    expanded_ptrs: HashSet<String>,
     edit_state: Option<EditState>,
 
     // Auto-dissect controls (Memory View toolbar)
@@ -283,14 +311,22 @@ pub struct NemclassApp {
     /// Pending "follow pointer" request collected during the class-table draw and
     /// applied after the closure. `(target_addr, target_class_uuid)`.
     pending_follow_pointer: Option<(usize, Option<Uuid>)>,
+    /// Deferred structural edits applied after the table-draw closure exits.
+    pending_node_edits: Vec<NodeEditOp>,
+    /// Class-picker modal (for SetPtrTarget / SetInstance / ChangeToInstance).
+    class_picker: Option<ClassPickerState>,
+    /// Add/Insert bytes dialog.
+    add_bytes_dialog: Option<AddBytesState>,
 
-    // In-app file dialog
-    file_dialog: Option<FileDialog>,
     /// Non-modal status message shown below the menu bar (e.g. last save path).
     status_msg: Option<String>,
 
-    // Central panel tab
-    central_tab: CentralTab,
+    // Central-panel dock layout. `Option` so `show_central_panel` can
+    // `take()` it into a local while the `DockViewer` borrows `&mut self`.
+    dock_state: Option<DockState<TabKind>>,
+    /// Cross-panel navigation request: bring this tab to the front of its dock
+    /// group after the frame draws (e.g. "Disassemble here" → focus Disassembly).
+    pending_focus: Option<TabKind>,
 
     // Scanner panel
     scanner_panel: ScannerPanel,
@@ -303,6 +339,16 @@ pub struct NemclassApp {
 
     // Disassembly panel
     disassembly_panel: DisassemblyPanel,
+
+    // Navigator side panel (strings / functions / calls)
+    navigator_panel: navigator::NavigatorPanel,
+
+    // Persistent user settings (~/.local/share/nemclass/settings.json).
+    settings: settings::Settings,
+    /// Set when a persisted setting changed; drives a debounced save in `logic`.
+    settings_dirty: bool,
+    /// Last time settings were written, for debouncing.
+    last_settings_save: Option<Instant>,
 }
 
 impl NemclassApp {
@@ -310,12 +356,31 @@ impl NemclassApp {
         let registry = ProviderRegistry::default();
         let mut backend_names: Vec<String> = registry.names().map(str::to_owned).collect();
         backend_names.sort();
-        let selected_backend = backend_names.first().cloned().unwrap_or_default();
-
         let node_registry = NodeRegistry::new().with_builtins();
-        let project = demo_project();
 
-        // Pre-select the first (demo) class.
+        // Load persisted user settings; any error falls back to defaults.
+        let settings = settings::Settings::load();
+
+        // Prefer the last-used backend if it still exists, else the first.
+        let selected_backend = settings
+            .last_backend
+            .clone()
+            .filter(|b| backend_names.iter().any(|n| n == b))
+            .or_else(|| backend_names.first().cloned())
+            .unwrap_or_default();
+
+        // Auto-reopen the last project (best-effort); otherwise load the demo.
+        let (project, project_dir) = settings
+            .last_project
+            .clone()
+            .and_then(|dir| {
+                load_project_from(&dir, &node_registry)
+                    .ok()
+                    .map(|(p, resolved)| (p, Some(resolved)))
+            })
+            .unwrap_or_else(|| (demo_project(), None));
+
+        // Pre-select the first class.
         let selected_class = project.classes_in_order().next().map(|c| c.uuid);
 
         // Auto-load the kernel auth-key from the well-known file (or env
@@ -351,14 +416,15 @@ impl NemclassApp {
             last_error: None,
             project,
             node_registry,
-            project_dir: None,
+            project_dir,
             selected_class,
             node_snapshots: Vec::new(),
             class_base: None,
             mem_buf: Vec::new(),
             last_snapshot: None,
-            snapshot_interval: Duration::from_millis(100),
+            snapshot_interval: Duration::from_millis(settings.live_interval_ms.unwrap_or(100)),
             collapsed: HashSet::new(),
+            expanded_ptrs: HashSet::new(),
             edit_state: None,
             dissect_len_text: "0x100".to_owned(),
             #[cfg(target_os = "linux")]
@@ -373,16 +439,70 @@ impl NemclassApp {
             scripts_panel: ScriptsPanel::new(),
             script_resolved_base: None,
             pending_follow_pointer: None,
-            file_dialog: None,
+            pending_node_edits: Vec::new(),
+            class_picker: None,
+            add_bytes_dialog: None,
             status_msg: script_spawn_msg
                 .map(|m| format!("Scripting: {m}"))
                 .or(key_status)
                 .or_else(|| Some("Demo project loaded. Use File > New or Open to load a project.".into())),
-            central_tab: CentralTab::MemoryView,
+            dock_state: Some(settings.dock_state().unwrap_or_else(dock::default_layout)),
+            pending_focus: None,
             scanner_panel: ScannerPanel::new(),
             debugger_panel: DebuggerPanel::with_key(kernel_key),
             memory_viewer: MemoryViewer::new(),
             disassembly_panel: DisassemblyPanel::new(),
+            navigator_panel: navigator::NavigatorPanel::new(),
+            settings,
+            settings_dirty: false,
+            // Start the heartbeat clock now so dock-layout drags get persisted on
+            // the ~30s cadence even without an explicit dirty flag.
+            last_settings_save: Some(Instant::now()),
+        }
+    }
+
+    /// Marks settings as needing a save; the debounced writer in `logic` picks
+    /// it up. Call after mutating anything persisted (backend, interval, project).
+    fn mark_settings_dirty(&mut self) {
+        self.settings_dirty = true;
+    }
+
+    /// Snapshots the current live state (dock layout, window size, backend,
+    /// interval) into `self.settings` and writes it to disk. `ctx` is optional
+    /// so `eframe::App::save` (which has no context) can also drive it — window
+    /// size is only refreshed when a context is available.
+    fn persist_settings(&mut self, ctx: Option<&egui::Context>) {
+        // Fold the current UI state into the settings document.
+        if let Some(dock) = &self.dock_state {
+            self.settings.set_dock(dock);
+        }
+        if let Some(ctx) = ctx {
+            let size = ctx.input(|i| i.viewport_rect().size());
+            self.settings.window = Some(settings::WindowGeom {
+                width: size.x,
+                height: size.y,
+            });
+        }
+        self.settings.last_backend = Some(self.selected_backend.clone());
+        self.settings.live_interval_ms = Some(self.snapshot_interval.as_millis() as u64);
+
+        if let Err(e) = self.settings.save() {
+            self.last_error = Some(format!("Settings save failed: {e}"));
+        }
+        self.settings_dirty = false;
+        self.last_settings_save = Some(Instant::now());
+    }
+
+    /// Debounced settings writer, called each frame: saves ~2s after an explicit
+    /// change, and on a ~30s heartbeat so dock-layout drags are captured even
+    /// without an explicit dirty flag.
+    fn maybe_persist_settings(&mut self, ctx: &egui::Context) {
+        let elapsed = self.last_settings_save.map(|t| t.elapsed());
+        let dirty_due = self.settings_dirty
+            && elapsed.map(|e| e >= Duration::from_secs(2)).unwrap_or(true);
+        let heartbeat_due = elapsed.map(|e| e >= Duration::from_secs(30)).unwrap_or(false);
+        if dirty_due || heartbeat_due {
+            self.persist_settings(Some(ctx));
         }
     }
 
@@ -482,6 +602,64 @@ impl NemclassApp {
             Err(e) => {
                 self.last_error = Some(format!("Attach failed: {e}"));
             }
+        }
+    }
+
+    /// Debug/screenshot hook: attach to `pid` via `backend` and drive the
+    /// disassembler into linear mode over a module (matched by `module_substr`),
+    /// focusing the Disassembly tab. Used by the `--screenshot --attach` smoke.
+    pub fn debug_attach_disasm(
+        &mut self,
+        backend: &str,
+        pid: i32,
+        module_substr: Option<&str>,
+    ) -> Result<(), String> {
+        self.selected_backend = backend.to_string();
+        #[cfg(target_os = "linux")]
+        self.ensure_kernel_key_registered();
+
+        let provider = self
+            .registry
+            .get(&self.selected_backend)
+            .ok_or_else(|| format!("Backend '{backend}' not found"))?;
+        let proc = provider
+            .open(pid as libc::pid_t)
+            .map_err(|e| format!("open({pid}): {e}"))?;
+
+        self.memory_viewer.on_attach(&proc);
+        self.disassembly_panel.on_attach(&proc);
+        self.attached_name = Some(format!("pid:{pid}"));
+        self.process = Some(proc);
+        self.last_error = None;
+
+        // Take the process out to satisfy the borrow checker, drive the panel,
+        // then put it back.
+        if let Some(proc) = self.process.take() {
+            self.disassembly_panel.debug_enter_module(&proc, module_substr);
+            self.process = Some(proc);
+        }
+        self.pending_focus = Some(TabKind::Disassembly);
+        Ok(())
+    }
+
+    /// Debug/screenshot hook: collapse the dock to a single maximized
+    /// Disassembly tab so a capture shows it full-window.
+    pub fn debug_solo_disasm(&mut self) {
+        self.dock_state = Some(DockState::new(vec![TabKind::Disassembly]));
+    }
+
+    /// Debug/screenshot hook: maximize the Navigator tab.
+    pub fn debug_solo_navigator(&mut self) {
+        self.dock_state = Some(DockState::new(vec![TabKind::Navigator]));
+    }
+
+    /// Debug/screenshot hook: run a dissect over the disassembler's selected
+    /// module (populates the Navigator).
+    pub fn debug_dissect(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(proc) = self.process.take() {
+            self.disassembly_panel.dissect_selected(&proc);
+            self.process = Some(proc);
         }
     }
 
@@ -596,8 +774,8 @@ impl NemclassApp {
             self.status_msg = Some(format!("Saved to {}", dir.display()));
             Ok(())
         } else {
-            // No project dir yet — open the Save As dialog.
-            self.file_dialog = Some(FileDialog::new(FileOp::SaveAs, ""));
+            // No project dir yet — route to the native Save As picker.
+            self.pick_save_as();
             Ok(())
         }
     }
@@ -662,7 +840,10 @@ impl NemclassApp {
         self.class_base = base;
 
         let total_size = self.project.get_class(&uuid)
-            .map(|c| c.memory_size())
+            .map(|c| {
+                let mut visited = std::collections::HashSet::new();
+                nemclass_model::resolved_class_size(c, &self.project, &mut visited)
+            })
             .unwrap_or(0);
 
         let buf = if let (Some(addr), true) = (base, total_size > 0) {
@@ -679,18 +860,97 @@ impl NemclassApp {
     }
 
     fn rebuild_snapshots_from_buf(&mut self, uuid: Uuid) {
-        self.node_snapshots.clear();
-        if let Some(class) = self.project.get_class(&uuid) {
-            let base = self.class_base.unwrap_or(0);
-            flatten_nodes(
-                &class.children,
-                base,
-                0,
-                0,
-                &self.mem_buf,
-                String::new(),
-                &mut self.node_snapshots,
-            );
+        const MAX_DEREF_DEPTH: usize = 8;
+
+        let base = self.class_base.unwrap_or(0);
+        let collapsed = self.collapsed.clone();
+        let expanded_ptrs = self.expanded_ptrs.clone();
+        let mut deref_bufs: HashMap<String, (usize, Vec<u8>)> = HashMap::new();
+
+        loop {
+            self.node_snapshots.clear();
+            if let Some(class) = self.project.get_class(&uuid) {
+                let mut visited = HashSet::new();
+                flatten_nodes(
+                    &class.children,
+                    base,
+                    0,
+                    0,
+                    &self.mem_buf,
+                    String::new(),
+                    uuid,
+                    &[],
+                    &mut self.node_snapshots,
+                    &self.project,
+                    &collapsed,
+                    &expanded_ptrs,
+                    &deref_bufs,
+                    &mut visited,
+                    MAX_DEREF_DEPTH,
+                );
+            }
+
+            // Find expanded pointers that still need a deref buffer.
+            let needed: Vec<(String, usize, Uuid)> = self
+                .node_snapshots
+                .iter()
+                .filter(|s| {
+                    s.type_tag == "Pointer"
+                        && s.pointer_target.is_some()
+                        && expanded_ptrs.contains(&s.id_path)
+                        && !deref_bufs.contains_key(&s.id_path)
+                })
+                .map(|s| (s.id_path.clone(), s.address, s.pointer_target.unwrap()))
+                .collect();
+
+            if needed.is_empty() {
+                break;
+            }
+
+            let Some(proc) = &self.process else {
+                for (id, _, _) in needed {
+                    deref_bufs.insert(id, (0, Vec::new()));
+                }
+                break;
+            };
+
+            let mut any_filled = false;
+            for (id, addr, t_uuid) in needed {
+                let mut ptr_bytes = [0u8; 8];
+                let n = proc.read_buf(addr, &mut ptr_bytes).unwrap_or(0);
+                let deref_addr = if n >= 8 {
+                    u64::from_le_bytes(ptr_bytes) as usize
+                } else {
+                    0
+                };
+
+                if deref_addr == 0 {
+                    deref_bufs.insert(id, (0, Vec::new()));
+                    any_filled = true;
+                    continue;
+                }
+
+                let target_size = self
+                    .project
+                    .get_class(&t_uuid)
+                    .map(|tc| {
+                        let mut vis = HashSet::new();
+                        nemclass_model::resolved_class_size(tc, &self.project, &mut vis)
+                    })
+                    .unwrap_or(0);
+
+                let dbuf = if target_size > 0 {
+                    read_process_buf(proc, deref_addr, target_size)
+                } else {
+                    Vec::new()
+                };
+                deref_bufs.insert(id, (deref_addr, dbuf));
+                any_filled = true;
+            }
+
+            if !any_filled {
+                break;
+            }
         }
     }
 
@@ -871,7 +1131,13 @@ impl NemclassApp {
     // -----------------------------------------------------------------------
 
     fn commit_edit(&mut self) {
-        let Some(edit) = self.edit_state.take() else { return; };
+        let Some(edit) = self.edit_state.as_ref() else { return; };
+        // Name/comment edits are handled inline in the draw loop via NodeEditOp.
+        if edit.field != EditField::Value {
+            self.edit_state = None;
+            return;
+        }
+        let edit = self.edit_state.take().unwrap();
         let Some(proc) = &self.process else { return; };
 
         let (addr, type_tag) = match self.node_snapshots.iter().find(|s| s.id_path == edit.node_id) {
@@ -904,7 +1170,6 @@ impl Default for NemclassApp {
 impl eframe::App for NemclassApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let needs_snapshot = self.selected_class.is_some()
-            && self.file_dialog.is_none()   // don't snapshot while dialog is open
             && self
                 .last_snapshot
                 .map(|t| t.elapsed() >= self.snapshot_interval)
@@ -937,6 +1202,15 @@ impl eframe::App for NemclassApp {
         if self.process.is_some() || self.script_host.is_active() {
             ctx.request_repaint_after(self.snapshot_interval);
         }
+
+        // Persist settings (debounced on change, ~30s heartbeat for layout).
+        self.maybe_persist_settings(ctx);
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        // Best-effort flush on eframe's periodic/exit save. No context here, so
+        // the window size keeps its last-known value.
+        self.persist_settings(None);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -944,12 +1218,6 @@ impl eframe::App for NemclassApp {
         egui::Panel::top("menu_bar")
             .resizable(false)
             .show(ui, |ui| self.show_menu_bar(ui));
-
-        // File dialog (modal overlay — rendered as a Window).
-        // We drive the dialog from outside the closure to avoid borrow issues.
-        if self.file_dialog.is_some() {
-            self.show_file_dialog(ui.ctx());
-        }
 
         // Address bar.
         egui::Panel::top("address_bar")
@@ -961,6 +1229,10 @@ impl eframe::App for NemclassApp {
             .show(ui, |ui| self.show_left_panel(ui));
 
         egui::CentralPanel::default().show(ui, |ui| self.show_central_panel(ui));
+
+        // Modal dialogs (rendered on top of everything else).
+        self.show_class_picker(ui.ctx());
+        self.show_add_bytes_dialog(ui.ctx());
     }
 }
 
@@ -988,22 +1260,61 @@ impl NemclassApp {
 
             ui.separator();
 
-            if ui.button("New").clicked() && self.file_dialog.is_none() {
-                self.file_dialog = Some(FileDialog::new(FileOp::New, ""));
-            }
-            if ui.button("Open").clicked() && self.file_dialog.is_none() {
-                self.file_dialog = Some(FileDialog::new(FileOp::Open, ""));
-            }
-            if ui.button("Save").clicked() && self.file_dialog.is_none()
-                && let Err(e) = self.exec_save() {
+            // Deferred file actions (native rfd dialogs block the UI thread, so
+            // we collect the intent and run it after the menu-bar closure).
+            let mut do_new = false;
+            let mut do_open = false;
+            let mut do_save = false;
+            let mut do_save_as = false;
+            let mut open_recent: Option<PathBuf> = None;
+
+            ui.menu_button("File", |ui| {
+                if ui.button("New Project…").clicked() {
+                    do_new = true;
+                    ui.close();
+                }
+                if ui.button("Open Project…").clicked() {
+                    do_open = true;
+                    ui.close();
+                }
+                if ui.button("Save").clicked() {
+                    do_save = true;
+                    ui.close();
+                }
+                if ui.button("Save As…").clicked() {
+                    do_save_as = true;
+                    ui.close();
+                }
+                // Recent projects submenu.
+                if !self.settings.recent_projects.is_empty() {
+                    ui.separator();
+                    ui.menu_button("Recent Projects", |ui| {
+                        for dir in &self.settings.recent_projects {
+                            if ui.button(dir.display().to_string()).clicked() {
+                                open_recent = Some(dir.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+            });
+
+            // View menu: toggle dock panels on/off and reset the layout.
+            ui.menu_button("View", |ui| self.show_view_menu(ui));
+
+            // Apply the collected file action after the closures release `self`.
+            if do_new {
+                self.pick_new_project();
+            } else if do_open {
+                self.pick_open_project();
+            } else if do_save {
+                if let Err(e) = self.exec_save() {
                     self.last_error = Some(e);
-            }
-            if ui.button("Save As").clicked() && self.file_dialog.is_none() {
-                let hint = self.project_dir
-                    .as_deref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                self.file_dialog = Some(FileDialog::new(FileOp::SaveAs, &hint));
+                }
+            } else if do_save_as {
+                self.pick_save_as();
+            } else if let Some(dir) = open_recent {
+                self.open_project_path(dir);
             }
 
             // Status message (right-aligned).
@@ -1016,107 +1327,84 @@ impl NemclassApp {
     }
 
     // -----------------------------------------------------------------------
-    // File dialog (in-app path input)
+    // Native file dialogs (rfd) + recent projects
     // -----------------------------------------------------------------------
 
-    fn show_file_dialog(&mut self, ctx: &egui::Context) {
-        // Extract the dialog state to avoid holding &self borrow inside closure.
-        let Some(ref dialog) = self.file_dialog else { return; };
-        let title = match dialog.op {
-            FileOp::New    => "New Project — choose target directory",
-            FileOp::Open   => "Open Project — enter path to project.nemclass or its directory",
-            FileOp::SaveAs => "Save As — choose target directory",
-        };
-        let op = dialog.op.clone();
+    /// The directory to start a native dialog in: the current project dir, else
+    /// the most recent project, else the user's home.
+    fn dialog_start_dir(&self) -> PathBuf {
+        self.project_dir
+            .clone()
+            .or_else(|| self.settings.recent_projects.first().cloned())
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
 
-        // We need owned copies to avoid borrow-checker issues inside the closure.
-        let mut path_text = dialog.path_text.clone();
-        let dialog_error = dialog.error.clone();
-        let mut close = false;
-        let mut confirm = false;
+    /// New Project: pick a target directory, scaffold + load it there.
+    fn pick_new_project(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("New Project — choose a directory")
+            .set_directory(self.dialog_start_dir())
+            .pick_folder()
+        {
+            match self.exec_new(dir.clone()) {
+                Ok(()) => self.on_project_path_used(&dir),
+                Err(e) => self.last_error = Some(e),
+            }
+        }
+    }
 
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-
-                let hint = match op {
-                    FileOp::New    => "e.g. /home/user/myproject",
-                    FileOp::Open   => "e.g. /home/user/myproject  or  /home/user/myproject/project.nemclass",
-                    FileOp::SaveAs => "e.g. /home/user/myproject",
-                };
-                ui.label(hint);
-                ui.add_space(4.0);
-
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut path_text)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(hint),
-                );
-                // Allow confirming with Enter.
-                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if resp.lost_focus() && enter_pressed {
-                    confirm = true;
-                }
-
-                ui.add_space(4.0);
-
-                if let Some(err) = &dialog_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                    ui.add_space(4.0);
-                }
-
-                ui.horizontal(|ui| {
-                    if ui.button("Confirm").clicked() {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        close = true;
-                    }
-                });
+    /// Open Project: pick a `project.nemclass` file (or, failing a filtered
+    /// pick, a directory) and load it.
+    fn pick_open_project(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Open Project — select project.nemclass")
+            .set_directory(self.dialog_start_dir())
+            .add_filter("NemClass project", &["nemclass"])
+            .pick_file()
+            .or_else(|| {
+                rfd::FileDialog::new()
+                    .set_title("Open Project — select the project directory")
+                    .set_directory(self.dialog_start_dir())
+                    .pick_folder()
             });
-
-        // Write back any edits to path_text.
-        if let Some(ref mut d) = self.file_dialog {
-            d.path_text = path_text.clone();
+        if let Some(path) = picked {
+            self.open_project_path(path);
         }
+    }
 
-        if close {
-            self.file_dialog = None;
-            return;
-        }
-
-        if confirm {
-            let path = PathBuf::from(path_text.trim());
-            if path.as_os_str().is_empty() {
-                if let Some(ref mut d) = self.file_dialog {
-                    d.error = Some("Path cannot be empty.".into());
-                }
-                return;
-            }
-
-            let result = match op {
-                FileOp::New    => self.exec_new(path),
-                FileOp::Open   => self.exec_open(path),
-                FileOp::SaveAs => self.exec_save_as(path),
-            };
-
-            match result {
-                Ok(()) => {
-                    self.file_dialog = None;
-                    // Clear any prior errors on success.
-                    self.last_error = None;
-                }
-                Err(e) => {
-                    // Show the error inside the dialog so the user can correct the path.
-                    if let Some(ref mut d) = self.file_dialog {
-                        d.error = Some(e);
-                    }
-                }
+    /// Save As: pick a target directory and save the project there.
+    fn pick_save_as(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("Save As — choose a directory")
+            .set_directory(self.dialog_start_dir())
+            .pick_folder()
+        {
+            match self.exec_save_as(dir.clone()) {
+                Ok(()) => self.on_project_path_used(&dir),
+                Err(e) => self.last_error = Some(e),
             }
         }
+    }
+
+    /// Loads a project from an explicit path (recent-projects entry).
+    fn open_project_path(&mut self, path: PathBuf) {
+        match self.exec_open(path) {
+            Ok(()) => {
+                if let Some(dir) = self.project_dir.clone() {
+                    self.on_project_path_used(&dir);
+                }
+            }
+            Err(e) => self.last_error = Some(e),
+        }
+    }
+
+    /// Records a successfully-used project path in the MRU list and schedules a
+    /// settings save.
+    fn on_project_path_used(&mut self, dir: &std::path::Path) {
+        self.last_error = None;
+        self.settings.note_project(dir);
+        self.mark_settings_dirty();
     }
 
     // -----------------------------------------------------------------------
@@ -1227,6 +1515,7 @@ impl NemclassApp {
         // Backend selector.
         ui.heading("Backend");
         let backend_names = self.backend_names.clone();
+        let prev_backend = self.selected_backend.clone();
         egui::ComboBox::from_id_salt("backend_combo")
             .selected_text(&self.selected_backend)
             .show_ui(ui, |ui| {
@@ -1234,6 +1523,9 @@ impl NemclassApp {
                     ui.selectable_value(&mut self.selected_backend, name.clone(), name.as_str());
                 }
             });
+        if self.selected_backend != prev_backend {
+            self.mark_settings_dirty();
+        }
 
         // Auth-key row — only shown when the kernel backend is selected (Linux
         // only: the module gates all memory ops behind NEMCLASS_IOC_AUTH).
@@ -1316,15 +1608,20 @@ impl NemclassApp {
         ui.separator();
 
         // Class list.
-        ui.heading("Classes");
-        if ui.button("+ Add class").clicked() {
-            let cls = blank_class();
-            let uuid = cls.uuid;
-            self.project.add_class(cls);
-            self.selected_class = Some(uuid);
-            self.last_snapshot = None;
-            self.clear_memory_state();
-        }
+        ui.horizontal(|ui| {
+            ui.heading("Classes");
+            // Create an empty, auto-named class container. The layout is then
+            // shaped with the node editor / auto-dissect / scripts and the name
+            // is not hand-editable (classes are not manually renamed).
+            if ui.button("+ Add class").on_hover_text("Create an empty class").clicked() {
+                let cls = blank_class(&self.project);
+                let uuid = cls.uuid;
+                self.project.add_class(cls);
+                self.selected_class = Some(uuid);
+                self.last_snapshot = None;
+                self.clear_memory_state();
+            }
+        });
 
         egui::ScrollArea::vertical()
             .id_salt("class_list")
@@ -1363,6 +1660,7 @@ impl NemclassApp {
                 .changed()
             {
                 self.snapshot_interval = Duration::from_millis(ms);
+                self.mark_settings_dirty();
             }
         });
     }
@@ -1372,24 +1670,56 @@ impl NemclassApp {
     // -----------------------------------------------------------------------
 
     fn show_central_panel(&mut self, ui: &mut egui::Ui) {
-        // Tab bar.
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.central_tab, CentralTab::MemoryView,   "Memory View");
-            ui.selectable_value(&mut self.central_tab, CentralTab::Scanner,      "Scanner");
-            ui.selectable_value(&mut self.central_tab, CentralTab::Debugger,     "Debugger");
-            ui.selectable_value(&mut self.central_tab, CentralTab::MemoryViewer, "Memory");
-            ui.selectable_value(&mut self.central_tab, CentralTab::Disassembly,  "Disassembly");
-            ui.selectable_value(&mut self.central_tab, CentralTab::Scripts,      "Scripts");
-        });
-        ui.separator();
+        // Take the dock state into a local so the `DockViewer` can borrow the
+        // rest of `self` mutably without aliasing the `dock_state` field.
+        let mut dock = self
+            .dock_state
+            .take()
+            .unwrap_or_else(dock::default_layout);
 
-        match self.central_tab {
-            CentralTab::MemoryView   => self.show_class_view(ui),
-            CentralTab::Scanner      => self.show_scanner_tab(ui),
-            CentralTab::Debugger     => self.show_debugger_tab(ui),
-            CentralTab::MemoryViewer => self.show_memory_viewer(ui),
-            CentralTab::Disassembly  => self.show_disassembly_tab(ui),
-            CentralTab::Scripts      => self.show_scripts_tab(ui),
+        egui_dock::DockArea::new(&mut dock)
+            .style(egui_dock::Style::from_egui(ui.style().as_ref()))
+            .show_inside(ui, &mut dock::DockViewer { app: self });
+
+        // Honour a cross-panel focus request raised during the draw (e.g. a
+        // "Disassemble here" click bringing the Disassembly tab to the front).
+        if let Some(target) = self.pending_focus.take()
+            && let Some(path) = dock.find_tab(&target)
+        {
+            let _ = dock.set_active_tab(path);
+        }
+
+        self.dock_state = Some(dock);
+    }
+
+    /// The "View" menu: re-open any dock tab that was closed (adds it to the
+    /// focused leaf) and reset the layout to the default arrangement.
+    fn show_view_menu(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        let dock = self.dock_state.get_or_insert_with(dock::default_layout);
+        for kind in TabKind::ALL {
+            let open = dock.find_tab(&kind).is_some();
+            let mut checked = open;
+            if ui.checkbox(&mut checked, kind.title()).clicked() {
+                if checked && !open {
+                    dock.push_to_focused_leaf(kind);
+                } else if !checked && open
+                    && let Some(path) = dock.find_tab(&kind)
+                {
+                    dock.remove_tab(path);
+                }
+                changed = true;
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("Reset layout").clicked() {
+            self.dock_state = Some(dock::default_layout());
+            changed = true;
+            ui.close();
+        }
+        if changed {
+            self.mark_settings_dirty();
         }
     }
 
@@ -1507,7 +1837,7 @@ impl NemclassApp {
         self.memory_viewer.show(ui, self.process.as_ref());
         // If the "Disassemble here" button was clicked, switch tabs and navigate.
         if let Some(addr) = self.memory_viewer.take_disassemble_request() {
-            self.central_tab = CentralTab::Disassembly;
+            self.pending_focus = Some(TabKind::Disassembly);
             self.disassembly_panel.goto(addr);
         }
         // If the "Dissect as class here" button was clicked, switch to the
@@ -1515,13 +1845,73 @@ impl NemclassApp {
         // The length comes from the existing dissect_len_text field.
         #[cfg(target_os = "linux")]
         if let Some(addr) = self.memory_viewer.take_dissect_request() {
-            self.central_tab = CentralTab::MemoryView;
+            self.pending_focus = Some(TabKind::ClassView);
             self.run_auto_dissect(addr);
+        }
+    }
+
+    /// The Navigator side panel: strings / functions / calls from a dissect.
+    /// Routes its click actions to the disassembler / hex viewer.
+    fn show_navigator_tab(&mut self, ui: &mut egui::Ui) {
+        use navigator::NavAction;
+
+        #[cfg(target_os = "linux")]
+        let action = {
+            let epoch = self.disassembly_panel.dissect_epoch();
+            let dissect = self.disassembly_panel.dissect_result().map(|d| (epoch, d));
+            self.navigator_panel.show(ui, dissect, self.process.as_ref())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let action = self.navigator_panel.show(ui);
+
+        match action {
+            Some(NavAction::GotoDisasm(addr)) => {
+                self.disassembly_panel.goto(addr);
+                self.pending_focus = Some(TabKind::Disassembly);
+            }
+            Some(NavAction::GotoMemory(addr)) => {
+                self.memory_viewer.goto(addr);
+                self.pending_focus = Some(TabKind::Memory);
+            }
+            Some(NavAction::RunDissect) => {
+                #[cfg(target_os = "linux")]
+                if let Some(proc) = self.process.take() {
+                    self.disassembly_panel.dissect_selected(&proc);
+                    self.process = Some(proc);
+                }
+            }
+            None => {}
         }
     }
 
     fn show_disassembly_tab(&mut self, ui: &mut egui::Ui) {
         self.disassembly_panel.show(ui, self.process.as_ref());
+
+        // Apply a row-context-menu action (set-as-class-base / add-address-node)
+        // raised inside the disassembler, targeting the selected class.
+        if let Some(action) = self.disassembly_panel.take_action() {
+            use disassembly::DisasmAction;
+            use nemclass_model::node::builtins::Hex64Node;
+            let uuid = self
+                .selected_class
+                .or_else(|| self.project.classes_in_order().next().map(|c| c.uuid));
+            if let Some(uuid) = uuid
+                && let Some(class) = self.project.get_class_mut(&uuid)
+            {
+                match action {
+                    DisasmAction::SetClassAddress(addr) => {
+                        class.address_formula = format!("{addr:#x}");
+                        self.status_msg =
+                            Some(format!("Set {} base to {addr:#x}", class.name));
+                    }
+                    DisasmAction::AddAddressToClass(addr) => {
+                        let mut node = Hex64Node::new(format!("disasm_{addr:#x}"));
+                        node.comment = format!("From disassembler {addr:#018X}");
+                        class.children.push(Box::new(node));
+                    }
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1794,16 +2184,18 @@ impl NemclassApp {
                         ViewRow::Snap(snap_idx) => {
                             let snap = &self.node_snapshots[*snap_idx];
 
-                            let address      = snap.address;
-                            let offset       = snap.offset;
-                            let type_tag     = snap.type_tag;
-                            let name         = snap.name.clone();
-                            let comment      = snap.comment.clone();
-                            let value        = snap.rendered.value.clone();
-                            let depth        = snap.depth;
-                            let has_children = snap.has_children;
-                            let id_path      = snap.id_path.clone();
+                            let address        = snap.address;
+                            let offset         = snap.offset;
+                            let type_tag       = snap.type_tag;
+                            let name           = snap.name.clone();
+                            let comment        = snap.comment.clone();
+                            let value          = snap.rendered.value.clone();
+                            let depth          = snap.depth;
+                            let has_children   = snap.has_children;
+                            let id_path        = snap.id_path.clone();
                             let pointer_target = snap.pointer_target;
+                            let snap_owner     = snap.owner_class;
+                            let snap_local_path = snap.local_path.clone();
 
                             // For live-expandable nodes, we treat them as
                             // containers (has_children for collapse toggle) even
@@ -1825,19 +2217,59 @@ impl NemclassApp {
                                     if indent > 0.0 { ui.add_space(indent); }
 
                                     if has_children || is_live_container {
-                                        let collapsed = self.collapsed.contains(&id_path);
-                                        let arrow = if collapsed { "▶" } else { "▼" };
-                                        if ui.small_button(arrow).clicked() {
-                                            if collapsed {
-                                                self.collapsed.remove(&id_path);
-                                            } else {
-                                                self.collapsed.insert(id_path.clone());
+                                        if type_tag == "Pointer" {
+                                            let is_expanded = self.expanded_ptrs.contains(&id_path);
+                                            let arrow = if is_expanded { "▼" } else { "▶" };
+                                            if ui.small_button(arrow).clicked() {
+                                                if is_expanded {
+                                                    self.expanded_ptrs.remove(&id_path);
+                                                } else {
+                                                    self.expanded_ptrs.insert(id_path.clone());
+                                                }
+                                            }
+                                        } else {
+                                            let is_collapsed = self.collapsed.contains(&id_path);
+                                            let arrow = if is_collapsed { "▶" } else { "▼" };
+                                            if ui.small_button(arrow).clicked() {
+                                                if is_collapsed {
+                                                    self.collapsed.remove(&id_path);
+                                                } else {
+                                                    self.collapsed.insert(id_path.clone());
+                                                }
                                             }
                                         }
                                     } else {
                                         ui.add_space(16.0);
                                     }
-                                    ui.label(&name);
+                                    // Name cell: double-click to edit inline.
+                                    let name_editing = self.edit_state.as_ref()
+                                        .is_some_and(|e| e.node_id == id_path && e.field == EditField::Name);
+                                    if name_editing {
+                                        let resp = ui.text_edit_singleline(
+                                            &mut self.edit_state.as_mut().unwrap().text,
+                                        );
+                                        let enter  = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                        if resp.lost_focus() || enter {
+                                            let edit = self.edit_state.take().unwrap();
+                                            self.pending_node_edits.push(NodeEditOp::SetName {
+                                                owner: snap_owner,
+                                                path: snap_local_path.clone(),
+                                                name: edit.text,
+                                            });
+                                        } else if escape {
+                                            self.edit_state = None;
+                                        }
+                                    } else {
+                                        let resp = ui.label(&name);
+                                        if resp.double_clicked() {
+                                            self.edit_state = Some(EditState {
+                                                node_id: id_path.clone(),
+                                                text: name.clone(),
+                                                field: EditField::Name,
+                                            });
+                                        }
+                                    }
                                 });
                             });
 
@@ -1845,7 +2277,7 @@ impl NemclassApp {
                                 let editing = self
                                     .edit_state
                                     .as_ref()
-                                    .is_some_and(|e| e.node_id == id_path);
+                                    .is_some_and(|e| e.node_id == id_path && e.field == EditField::Value);
 
                                 if is_editable(type_tag) && self.process.is_some() {
                                     if editing {
@@ -1870,39 +2302,58 @@ impl NemclassApp {
                                             self.edit_state = Some(EditState {
                                                 node_id: id_path.clone(),
                                                 text: seed,
+                                                field: EditField::Value,
                                             });
                                         }
+                                        resp.context_menu(|ui| {
+                                            self.build_node_context_menu(
+                                                ui, snap_owner, snap_local_path.clone(),
+                                                type_tag, &value, pointer_target,
+                                            );
+                                        });
                                     }
                                 } else {
                                     let resp = ui.label(&value);
-                                    // Pointer rows: right-click to follow the
-                                    // pointer and open its target class.
-                                    if type_tag == "Pointer" {
-                                        resp.context_menu(|ui| {
-                                            let target_addr = value
-                                                .strip_prefix("0x")
-                                                .or_else(|| value.strip_prefix("0X"))
-                                                .and_then(|h| usize::from_str_radix(h, 16).ok());
-                                            let enabled = target_addr.is_some_and(|a| a != 0);
-                                            if ui
-                                                .add_enabled(
-                                                    enabled,
-                                                    egui::Button::new("Follow pointer → open target"),
-                                                )
-                                                .clicked()
-                                            {
-                                                if let Some(addr) = target_addr {
-                                                    self.pending_follow_pointer =
-                                                        Some((addr, pointer_target));
-                                                }
-                                                ui.close();
-                                            }
+                                    resp.context_menu(|ui| {
+                                        self.build_node_context_menu(
+                                            ui, snap_owner, snap_local_path.clone(),
+                                            type_tag, &value, pointer_target,
+                                        );
+                                    });
+                                }
+                            });
+
+                            // Comment column: double-click to edit inline.
+                            row.col(|ui| {
+                                let comment_editing = self.edit_state.as_ref()
+                                    .is_some_and(|e| e.node_id == id_path && e.field == EditField::Comment);
+                                if comment_editing {
+                                    let resp = ui.text_edit_singleline(
+                                        &mut self.edit_state.as_mut().unwrap().text,
+                                    );
+                                    let enter  = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    if resp.lost_focus() || enter {
+                                        let edit = self.edit_state.take().unwrap();
+                                        self.pending_node_edits.push(NodeEditOp::SetComment {
+                                            owner: snap_owner,
+                                            path: snap_local_path.clone(),
+                                            comment: edit.text,
+                                        });
+                                    } else if escape {
+                                        self.edit_state = None;
+                                    }
+                                } else {
+                                    let resp = ui.label(&comment);
+                                    if resp.double_clicked() {
+                                        self.edit_state = Some(EditState {
+                                            node_id: id_path.clone(),
+                                            text: comment.clone(),
+                                            field: EditField::Comment,
                                         });
                                     }
                                 }
                             });
-
-                            row.col(|ui| { ui.label(&comment); });
                         }
 
                         #[cfg(target_os = "linux")]
@@ -1993,13 +2444,19 @@ impl NemclassApp {
         // Apply any pending disasm navigation collected during the draw phase.
         #[cfg(target_os = "linux")]
         if let Some(addr) = self.pending_disasm_goto.take() {
-            self.central_tab = CentralTab::Disassembly;
+            self.pending_focus = Some(TabKind::Disassembly);
             self.disassembly_panel.goto(addr as usize);
         }
 
         // Apply any pending "follow pointer" request collected during the draw.
         if let Some((addr, target_uuid)) = self.pending_follow_pointer.take() {
             self.follow_pointer(addr, target_uuid);
+        }
+
+        // Apply any deferred structural node edits (ChangeType, Delete, …).
+        let ops: Vec<NodeEditOp> = self.pending_node_edits.drain(..).collect();
+        for op in ops {
+            self.apply_node_edit(op);
         }
     }
 
@@ -2016,11 +2473,11 @@ impl NemclassApp {
                 self.mem_buf.clear();
                 self.edit_state = None;
                 self.last_snapshot = None;
-                self.central_tab = CentralTab::MemoryView;
+                self.pending_focus = Some(TabKind::ClassView);
             }
             _ => {
                 // No target class → show raw bytes at the pointed-to address.
-                self.central_tab = CentralTab::MemoryViewer;
+                self.pending_focus = Some(TabKind::Memory);
                 #[cfg(target_os = "linux")]
                 self.memory_viewer.goto(addr);
                 self.status_msg =
@@ -2028,12 +2485,372 @@ impl NemclassApp {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Per-row context menu
+    // -----------------------------------------------------------------------
+
+    /// Populate the right-click context menu for a node's value cell.
+    ///
+    /// Called on both the editable (`selectable_label`) and non-editable
+    /// (`label`) response so every row has a full context menu.
+    fn build_node_context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        snap_owner: Uuid,
+        snap_local_path: Vec<usize>,
+        type_tag: &'static str,
+        value: &str,
+        pointer_target: Option<Uuid>,
+    ) {
+        ui.menu_button("Change type ▸", |ui| {
+            for &(label, tag) in &[
+                ("Hex 8",    "Hex8"),    ("Hex 16",  "Hex16"),
+                ("Hex 32",   "Hex32"),   ("Hex 64",  "Hex64"),
+                ("Int 8",    "Int8"),    ("Int 16",  "Int16"),
+                ("Int 32",   "Int32"),   ("Int 64",  "Int64"),
+                ("UInt 8",   "UInt8"),   ("UInt 16", "UInt16"),
+                ("UInt 32",  "UInt32"),  ("UInt 64", "UInt64"),
+                ("Float",    "Float"),   ("Double",  "Double"),
+                ("Bool",     "Bool"),    ("Pointer", "Pointer"),
+            ] {
+                if ui.button(label).clicked() {
+                    self.pending_node_edits.push(NodeEditOp::ChangeType {
+                        owner: snap_owner,
+                        path: snap_local_path.clone(),
+                        new_tag: tag,
+                    });
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("Class Instance…").clicked() {
+                self.class_picker = Some(ClassPickerState {
+                    filter: String::new(),
+                    purpose: PickerPurpose::ChangeToInstance {
+                        owner: snap_owner,
+                        path: snap_local_path.clone(),
+                    },
+                });
+                ui.close();
+            }
+        });
+
+        if type_tag == "Pointer" || type_tag == "ClassInstance" {
+            ui.separator();
+            if ui.button("Set target class…").clicked() {
+                let purpose = if type_tag == "Pointer" {
+                    PickerPurpose::SetPtrTarget {
+                        owner: snap_owner,
+                        path: snap_local_path.clone(),
+                    }
+                } else {
+                    PickerPurpose::SetInstance {
+                        owner: snap_owner,
+                        path: snap_local_path.clone(),
+                    }
+                };
+                self.class_picker = Some(ClassPickerState {
+                    filter: String::new(),
+                    purpose,
+                });
+                ui.close();
+            }
+        }
+
+        ui.separator();
+        if ui.button("Add bytes…").clicked() {
+            self.add_bytes_dialog = Some(AddBytesState {
+                owner: snap_owner,
+                path: snap_local_path.clone(),
+                count_text: "8".into(),
+                insert: false,
+            });
+            ui.close();
+        }
+        if ui.button("Insert bytes…").clicked() {
+            self.add_bytes_dialog = Some(AddBytesState {
+                owner: snap_owner,
+                path: snap_local_path.clone(),
+                count_text: "8".into(),
+                insert: true,
+            });
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Delete").clicked() {
+            self.pending_node_edits.push(NodeEditOp::Delete {
+                owner: snap_owner,
+                path: snap_local_path.clone(),
+            });
+            ui.close();
+        }
+
+        if type_tag == "Pointer" {
+            ui.separator();
+            let target_addr = value
+                .strip_prefix("0x").or_else(|| value.strip_prefix("0X"))
+                .and_then(|h| usize::from_str_radix(h, 16).ok());
+            let enabled = target_addr.is_some_and(|a| a != 0);
+            if ui.add_enabled(
+                enabled,
+                egui::Button::new("Follow pointer → open target"),
+            ).clicked() {
+                if let Some(addr) = target_addr {
+                    self.pending_follow_pointer = Some((addr, pointer_target));
+                }
+                ui.close();
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Class picker modal
+    // -----------------------------------------------------------------------
+
+    fn show_class_picker(&mut self, ctx: &egui::Context) {
+        if self.class_picker.is_none() { return; }
+
+        let mut selected_uuid: Option<Uuid> = None;
+        let mut cancel = false;
+
+        // Clone what we need to avoid borrow conflict while the window borrows ctx.
+        let (filter, purpose) = {
+            let p = self.class_picker.as_ref().unwrap();
+            (p.filter.clone(), p.purpose.clone())
+        };
+
+        egui::Window::new("Select Class")
+            .resizable(true)
+            .show(ctx, |ui| {
+                let mut f = filter.clone();
+                if ui.text_edit_singleline(&mut f).changed()
+                    && let Some(p) = &mut self.class_picker
+                {
+                    p.filter = f.clone();
+                }
+                let filter_lc = f.to_lowercase();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let uuids: Vec<(Uuid, String)> = self
+                        .project
+                        .classes_in_order()
+                        .map(|c| (c.uuid, c.name.clone()))
+                        .collect();
+                    for (uuid, name) in uuids {
+                        if !filter_lc.is_empty() && !name.to_lowercase().contains(&filter_lc) {
+                            continue;
+                        }
+                        if ui.selectable_label(false, &name).clicked() {
+                            selected_uuid = Some(uuid);
+                        }
+                    }
+                });
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+
+        if cancel {
+            self.class_picker = None;
+            return;
+        }
+
+        if let Some(uuid) = selected_uuid {
+            let (owner, _path) = match &purpose {
+                PickerPurpose::SetPtrTarget     { owner, path } => (*owner, path.clone()),
+                PickerPurpose::SetInstance      { owner, path } => (*owner, path.clone()),
+                PickerPurpose::ChangeToInstance { owner, path } => (*owner, path.clone()),
+            };
+            let would_cycle = self
+                .project
+                .get_class(&uuid)
+                .map(|c| c.references_class(&owner) || uuid == owner)
+                .unwrap_or(false);
+            if would_cycle {
+                self.status_msg = Some("Cannot select: would create a class cycle.".into());
+            } else {
+                let op = match &purpose {
+                    PickerPurpose::SetPtrTarget { owner, path } => NodeEditOp::SetPtrTarget {
+                        owner: *owner, path: path.clone(), target: Some(uuid),
+                    },
+                    PickerPurpose::SetInstance { owner, path } => NodeEditOp::SetInstance {
+                        owner: *owner, path: path.clone(), target: uuid,
+                    },
+                    PickerPurpose::ChangeToInstance { owner, path } => NodeEditOp::SetInstance {
+                        owner: *owner, path: path.clone(), target: uuid,
+                    },
+                };
+                self.pending_node_edits.push(op);
+            }
+            self.class_picker = None;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Add-bytes dialog
+    // -----------------------------------------------------------------------
+
+    fn show_add_bytes_dialog(&mut self, ctx: &egui::Context) {
+        if self.add_bytes_dialog.is_none() { return; }
+
+        let title = if self.add_bytes_dialog.as_ref().unwrap().insert {
+            "Insert Bytes"
+        } else {
+            "Add Bytes"
+        };
+
+        let mut confirm = false;
+        let mut cancel = false;
+
+        egui::Window::new(title)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Count:");
+                    let mut t = self.add_bytes_dialog.as_ref().unwrap().count_text.clone();
+                    if ui.text_edit_singleline(&mut t).changed()
+                        && let Some(s) = &mut self.add_bytes_dialog
+                    {
+                        s.count_text = t;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for &preset in &[4usize, 8, 64, 256, 1024] {
+                        if ui.small_button(preset.to_string()).clicked()
+                            && let Some(s) = &mut self.add_bytes_dialog
+                        {
+                            s.count_text = preset.to_string();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() { confirm = true; }
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                });
+            });
+
+        if cancel {
+            self.add_bytes_dialog = None;
+            return;
+        }
+        if confirm {
+            let state = self.add_bytes_dialog.take().unwrap();
+            let count = state.count_text.trim().parse::<usize>().unwrap_or(0);
+            if count > 0 {
+                let op = if state.insert {
+                    NodeEditOp::InsertBytes {
+                        owner: state.owner, path: state.path, count,
+                    }
+                } else {
+                    NodeEditOp::AddBytes {
+                        owner: state.owner, path: state.path, count,
+                    }
+                };
+                self.pending_node_edits.push(op);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Apply node edits
+    // -----------------------------------------------------------------------
+
+    fn apply_node_edit(&mut self, op: NodeEditOp) {
+        use nemclass_model::node::builtins::{ClassInstanceNode, PointerNode};
+
+        let invalidate = |app: &mut NemclassApp| {
+            app.node_snapshots.clear();
+            app.mem_buf.clear();
+            app.edit_state = None;
+            app.last_snapshot = None;
+        };
+
+        match op {
+            NodeEditOp::ChangeType { owner, path, new_tag } => {
+                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
+                    let old_name    = vec[idx].name().to_owned();
+                    let old_comment = vec[idx].comment().to_owned();
+                    if let Some(mut new_node) = self.node_registry.construct(new_tag) {
+                        new_node.set_name(old_name);
+                        new_node.set_comment(old_comment);
+                        vec[idx] = new_node;
+                    }
+                }
+                invalidate(self);
+            }
+            NodeEditOp::Delete { owner, path } => {
+                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
+                    vec.remove(idx);
+                }
+                invalidate(self);
+            }
+            NodeEditOp::AddBytes { owner, path, count } => {
+                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
+                    let insert_at = idx + 1;
+                    let fill = hex_fill(count);
+                    for (j, node) in fill.into_iter().enumerate() {
+                        vec.insert(insert_at + j, node);
+                    }
+                }
+                invalidate(self);
+            }
+            NodeEditOp::InsertBytes { owner, path, count } => {
+                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
+                    let fill = hex_fill(count);
+                    for (j, node) in fill.into_iter().enumerate() {
+                        vec.insert(idx + j, node);
+                    }
+                }
+                invalidate(self);
+            }
+            NodeEditOp::SetName { owner, path, name } => {
+                if let Some(node) = resolve_node_mut(&mut self.project, owner, &path) {
+                    node.set_name(name);
+                }
+                invalidate(self);
+            }
+            NodeEditOp::SetComment { owner, path, comment } => {
+                if let Some(node) = resolve_node_mut(&mut self.project, owner, &path) {
+                    node.set_comment(comment);
+                }
+                invalidate(self);
+            }
+            NodeEditOp::SetPtrTarget { owner, path, target } => {
+                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
+                    let old_name    = vec[idx].name().to_owned();
+                    let old_comment = vec[idx].comment().to_owned();
+                    let new_node = Box::new(PointerNode {
+                        name:              old_name,
+                        comment:           old_comment,
+                        target_class_uuid: target,
+                    });
+                    vec[idx] = new_node;
+                }
+                invalidate(self);
+            }
+            NodeEditOp::SetInstance { owner, path, target } => {
+                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
+                    let old_name    = vec[idx].name().to_owned();
+                    let old_comment = vec[idx].comment().to_owned();
+                    let mut new_node = Box::new(ClassInstanceNode::new(old_name, target));
+                    new_node.set_comment(old_comment);
+                    vec[idx] = new_node;
+                }
+                invalidate(self);
+            }
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Node-tree structural helpers
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Tree flattening
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn flatten_nodes(
     children: &[Box<dyn Node>],
     base_addr: usize,
@@ -2041,7 +2858,15 @@ fn flatten_nodes(
     depth: usize,
     buf: &[u8],
     parent_id: String,
+    owner_class: Uuid,
+    parent_path: &[usize],
     out: &mut Vec<NodeSnapshot>,
+    project: &nemclass_model::Project,
+    collapsed: &HashSet<String>,
+    expanded_ptrs: &HashSet<String>,
+    deref_bufs: &HashMap<String, (usize, Vec<u8>)>,
+    visited: &mut HashSet<Uuid>,
+    depth_budget: usize,
 ) {
     let mut cur_offset = base_offset;
     for (i, node) in children.iter().enumerate() {
@@ -2051,9 +2876,33 @@ fn flatten_nodes(
             format!("{parent_id}.{i}")
         };
 
+        let mut local_path = parent_path.to_vec();
+        local_path.push(i);
+
+        let type_tag = node.type_tag();
         let rendered = node.render(buf, cur_offset);
-        let has_children = !node.children().is_empty();
-        let size = node.memory_size();
+
+        let ci_target = class_instance_target(node.as_ref());
+        let ptr_target = node.pointer_target_class();
+
+        let has_children = !node.children().is_empty()
+            || ci_target.is_some()
+            || ptr_target.is_some();
+
+        let size = if type_tag == "ClassInstance" {
+            if let Some(t_uuid) = ci_target {
+                if let Some(tc) = project.get_class(&t_uuid) {
+                    if !visited.contains(&t_uuid) {
+                        visited.insert(t_uuid);
+                        let sz = nemclass_model::resolved_class_size(tc, project, &mut HashSet::new());
+                        visited.remove(&t_uuid);
+                        sz
+                    } else { 0 }
+                } else { 0 }
+            } else { 0 }
+        } else {
+            node.memory_size()
+        };
 
         out.push(NodeSnapshot {
             address: base_addr.wrapping_add(cur_offset),
@@ -2062,27 +2911,104 @@ fn flatten_nodes(
             id_path: id_path.clone(),
             rendered,
             has_children,
-            type_tag: node.type_tag(),
+            type_tag,
             name: node.name().to_owned(),
             comment: node.comment().to_owned(),
             _memory_size: size,
-            pointer_target: node.pointer_target_class(),
+            pointer_target: ptr_target,
+            owner_class,
+            local_path: local_path.clone(),
         });
 
-        if has_children {
+        // Static children (unchanged).
+        if !node.children().is_empty() {
             flatten_nodes(
                 node.children(),
                 base_addr,
                 cur_offset,
                 depth + 1,
                 buf,
-                id_path,
+                id_path.clone(),
+                owner_class,
+                &local_path,
                 out,
+                project,
+                collapsed,
+                expanded_ptrs,
+                deref_bufs,
+                visited,
+                depth_budget.saturating_sub(1),
             );
+        }
+
+        // ClassInstance inline expansion: default-expanded, gated by collapsed.
+        if let Some(t_uuid) = ci_target
+            && !collapsed.contains(&id_path)
+            && !visited.contains(&t_uuid)
+            && depth_budget > 0
+            && let Some(target_class) = project.get_class(&t_uuid)
+        {
+            visited.insert(t_uuid);
+            flatten_nodes(
+                &target_class.children,
+                base_addr,
+                cur_offset,
+                depth + 1,
+                buf,
+                id_path.clone(),
+                t_uuid,
+                &[],
+                out,
+                project,
+                collapsed,
+                expanded_ptrs,
+                deref_bufs,
+                visited,
+                depth_budget - 1,
+            );
+            visited.remove(&t_uuid);
+        }
+
+        // Pointer inline expansion: default-collapsed, gated by expanded_ptrs.
+        if let Some(t_uuid) = ptr_target
+            && expanded_ptrs.contains(&id_path)
+            && !visited.contains(&t_uuid)
+            && depth_budget > 0
+            && let Some((deref_addr, dbuf)) = deref_bufs.get(&id_path)
+            && let Some(target_class) = project.get_class(&t_uuid)
+        {
+            visited.insert(t_uuid);
+            flatten_nodes(
+                &target_class.children,
+                *deref_addr,
+                0,
+                depth + 1,
+                dbuf,
+                id_path.clone(),
+                t_uuid,
+                &[],
+                out,
+                project,
+                collapsed,
+                expanded_ptrs,
+                deref_bufs,
+                visited,
+                depth_budget - 1,
+            );
+            visited.remove(&t_uuid);
         }
 
         cur_offset = cur_offset.wrapping_add(size);
     }
+}
+
+fn class_instance_target(node: &dyn Node) -> Option<Uuid> {
+    if node.type_tag() != "ClassInstance" { return None; }
+    let def = node.to_node_def();
+    def.attrs
+        .get("class_uuid")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok())
 }
 
 fn build_visible_rows(
@@ -2159,6 +3085,51 @@ fn build_augmented_rows(
     }
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Structural mutation helpers
+// ---------------------------------------------------------------------------
+
+/// Greedy-fill: produce nodes summing to `count` bytes using Hex64/32/16/8.
+fn hex_fill(count: usize) -> Vec<Box<dyn Node>> {
+    use nemclass_model::node::builtins::{Hex8Node, Hex16Node, Hex32Node, Hex64Node};
+    let mut nodes: Vec<Box<dyn Node>> = Vec::new();
+    let mut rem = count;
+    while rem >= 8 { nodes.push(Box::new(Hex64Node::new(""))); rem -= 8; }
+    while rem >= 4 { nodes.push(Box::new(Hex32Node::new(""))); rem -= 4; }
+    while rem >= 2 { nodes.push(Box::new(Hex16Node::new(""))); rem -= 2; }
+    while rem >= 1 { nodes.push(Box::new(Hex8Node::new("")));  rem -= 1; }
+    nodes
+}
+
+/// Walk `project` to find the parent `Vec<Box<dyn Node>>` and the last index
+/// for `local_path`. Returns `None` if path is empty, owner not found, or any
+/// index is out of bounds.
+fn resolve_parent_vec_mut<'a>(
+    project: &'a mut Project,
+    owner: Uuid,
+    local_path: &[usize],
+) -> Option<(&'a mut Vec<Box<dyn Node>>, usize)> {
+    if local_path.is_empty() { return None; }
+    let class = project.get_class_mut(&owner)?;
+    let (last, prefix) = local_path.split_last()?;
+    let mut vec: &mut Vec<Box<dyn Node>> = &mut class.children;
+    for &idx in prefix {
+        let node = vec.get_mut(idx)?;
+        vec = node.children_mut()?;
+    }
+    if *last < vec.len() { Some((vec, *last)) } else { None }
+}
+
+/// Resolve the node itself (mutable) at `local_path` inside `owner`.
+fn resolve_node_mut<'a>(
+    project: &'a mut Project,
+    owner: Uuid,
+    local_path: &[usize],
+) -> Option<&'a mut Box<dyn Node>> {
+    let (vec, idx) = resolve_parent_vec_mut(project, owner, local_path)?;
+    vec.get_mut(idx)
 }
 
 // ---------------------------------------------------------------------------
@@ -2264,10 +3235,192 @@ fn demo_project() -> Project {
     project
 }
 
-/// A blank class for "Add class" in an open project.
-fn blank_class() -> ClassNode {
-    use nemclass_model::node::builtins::Int32Node;
-    let mut cls = ClassNode::new("NewClass");
-    cls.children.push(Box::new(Int32Node::new("field_0")));
+/// Build an empty, auto-named class container for the "+ Add class" button.
+///
+/// The name is generated to be unique within `project` (`Class1`, `Class2`, …)
+/// rather than user-typed — classes are created but not manually renamed. It
+/// seeds one `Hex64` field so the new class renders a row immediately; the user
+/// then reshapes it with the node editor, auto-dissect, or a script.
+fn blank_class(project: &Project) -> ClassNode {
+    use nemclass_model::node::builtins::Hex64Node;
+
+    let mut n = 1usize;
+    let name = loop {
+        let candidate = format!("Class{n}");
+        if !project.classes_in_order().any(|c| c.name == candidate) {
+            break candidate;
+        }
+        n += 1;
+    };
+
+    let mut cls = ClassNode::new(name);
+    cls.children.push(Box::new(Hex64Node::new("field_0")));
     cls
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — pure helpers that don't need an egui context
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nemclass_model::node::builtins::Int32Node;
+    use nemclass_model::{ClassNode, NodeRegistry, Project};
+
+    #[test]
+    fn hex_fill_greedy() {
+        // 8 → exactly one Hex64
+        let nodes = hex_fill(8);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].type_tag(), "Hex64");
+
+        // 13 = 8+4+1 → Hex64, Hex32, Hex8
+        let nodes = hex_fill(13);
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].type_tag(), "Hex64");
+        assert_eq!(nodes[1].type_tag(), "Hex32");
+        assert_eq!(nodes[2].type_tag(), "Hex8");
+
+        // 3 = 2+1 → Hex16, Hex8
+        let nodes = hex_fill(3);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].type_tag(), "Hex16");
+        assert_eq!(nodes[1].type_tag(), "Hex8");
+
+        // 0 → empty
+        assert!(hex_fill(0).is_empty());
+
+        // sum is always exact
+        let nodes = hex_fill(100);
+        let sum: usize = nodes.iter().map(|n| n.memory_size()).sum();
+        assert_eq!(sum, 100);
+    }
+
+    #[test]
+    fn resolve_parent_vec_mut_basic() {
+        let mut project = Project::new("Test");
+        let mut cls = ClassNode::new("Root");
+        cls.children.push(Box::new(Int32Node::new("a")));
+        cls.children.push(Box::new(Int32Node::new("b")));
+        let uuid = cls.uuid;
+        project.add_class(cls);
+
+        // path [1] → parent is Root.children, index 1
+        let result = resolve_parent_vec_mut(&mut project, uuid, &[1]);
+        assert!(result.is_some());
+        let (vec, idx) = result.unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(vec[idx].name(), "b");
+
+        // empty path → None
+        assert!(resolve_parent_vec_mut(&mut project, uuid, &[]).is_none());
+
+        // out-of-bounds → None
+        assert!(resolve_parent_vec_mut(&mut project, uuid, &[99]).is_none());
+    }
+
+    #[test]
+    fn change_type_preserves_name_comment() {
+        let registry = NodeRegistry::new().with_builtins();
+        let mut project = Project::new("Test");
+        let mut cls = ClassNode::new("Root");
+        let mut n = Int32Node::new("my_field");
+        n.comment = "my_comment".into();
+        cls.children.push(Box::new(n));
+        let owner = cls.uuid;
+        project.add_class(cls);
+
+        // Simulate ChangeType: construct Hex32, copy name/comment from the old node
+        let (vec, idx) = resolve_parent_vec_mut(&mut project, owner, &[0]).unwrap();
+        let old_name    = vec[idx].name().to_owned();
+        let old_comment = vec[idx].comment().to_owned();
+        let mut new_node = registry.construct("Hex32").unwrap();
+        new_node.set_name(old_name);
+        new_node.set_comment(old_comment);
+        vec[idx] = new_node;
+
+        let cls = project.get_class(&owner).unwrap();
+        assert_eq!(cls.children[0].type_tag(), "Hex32");
+        assert_eq!(cls.children[0].name(), "my_field");
+        assert_eq!(cls.children[0].comment(), "my_comment");
+    }
+
+    #[test]
+    fn flatten_nodes_inline_class_instance() {
+        use nemclass_model::node::builtins::{ClassInstanceNode, Int32Node};
+
+        let mut project = Project::new("Test");
+
+        let b_uuid = {
+            let mut b = ClassNode::new("B");
+            b.children.push(Box::new(Int32Node::new("x")));
+            b.children.push(Box::new(Int32Node::new("y")));
+            let uuid = b.uuid;
+            project.add_class(b);
+            uuid
+        };
+
+        let a_uuid = {
+            let mut a = ClassNode::new("A");
+            a.children.push(Box::new(ClassInstanceNode::new("b_field", b_uuid)));
+            a.children.push(Box::new(Int32Node::new("after")));
+            let uuid = a.uuid;
+            project.add_class(a);
+            uuid
+        };
+
+        let buf = vec![0u8; 64];
+        let collapsed: HashSet<String> = HashSet::new();
+        let expanded_ptrs: HashSet<String> = HashSet::new();
+        let deref_bufs: HashMap<String, (usize, Vec<u8>)> = HashMap::new();
+        let mut visited: HashSet<Uuid> = HashSet::new();
+        let mut snapshots: Vec<NodeSnapshot> = Vec::new();
+
+        {
+            let cls = project.get_class(&a_uuid).unwrap();
+            flatten_nodes(
+                &cls.children,
+                0,
+                0,
+                0,
+                &buf,
+                String::new(),
+                a_uuid,
+                &[],
+                &mut snapshots,
+                &project,
+                &collapsed,
+                &expanded_ptrs,
+                &deref_bufs,
+                &mut visited,
+                8,
+            );
+        }
+
+        assert_eq!(snapshots.len(), 4, "expected 4 rows: instance + 2 B children + after");
+
+        let ci = &snapshots[0];
+        assert_eq!(ci.type_tag, "ClassInstance");
+        assert_eq!(ci.offset, 0);
+        assert_eq!(ci.owner_class, a_uuid);
+
+        let x = &snapshots[1];
+        assert_eq!(x.type_tag, "Int32");
+        assert_eq!(x.name, "x");
+        assert_eq!(x.offset, 0);
+        assert_eq!(x.owner_class, b_uuid);
+
+        let y = &snapshots[2];
+        assert_eq!(y.type_tag, "Int32");
+        assert_eq!(y.name, "y");
+        assert_eq!(y.offset, 4);
+        assert_eq!(y.owner_class, b_uuid);
+
+        let after = &snapshots[3];
+        assert_eq!(after.type_tag, "Int32");
+        assert_eq!(after.name, "after");
+        assert_eq!(after.offset, 8, "field after instance must sit at resolved_class_size(B) = 8");
+        assert_eq!(after.owner_class, a_uuid);
+    }
 }

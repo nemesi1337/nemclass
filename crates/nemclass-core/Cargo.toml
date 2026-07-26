@@ -17,6 +17,11 @@ symbols = [
     "dep:object",
     "dep:pdb-addr2line",
 ]
+# Test-only seams: a public `Process::from_backend_for_test` and an in-memory
+# `MockMemoryBackend`, so the ui/scan layers can exercise the hex viewer,
+# disassembler, and analysis against known bytes without a live `/proc` target.
+# Off by default; never compiled into a release build.
+test-util = []
 
 [dependencies]
 iced-x86.workspace = true

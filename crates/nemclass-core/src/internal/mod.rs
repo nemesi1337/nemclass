@@ -20,6 +20,10 @@ pub use process::{
 #[cfg(feature = "symbols")]
 pub use process::{SymbolResolver, symbol_resolver};
 
+// Test-only in-memory backend (`from_backend_for_test` lives on `Process`).
+#[cfg(feature = "test-util")]
+pub use process::MockMemoryBackend;
+
 // Native Linux provider (`process_vm_readv` backend + `/proc` enumeration) plus
 // the backend-name constants a UI backend picker keys off of.
 #[cfg(target_os = "linux")]
