@@ -194,6 +194,17 @@ fn save_ppm(path: &std::path::Path, image: &egui::ColorImage) -> std::io::Result
 
 /// Try to initialise `env_logger`; silently ignore `SetLoggerError` if another
 /// logger was already installed (common in test harnesses).
+///
+/// SWC — the TypeScript transpiler inside the JS engine — logs its internal
+/// source-map generation as `srcmap;` records at ERROR level. Since env_logger's
+/// default level is `error`, those flood stderr the moment a real `.ts` script
+/// is transpiled (the empty scaffold `init.ts` never triggered it). We pin those
+/// SWC targets to `off`; `RUST_LOG` still controls everything else.
 fn env_logger_try_init() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::try_init().map_err(Into::into)
+    use log::LevelFilter;
+    env_logger::Builder::from_default_env()
+        .filter_module("swc_ecma_codegen", LevelFilter::Off)
+        .filter_module("swc_ecma_transforms_base", LevelFilter::Off)
+        .try_init()
+        .map_err(Into::into)
 }

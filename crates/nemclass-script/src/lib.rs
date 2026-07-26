@@ -37,6 +37,7 @@
 //! bus.register(Box::new(EngineSubscriber::new(engine))); // joins the bus
 //! ```
 
+pub mod api_catalog;
 pub mod bus;
 pub mod engine;
 pub mod events;
@@ -47,6 +48,7 @@ pub mod scaffold;
 #[cfg(feature = "scripting")]
 pub mod engine_rusty;
 
+pub use api_catalog::{host_method_names, HostMethod, HOST_METHODS};
 pub use bus::{EventBus, Subscriber};
 pub use engine::{EngineSubscriber, HostFn, NoopEngine, ScriptEngine};
 pub use events::{ClassAddressQuery, CustomPayload, Event, GlobalVariable};
@@ -54,7 +56,7 @@ pub use host_api::{
     PatternError, PatternScan, TypeDeclare, find_pattern, scan_module, try_find_pattern,
 };
 pub use plugin::{Plugin, PluginHost, PluginRegistry, register_builtin_plugins};
-pub use scaffold::{write_script_scaffold, EVENT_KINDS};
+pub use scaffold::{write_dts, write_script_scaffold, EVENT_KINDS};
 
 #[cfg(feature = "scripting")]
 pub use engine_rusty::{HostApi, HostRequest, LogLevel, RustyScriptEngine};

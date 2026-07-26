@@ -226,6 +226,126 @@ fn get_static_instruction_bytes(instruction: &Instruction) -> i32 {
 /// `virtual_address`: The base address where this code conceptually lives in memory.
 /// `determine_static_bytes`: Whether to calculate static vs dynamic byte length.
 /// `callback`: A closure called for each instruction. If it returns `false`, disassembly stops.
+/// Decode instructions from `code` (starting at `virtual_address`) covering at
+/// least `min_len` bytes, returning a per-byte "wildcard" mask: `true` where the
+/// byte is part of a displacement or immediate operand (i.e. it varies with
+/// relocation / base) and `false` for opcode/modrm/prefix bytes.
+///
+/// This is the basis for robust AOB signature generation: wildcarding the
+/// operand bytes yields a pattern that survives a rebased image, where an
+/// exact-byte signature would break. The returned mask length is the sum of the
+/// decoded instruction lengths (≥ `min_len`, or shorter if the code runs out /
+/// an invalid instruction is hit).
+pub fn operand_wildcard_mask(code: &[u8], virtual_address: u64, min_len: usize) -> Vec<bool> {
+    let bitness = if cfg!(target_pointer_width = "64") { 64 } else { 32 };
+    let mut decoder = Decoder::with_ip(bitness, code, virtual_address, DecoderOptions::NONE);
+    let mut mask: Vec<bool> = Vec::new();
+    let mut instruction = Instruction::default();
+
+    while decoder.can_decode() && mask.len() < min_len {
+        decoder.decode_out(&mut instruction);
+        let len = instruction.len();
+        if instruction.is_invalid() && len == 0 {
+            break;
+        }
+        let co = decoder.get_constant_offsets(&instruction);
+        let mut instr_mask = vec![false; len];
+        let mut wildcard = |off: usize, size: usize| {
+            for b in instr_mask.iter_mut().skip(off).take(size) {
+                *b = true;
+            }
+        };
+        if co.has_displacement() {
+            wildcard(co.displacement_offset(), co.displacement_size());
+        }
+        if co.has_immediate() {
+            wildcard(co.immediate_offset(), co.immediate_size());
+        }
+        if co.has_immediate2() {
+            wildcard(co.immediate_offset2(), co.immediate_size2());
+        }
+        mask.extend(instr_mask);
+    }
+    mask
+}
+
+/// Generate a **robust** AOB signature for the code at `offset` in `haystack` (a
+/// module image), wildcarding operand bytes via [`operand_wildcard_mask`] so the
+/// signature survives a rebased image. Returns an IDA-style string with `??` for
+/// wildcarded bytes (e.g. `"48 8B 05 ?? ?? ?? ?? C3"`) that is unique within
+/// `haystack`, or `None` if no unique masked run exists within `max_len`.
+///
+/// Uniqueness is found by candidate narrowing seeded on the (exact) opcode byte,
+/// so it stays close to O(n) rather than O(n·len²).
+pub fn make_masked_signature(
+    haystack: &[u8],
+    offset: usize,
+    min_len: usize,
+    max_len: usize,
+) -> Option<String> {
+    if offset >= haystack.len() {
+        return None;
+    }
+    let max_len = max_len.min(haystack.len() - offset);
+    let full_mask = operand_wildcard_mask(&haystack[offset..], offset as u64, max_len);
+    if full_mask.is_empty() {
+        return None;
+    }
+    let span = full_mask.len();
+    let needle = &haystack[offset..offset + span];
+    let last_start = haystack.len() - span;
+
+    // Seed on the first byte when it's exact (an opcode/prefix — almost always).
+    let mut candidates: Vec<usize> = if full_mask[0] {
+        (0..=last_start).collect()
+    } else {
+        let b0 = needle[0];
+        (0..=last_start).filter(|&p| haystack[p] == b0).collect()
+    };
+
+    let mut len = 1usize;
+    loop {
+        let i = len - 1;
+        if !full_mask[i] {
+            let bi = needle[i];
+            candidates.retain(|&p| haystack[p + i] == bi);
+        }
+        let unique = candidates.len() == 1 && candidates[0] == offset;
+        if unique && len >= min_len {
+            return Some(format_masked(&needle[..len], &full_mask[..len]));
+        }
+        if len >= span {
+            return unique.then(|| format_masked(&needle[..len], &full_mask[..len]));
+        }
+        len += 1;
+    }
+}
+
+/// Scan `code` (mapped at `virtual_address`) for instructions whose direct
+/// branch target or RIP-relative memory target equals `target`, returning the
+/// addresses of those instructions. This is the basis for "find references to
+/// this address / function" — call it over a module's executable regions.
+pub fn find_code_refs(code: &[u8], virtual_address: u64, target: u64) -> Vec<u64> {
+    let mut refs = Vec::new();
+    disassemble_instructions(code, virtual_address, false, |ins| {
+        if ins.target == Some(target) || ins.mem_target == Some(target) {
+            refs.push(ins.address);
+        }
+        true // keep scanning the whole range
+    });
+    refs
+}
+
+/// Format a byte slice as an IDA hex signature, emitting `??` where `mask[i]`.
+fn format_masked(bytes: &[u8], mask: &[bool]) -> String {
+    bytes
+        .iter()
+        .zip(mask)
+        .map(|(&b, &m)| if m { "??".to_string() } else { format!("{b:02X}") })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn disassemble_instructions<F>(
     code: &[u8],
     virtual_address: u64,
@@ -333,6 +453,56 @@ mod tests {
             false // stop after the first instruction
         });
         out.expect("expected one decoded instruction")
+    }
+
+    #[test]
+    fn find_code_refs_locates_a_call_to_target() {
+        // At VA (0x1000): `call rel32` where rel32 = 0x2000 - (0x1000+5) = 0xFFB,
+        // so the call targets 0x2000. Pad with NOPs that reference nothing.
+        let code = [
+            0xE8, 0xFB, 0x0F, 0x00, 0x00, // call 0x2000
+            0x90, 0x90, 0x90, // nops
+        ];
+        let refs = find_code_refs(&code, VA, 0x2000);
+        assert_eq!(refs, vec![VA]);
+        // No references to an unrelated address.
+        assert!(find_code_refs(&code, VA, 0xDEAD).is_empty());
+    }
+
+    #[test]
+    fn operand_wildcard_mask_flags_displacement() {
+        // 48 8B 05 <disp32> = mov rax, [rip+disp32] (7 bytes). The 4 displacement
+        // bytes (offset 3..7) must be wildcarded; the opcode/modrm must not.
+        let code = [0x48, 0x8B, 0x05, 0xDE, 0xAD, 0xBE, 0xEF];
+        let mask = operand_wildcard_mask(&code, VA, code.len());
+        assert_eq!(mask, vec![false, false, false, true, true, true, true]);
+    }
+
+    #[test]
+    fn masked_signature_wildcards_call_rel32() {
+        // The most common signature target: a call site. The rel32 (an immediate)
+        // must be wildcarded so the signature survives a rebased image.
+        let mut buf = vec![0u8; 128];
+        let instr = [0xE8, 0x11, 0x22, 0x33, 0x44, 0xC3]; // call rel32; ret
+        buf[50..50 + instr.len()].copy_from_slice(&instr);
+        let sig = make_masked_signature(&buf, 50, 6, 32).expect("signature");
+        assert!(sig.starts_with("E8 ?? ?? ?? ??"), "sig = {sig}");
+    }
+
+    #[test]
+    fn make_masked_signature_wildcards_operands_and_is_unique() {
+        // Build a haystack: the rip-relative mov (with a distinctive opcode run)
+        // followed by a ret, embedded in zero padding so it's locally unique.
+        let mut buf = vec![0u8; 128];
+        let instr = [0x48, 0x8B, 0x05, 0x11, 0x22, 0x33, 0x44, 0xC3];
+        buf[40..40 + instr.len()].copy_from_slice(&instr);
+
+        // min_len 8 forces the full mov+ret so the displacement masking shows.
+        let sig = make_masked_signature(&buf, 40, 8, 32).expect("signature");
+        // The displacement bytes must be wildcards; the opcode bytes exact.
+        assert!(sig.starts_with("48 8B 05 ?? ?? ?? ??"), "sig = {sig}");
+        // And it must not contain the literal displacement bytes.
+        assert!(!sig.contains("11 22 33 44"), "operands should be masked: {sig}");
     }
 
     #[test]

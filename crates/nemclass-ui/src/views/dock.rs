@@ -38,6 +38,10 @@ pub enum TabKind {
     Debugger,
     /// JS scripting console.
     Scripts,
+    /// Pointer-chain scanner (ASLR-stable path finder).
+    PointerScan,
+    /// Cheat-Engine-style saved address list with freeze.
+    CheatTable,
 }
 
 impl TabKind {
@@ -51,11 +55,13 @@ impl TabKind {
             TabKind::Scanner => "Scanner",
             TabKind::Debugger => "Debugger",
             TabKind::Scripts => "Scripts",
+            TabKind::PointerScan => "Pointer scan",
+            TabKind::CheatTable => "Cheat table",
         }
     }
 
     /// Every tab kind, for building the "View" menu that re-opens closed panels.
-    pub const ALL: [TabKind; 7] = [
+    pub const ALL: [TabKind; 9] = [
         TabKind::ClassView,
         TabKind::Navigator,
         TabKind::Memory,
@@ -63,6 +69,8 @@ impl TabKind {
         TabKind::Scanner,
         TabKind::Debugger,
         TabKind::Scripts,
+        TabKind::PointerScan,
+        TabKind::CheatTable,
     ];
 }
 
@@ -79,11 +87,11 @@ pub fn default_layout() -> DockState<TabKind> {
     let [_left, right_top] = surface.split_right(NodeIndex::root(), 0.45, vec![TabKind::Memory]);
     let [_mem, disasm] = surface.split_below(right_top, 0.5, vec![TabKind::Disassembly]);
 
-    // Below the disassembler: scanner + debugger + scripts share a tab group.
+    // Below the disassembler: scanner + pointer scan + cheat table + debugger + scripts share a tab group.
     surface.split_below(
         disasm,
         0.6,
-        vec![TabKind::Scanner, TabKind::Debugger, TabKind::Scripts],
+        vec![TabKind::Scanner, TabKind::PointerScan, TabKind::CheatTable, TabKind::Debugger, TabKind::Scripts],
     );
 
     state
@@ -111,6 +119,8 @@ impl TabViewer for DockViewer<'_> {
             TabKind::Scanner => self.app.show_scanner_tab(ui),
             TabKind::Debugger => self.app.show_debugger_tab(ui),
             TabKind::Scripts => self.app.show_scripts_tab(ui),
+            TabKind::PointerScan => self.app.show_pointer_scan_tab(ui),
+            TabKind::CheatTable => self.app.show_cheat_table_tab(ui),
         }
     }
 

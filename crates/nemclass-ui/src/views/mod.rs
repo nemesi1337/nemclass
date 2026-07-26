@@ -27,6 +27,8 @@ mod script_host;
 mod script_log;
 mod scripts_panel;
 mod host_api_impl;
+mod pointer_scan_panel;
+pub(crate) mod cheat_table_panel;
 
 pub use scanner_panel::ScannerPanel;
 pub use debugger_panel::DebuggerPanel;
@@ -36,6 +38,8 @@ pub use disassembly::DisassemblyPanel;
 use script_host::ScriptHost;
 use script_log::{LogKind, ScriptLog, new_script_log};
 use scripts_panel::{ScriptsPanel, ScriptsPanelAction};
+use pointer_scan_panel::{PointerScanPanel, PointerScanAction};
+use cheat_table_panel::{CheatTablePanel, CheatTablePanelAction};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -268,6 +272,10 @@ pub struct NemclassApp {
     class_base: Option<usize>,
     mem_buf: Vec<u8>,
     last_snapshot: Option<Instant>,
+    /// Last time an `OnTick` script event fired (throttled to the snapshot
+    /// interval). Only meaningful under the `scripting` feature.
+    #[cfg(feature = "scripting")]
+    last_tick: Option<Instant>,
     snapshot_interval: Duration,
     collapsed: HashSet<String>,
     expanded_ptrs: HashSet<String>,
@@ -304,6 +312,27 @@ pub struct NemclassApp {
     script_log: ScriptLog,
     /// Transient UI state for the Scripts tab.
     scripts_panel: ScriptsPanel,
+    /// Script-registered global hotkeys, polled each frame in `logic`. A match
+    /// fires `Event::OnHotkey { id }` into the engine.
+    #[cfg(feature = "scripting")]
+    script_hotkeys: Vec<HotkeyReg>,
+    /// Monotonic id counter for `hotkeys.register`.
+    #[cfg(feature = "scripting")]
+    next_hotkey_id: u32,
+    /// Direct script freezes (not tied to the cheat table): `(addr, type, value
+    /// text)`. Applied on the throttled freeze tick in `logic`.
+    #[cfg(feature = "scripting")]
+    script_freezes: Vec<(usize, nemclass_scan::ScanValueType, String)>,
+    /// Cheat-Engine-style iterative scan session driven by the JS
+    /// `scan.first`/`scan.next`/`scan.results`/`scan.reset` API. Holds the live
+    /// `Scanner` between calls so a script can narrow a result set over time.
+    /// Reset to `None` on detach and project change.
+    #[cfg(all(feature = "scripting", target_os = "linux"))]
+    script_scanner: Option<nemclass_scan::Scanner<nemclass_scan::ProcessTarget>>,
+    /// Throttle clock for [`Self::tick_script_freezes`] (mirrors the cheat
+    /// table's own freeze cadence).
+    #[cfg(all(feature = "scripting", target_os = "linux"))]
+    last_script_freeze: Option<Instant>,
     /// A class base address supplied by a script resolver via the "Try resolve
     /// (script)" button. When set, it takes precedence over the address formula
     /// in `take_snapshot`; cleared on detach or when the formula is edited.
@@ -340,6 +369,15 @@ pub struct NemclassApp {
     // Disassembly panel
     disassembly_panel: DisassemblyPanel,
 
+    // Pointer-scan panel
+    pointer_scan_panel: PointerScanPanel,
+    /// Deferred action from the pointer-scan panel; applied after the dock draw
+    /// to avoid borrow conflicts with `self.project` / `self.selected_class`.
+    pending_pointer_scan_action: Option<PointerScanAction>,
+
+    // Cheat table panel
+    cheat_table_panel: CheatTablePanel,
+
     // Navigator side panel (strings / functions / calls)
     navigator_panel: navigator::NavigatorPanel,
 
@@ -349,6 +387,54 @@ pub struct NemclassApp {
     settings_dirty: bool,
     /// Last time settings were written, for debouncing.
     last_settings_save: Option<Instant>,
+}
+
+/// A script-registered global hotkey: an id (returned to JS) plus the parsed
+/// modifier set and trigger key. Polled each frame in `logic`; a match fires
+/// `Event::OnHotkey { id }`. Only compiled under the `scripting` feature.
+#[cfg(feature = "scripting")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotkeyReg {
+    /// Registration id handed back to the script.
+    pub id: u32,
+    /// Whether Ctrl must be held.
+    pub ctrl: bool,
+    /// Whether Shift must be held.
+    pub shift: bool,
+    /// Whether Alt must be held.
+    pub alt: bool,
+    /// The trigger key.
+    pub key: egui::Key,
+}
+
+/// Parse a CE-style hotkey combo string like `"Ctrl+Shift+H"`, `"F6"`, or
+/// `"Alt+K"` into `(ctrl, shift, alt, key)`. Segments are split on `+`,
+/// case-insensitively; `Ctrl`/`Control`, `Shift`, and `Alt`/`Option` are
+/// modifiers and everything else must be exactly one egui-nameable key. Returns
+/// `None` for empty input, an unknown key, or more than one non-modifier token.
+#[cfg(feature = "scripting")]
+pub fn parse_hotkey(combo: &str) -> Option<(bool, bool, bool, egui::Key)> {
+    let (mut ctrl, mut shift, mut alt) = (false, false, false);
+    let mut key: Option<egui::Key> = None;
+    for raw in combo.split('+') {
+        let seg = raw.trim();
+        if seg.is_empty() {
+            return None;
+        }
+        match seg.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "shift" => shift = true,
+            "alt" | "option" => alt = true,
+            _ => {
+                if key.is_some() {
+                    return None; // more than one non-modifier key
+                }
+                key = egui::Key::from_name(seg);
+                key?; // unknown key name
+            }
+        }
+    }
+    key.map(|k| (ctrl, shift, alt, k))
 }
 
 impl NemclassApp {
@@ -402,7 +488,7 @@ impl NemclassApp {
         let (script_host, script_spawn_msg) = ScriptHost::spawn();
         let script_log = new_script_log();
 
-        Self {
+        let mut app = Self {
             registry,
             backend_names,
             selected_backend,
@@ -422,6 +508,8 @@ impl NemclassApp {
             class_base: None,
             mem_buf: Vec::new(),
             last_snapshot: None,
+            #[cfg(feature = "scripting")]
+            last_tick: None,
             snapshot_interval: Duration::from_millis(settings.live_interval_ms.unwrap_or(100)),
             collapsed: HashSet::new(),
             expanded_ptrs: HashSet::new(),
@@ -437,6 +525,16 @@ impl NemclassApp {
             script_host,
             script_log,
             scripts_panel: ScriptsPanel::new(),
+            #[cfg(feature = "scripting")]
+            script_hotkeys: Vec::new(),
+            #[cfg(feature = "scripting")]
+            next_hotkey_id: 1,
+            #[cfg(feature = "scripting")]
+            script_freezes: Vec::new(),
+            #[cfg(all(feature = "scripting", target_os = "linux"))]
+            script_scanner: None,
+            #[cfg(all(feature = "scripting", target_os = "linux"))]
+            last_script_freeze: None,
             script_resolved_base: None,
             pending_follow_pointer: None,
             pending_node_edits: Vec::new(),
@@ -452,13 +550,43 @@ impl NemclassApp {
             debugger_panel: DebuggerPanel::with_key(kernel_key),
             memory_viewer: MemoryViewer::new(),
             disassembly_panel: DisassemblyPanel::new(),
+            pointer_scan_panel: PointerScanPanel::new(),
+            pending_pointer_scan_action: None,
+            cheat_table_panel: CheatTablePanel::new(),
             navigator_panel: navigator::NavigatorPanel::new(),
             settings,
             settings_dirty: false,
             // Start the heartbeat clock now so dock-layout drags get persisted on
             // the ~30s cadence even without an explicit dirty flag.
             last_settings_save: Some(Instant::now()),
+        };
+
+        // Auto-load the auto-reopened project's scripts at launch so their
+        // lifecycle handlers (OnAttach, OnTick, hotkeys, …) get registered. The
+        // File > Open path does this in `replace_project`; startup goes through
+        // `new()`, which previously skipped it — so nothing fired until the user
+        // manually clicked Reload in the Scripts panel.
+        if let Some(dir) = app.project_dir.clone() {
+            let src = dir.join("src");
+            match app.script_host.load_scripts(&src) {
+                Ok(()) if app.script_host.is_active() => script_log::push(
+                    &app.script_log,
+                    LogKind::Lifecycle,
+                    format!("Loaded scripts from {}", src.display()),
+                ),
+                Ok(()) => {}
+                Err(e) => script_log::push(
+                    &app.script_log,
+                    LogKind::Error,
+                    format!("load scripts: {e}"),
+                ),
+            }
+            // Fire OnProjectLoad AFTER load so handlers registered during load
+            // can catch it (the worker processes the commands in order).
+            app.emit(Event::OnProjectLoad { path: dir.display().to_string() });
         }
+
+        app
     }
 
     /// Marks settings as needing a save; the debounced writer in `logic` picks
@@ -674,6 +802,13 @@ impl NemclassApp {
             self.debugger_panel.on_detach();
             self.memory_viewer.on_detach();
             self.disassembly_panel.on_detach();
+            self.pointer_scan_panel.on_detach();
+            self.cheat_table_panel.on_detach();
+            // The script scan session is bound to the detached process; drop it.
+            #[cfg(all(feature = "scripting", target_os = "linux"))]
+            {
+                self.script_scanner = None;
+            }
         }
     }
 
@@ -685,6 +820,74 @@ impl NemclassApp {
         // A script-resolved base is tied to the previous attach/class; drop it so
         // it doesn't leak across detach or project changes.
         self.script_resolved_base = None;
+    }
+
+    /// Applies a deferred `ui.*` action queued by a script during host-request
+    /// pumping. Kept out of `UiHostApi` because it touches panel state the
+    /// transient host struct does not borrow. Goto actions no-op the panel move
+    /// on non-Linux (mirroring the rest of the memory/disasm UI).
+    #[cfg(feature = "scripting")]
+    fn apply_ui_action(&mut self, action: host_api_impl::UiAction) {
+        match action {
+            host_api_impl::UiAction::GotoMemory(addr) => {
+                self.pending_focus = Some(TabKind::Memory);
+                self.memory_viewer.goto(addr);
+            }
+            host_api_impl::UiAction::GotoDisasm(addr) => {
+                self.pending_focus = Some(TabKind::Disassembly);
+                self.disassembly_panel.goto(addr);
+            }
+            host_api_impl::UiAction::SelectClass(uuid) => {
+                if self.project.get_class(&uuid).is_some() {
+                    self.selected_class = Some(uuid);
+                    self.clear_memory_state();
+                    self.pending_focus = Some(TabKind::ClassView);
+                }
+            }
+            host_api_impl::UiAction::SaveTable(name) => {
+                self.apply_cheat_table_action(CheatTablePanelAction::Save(name));
+            }
+            host_api_impl::UiAction::LoadTable(name) => {
+                self.apply_cheat_table_action(CheatTablePanelAction::Load(name));
+            }
+        }
+    }
+
+    /// Apply direct script freezes (`mem.freeze`), throttled to the same cadence
+    /// as the cheat table's freeze tick. Each freeze parses its value text with
+    /// its type into little-endian bytes and pins it via a `ProcessTarget`.
+    /// Derived from `script_freezes` every tick so edits take effect immediately
+    /// and no stale byte-cache can revert a change.
+    #[cfg(all(feature = "scripting", target_os = "linux"))]
+    fn tick_script_freezes(&mut self) {
+        const INTERVAL: Duration = Duration::from_millis(200);
+        if self.script_freezes.is_empty() {
+            return;
+        }
+        let due = self
+            .last_script_freeze
+            .map(|t| t.elapsed() >= INTERVAL)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_script_freeze = Some(Instant::now());
+
+        let Some(pid) = self.process.as_ref().map(|p| p.pid()) else {
+            return;
+        };
+        let mut set = nemclass_scan::FreezeSet::new();
+        for (addr, vt, text) in &self.script_freezes {
+            if let Some(bytes) = cheat_table_panel::value_text_to_bytes(*vt, text) {
+                set.set(*addr, bytes);
+            }
+        }
+        if set.is_empty() {
+            return;
+        }
+        if let Ok(target) = nemclass_scan::ProcessTarget::attach(pid) {
+            let _ = set.apply(&target);
+        }
     }
 
     /// Publishes a lifecycle event to BOTH the compile-time plugin bus and the
@@ -709,6 +912,19 @@ impl NemclassApp {
         self.clear_memory_state();
         self.last_snapshot = None;
         self.collapsed.clear();
+
+        // Drop script-registered hotkeys/freezes from the previous project so
+        // handlers referencing stale ids don't fire against the new one.
+        #[cfg(feature = "scripting")]
+        {
+            self.script_hotkeys.clear();
+            self.next_hotkey_id = 1;
+            self.script_freezes.clear();
+            #[cfg(target_os = "linux")]
+            {
+                self.script_scanner = None;
+            }
+        }
 
         // Notify the scripting layer and auto-load the project's scripts.
         if let Some(dir) = self.project_dir.clone() {
@@ -1179,28 +1395,103 @@ impl eframe::App for NemclassApp {
             self.take_snapshot();
         }
 
+        // Emit a lightweight OnTick to scripts once per snapshot interval, so
+        // scripts can poll/freeze without a timer of their own. Independent of
+        // `selected_class` (which gates the class-view snapshot above).
+        #[cfg(feature = "scripting")]
+        {
+            let due = self
+                .last_tick
+                .map(|t| t.elapsed() >= self.snapshot_interval)
+                .unwrap_or(true);
+            if due && self.script_host.is_active() {
+                self.last_tick = Some(Instant::now());
+                let pid = self.process.as_ref().map(|p| p.pid());
+                self.script_host
+                    .on_event(&Event::OnTick { pid });
+            }
+
+            // Poll script-registered global hotkeys. For each match this frame,
+            // dispatch `OnHotkey { id }` into the engine. Collect ids first so we
+            // don't hold the `ctx.input` closure while borrowing `script_host`.
+            if !self.script_hotkeys.is_empty() && self.script_host.is_active() {
+                let fired: Vec<u32> = ctx.input(|i| {
+                    self.script_hotkeys
+                        .iter()
+                        .filter(|h| {
+                            i.key_pressed(h.key)
+                                && i.modifiers.ctrl == h.ctrl
+                                && i.modifiers.shift == h.shift
+                                && i.modifiers.alt == h.alt
+                        })
+                        .map(|h| h.id)
+                        .collect()
+                });
+                for id in fired {
+                    self.script_host.on_event(&Event::OnHotkey { id });
+                }
+            }
+        }
+
         // Drive scanner freeze write-back and debugger event polling.
         self.scanner_panel.tick_freeze();
         self.debugger_panel.tick_events();
+        #[cfg(target_os = "linux")]
+        self.cheat_table_panel.tick_freeze(
+            self.process.as_ref(),
+            self.process.as_ref().map(|p| p.pid()),
+        );
+        #[cfg(all(feature = "scripting", target_os = "linux"))]
+        self.tick_script_freezes();
 
         // Service host-API requests raised by worker-thread JS. Build a transient
         // `UiHostApi` from disjoint field borrows (never `&mut self`) so the
         // borrow checker is satisfied while the engine mutates the project/log.
         #[cfg(feature = "scripting")]
         {
-            let mut host = host_api_impl::UiHostApi {
-                project: &mut self.project,
-                process: self.process.as_ref(),
-                log: self.script_log.clone(),
-                last_error: &mut self.last_error,
-            };
-            self.script_host.pump(&mut host);
+            let mut ui_actions: Vec<host_api_impl::UiAction> = Vec::new();
+            {
+                let mut host = host_api_impl::UiHostApi {
+                    project: &mut self.project,
+                    node_registry: &self.node_registry,
+                    process: self.process.as_ref(),
+                    log: self.script_log.clone(),
+                    last_error: &mut self.last_error,
+                    ui_actions: &mut ui_actions,
+                    cheat_table: self.cheat_table_panel.table_mut(),
+                    script_hotkeys: &mut self.script_hotkeys,
+                    next_hotkey_id: &mut self.next_hotkey_id,
+                    script_freezes: &mut self.script_freezes,
+                    #[cfg(target_os = "linux")]
+                    script_scanner: &mut self.script_scanner,
+                };
+                self.script_host.pump(&mut host);
+            }
+            // Apply the `ui.*` actions the scripts queued (needs panel state the
+            // transient `UiHostApi` deliberately does not borrow).
+            for action in ui_actions {
+                self.apply_ui_action(action);
+            }
         }
 
         // Keep repainting while attached OR while a live engine is running (so
         // pending host-API requests drain even when not attached).
         if self.process.is_some() || self.script_host.is_active() {
             ctx.request_repaint_after(self.snapshot_interval);
+        }
+
+        // ── Ctrl+F: toggle freeze on all cheat-table entries ─────────────
+        let freeze_hotkey = ctx.input(|i| {
+            i.key_pressed(egui::Key::F) && i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt
+        });
+        if freeze_hotkey {
+            let process = self.process.as_ref();
+            let now_frozen = self.cheat_table_panel.toggle_freeze_all(process);
+            self.cheat_table_panel.status_msg = Some(if now_frozen {
+                "All entries frozen (Ctrl+F to unfreeze)".to_owned()
+            } else {
+                "All entries unfrozen".to_owned()
+            });
         }
 
         // Persist settings (debounced on change, ~30s heartbeat for layout).
@@ -1690,6 +1981,12 @@ impl NemclassApp {
         }
 
         self.dock_state = Some(dock);
+
+        // Apply any deferred pointer-scan action (collected during the tab draw
+        // to avoid borrow conflicts with `self.project` / `self.selected_class`).
+        if let Some(action) = self.pending_pointer_scan_action.take() {
+            self.apply_pointer_scan_action(action);
+        }
     }
 
     /// The "View" menu: re-open any dock tab that was closed (adds it to the
@@ -1726,7 +2023,12 @@ impl NemclassApp {
     /// The "Scripts" tab: engine status, script-file list, host functions, and
     /// the shared log. Applies the panel's returned action after the draw.
     fn show_scripts_tab(&mut self, ui: &mut egui::Ui) {
-        const HOST_FNS: &[&str] = &["pattern_scan", "declare_class", "declare_type", "log"];
+        // The legacy named host functions plus every catalog-driven namespaced
+        // method (`mem.readU32`, ...), so the panel reference stays in lock-step
+        // with the actual API surface.
+        let mut host_fns: Vec<&str> = vec!["pattern_scan", "declare_class", "declare_type", "log"];
+        host_fns.extend(nemclass_script::host_method_names());
+        let host_fns_ref: &[&str] = &host_fns;
 
         let scripts_dir = self.project_dir.as_ref().map(|d| d.join("src"));
         let engine_active = self.script_host.is_active();
@@ -1743,7 +2045,7 @@ impl NemclassApp {
             scripts_dir.as_deref(),
             engine_active,
             &status,
-            HOST_FNS,
+            host_fns_ref,
             &self.script_log,
         );
 
@@ -1799,29 +2101,157 @@ impl NemclassApp {
         let pid: Option<nemclass_core::Pid> = None;
 
         let process_ref = self.process.as_ref();
-        let selected_class = self.selected_class;
-        let project = &mut self.project;
+
+        let mut add_to_class_addr: Option<usize> = None;
+        let mut add_to_table: Option<(usize, String)> = None;
+        let mut ptr_scan_addr: Option<usize> = None;
 
         self.scanner_panel.show(
             ui,
             process_ref,
             pid,
-            |addr| {
-                // "Add to class" callback: append a Hex64 address node to the
-                // currently-selected class (or the first class in the project).
-                use nemclass_model::node::builtins::Hex64Node;
-                let uuid = selected_class
-                    .or_else(|| project.classes_in_order().next().map(|c| c.uuid));
-                if let Some(uuid) = uuid
-                    && let Some(class) = project.get_class_mut(&uuid)
-                {
-                    let label = format!("scan_{addr:#x}");
-                    let mut node = Hex64Node::new(&label);
-                    node.comment = format!("Scanner result 0x{addr:016X}");
-                    class.children.push(Box::new(node));
-                }
-            },
+            |addr| { add_to_class_addr = Some(addr); },
+            |addr, tag| { add_to_table = Some((addr, tag.to_owned())); },
+            |addr| { ptr_scan_addr = Some(addr); },
         );
+
+        // Apply deferred callbacks (all need self borrows unavailable inside the closure).
+        if let Some(addr) = add_to_class_addr {
+            // "Add to class": append a Hex64 address node to the currently-selected
+            // class (or the first class in the project).
+            use nemclass_model::node::builtins::Hex64Node;
+            let selected_class = self.selected_class;
+            let uuid = selected_class
+                .or_else(|| self.project.classes_in_order().next().map(|c| c.uuid));
+            if let Some(uuid) = uuid
+                && let Some(class) = self.project.get_class_mut(&uuid)
+            {
+                let label = format!("scan_{addr:#x}");
+                let mut node = Hex64Node::new(&label);
+                node.comment = format!("Scanner result 0x{addr:016X}");
+                class.children.push(Box::new(node));
+            }
+        }
+        if let Some((addr, tag)) = add_to_table {
+            self.cheat_table_panel.table_mut().push(nemclass_model::CheatEntry {
+                description: format!("0x{addr:X}"),
+                address: format!("0x{addr:X}"),
+                value_type: tag,
+                frozen: false,
+                frozen_value: String::new(),
+                group: String::new(),
+            });
+        }
+        if let Some(addr) = ptr_scan_addr {
+            self.pointer_scan_panel.set_goal(addr);
+            self.pending_focus = Some(TabKind::PointerScan);
+        }
+    }
+
+    fn show_pointer_scan_tab(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_os = "linux")]
+        let pid: Option<nemclass_core::Pid> = self.process.as_ref().map(|p| p.pid());
+        #[cfg(not(target_os = "linux"))]
+        let pid: Option<nemclass_core::Pid> = None;
+
+        let modules: Vec<nemclass_core::ModuleInfoWithName> = self
+            .process
+            .as_ref()
+            .and_then(|p| p.modules().ok())
+            .map(|it| it.collect())
+            .unwrap_or_default();
+
+        let action = self.pointer_scan_panel.show(
+            ui,
+            self.process.as_ref(),
+            pid,
+            &modules,
+        );
+
+        // Stash the action for application after the dock draw closes all borrows.
+        match action {
+            PointerScanAction::None => {}
+            other => { self.pending_pointer_scan_action = Some(other); }
+        }
+    }
+
+    /// Apply a [`PointerScanAction`] deferred from the pointer-scan tab draw.
+    fn apply_pointer_scan_action(&mut self, action: PointerScanAction) {
+        match action {
+            PointerScanAction::None => {}
+            PointerScanAction::CreateClass { name, formula } => {
+                let mut cls = blank_class(&self.project);
+                if !name.is_empty() {
+                    cls.name = name;
+                }
+                cls.address_formula = formula;
+                let uuid = cls.uuid;
+                self.project.add_class(cls);
+                self.selected_class = Some(uuid);
+                self.clear_memory_state();
+                self.last_snapshot = None;
+            }
+            PointerScanAction::Goto(addr) => {
+                self.pending_focus = Some(TabKind::Memory);
+                #[cfg(target_os = "linux")]
+                self.memory_viewer.goto(addr);
+                #[cfg(not(target_os = "linux"))]
+                let _ = addr;
+            }
+        }
+    }
+
+    pub(crate) fn show_cheat_table_tab(&mut self, ui: &mut egui::Ui) {
+        let process = self.process.as_ref();
+        #[cfg(target_os = "linux")]
+        let pid: Option<nemclass_core::Pid> = self.process.as_ref().map(|p| p.pid());
+        #[cfg(not(target_os = "linux"))]
+        let pid: Option<nemclass_core::Pid> = None;
+        let project_dir = self.project_dir.as_deref();
+        let action = self.cheat_table_panel.show(ui, process, pid, project_dir);
+        self.apply_cheat_table_action(action);
+    }
+
+    fn apply_cheat_table_action(&mut self, action: CheatTablePanelAction) {
+        match action {
+            CheatTablePanelAction::None => {}
+            CheatTablePanelAction::Save(name) => {
+                if let Some(dir) = &self.project_dir {
+                    let tables_dir = dir.join("tables");
+                    let _ = std::fs::create_dir_all(&tables_dir);
+                    let path = tables_dir.join(format!("{name}.toml"));
+                    match self.cheat_table_panel.table_mut().to_toml() {
+                        Ok(s) => { let _ = std::fs::write(&path, s); }
+                        Err(e) => {
+                            self.cheat_table_panel.status_msg =
+                                Some(format!("Save failed: {e}"));
+                        }
+                    }
+                }
+            }
+            CheatTablePanelAction::Load(name) => {
+                if let Some(dir) = &self.project_dir {
+                    let path = dir.join("tables").join(format!("{name}.toml"));
+                    match std::fs::read_to_string(&path) {
+                        Ok(s) => match nemclass_model::CheatTable::from_toml(&s) {
+                            Ok(t) => { self.cheat_table_panel.set_table(t); }
+                            Err(e) => {
+                                self.cheat_table_panel.status_msg =
+                                    Some(format!("Parse error: {e}"));
+                            }
+                        },
+                        Err(e) => {
+                            self.cheat_table_panel.status_msg =
+                                Some(format!("Load failed: {e}"));
+                        }
+                    }
+                }
+            }
+            CheatTablePanelAction::GotoAddr(addr) => {
+                self.memory_viewer.goto(addr);
+                self.pending_focus = Some(TabKind::Memory);
+            }
+        }
     }
 
     fn show_debugger_tab(&mut self, ui: &mut egui::Ui) {
@@ -2601,6 +3031,16 @@ impl NemclassApp {
                 }
                 ui.close();
             }
+            if ui.add_enabled(
+                enabled,
+                egui::Button::new("Pointer-scan this address"),
+            ).clicked() {
+                if let Some(addr) = target_addr {
+                    self.pointer_scan_panel.set_goal(addr);
+                    self.pending_focus = Some(TabKind::PointerScan);
+                }
+                ui.close();
+            }
         }
     }
 
@@ -3295,6 +3735,44 @@ mod tests {
         let nodes = hex_fill(100);
         let sum: usize = nodes.iter().map(|n| n.memory_size()).sum();
         assert_eq!(sum, 100);
+    }
+
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn parse_hotkey_combos() {
+        use egui::Key;
+        assert_eq!(parse_hotkey("Ctrl+Shift+H"), Some((true, true, false, Key::H)));
+        assert_eq!(parse_hotkey("F6"), Some((false, false, false, Key::F6)));
+        assert_eq!(parse_hotkey("Alt+K"), Some((false, false, true, Key::K)));
+        // Case-insensitive modifiers + whitespace tolerance.
+        assert_eq!(parse_hotkey(" control + k "), Some((true, false, false, Key::K)));
+        // Bad input.
+        assert_eq!(parse_hotkey(""), None);
+        assert_eq!(parse_hotkey("Ctrl+"), None);
+        assert_eq!(parse_hotkey("Ctrl+Nonsense"), None);
+        assert_eq!(parse_hotkey("A+B"), None); // two non-modifier keys
+    }
+
+    #[test]
+    fn enums_round_trip_through_project() {
+        use nemclass_model::EnumDescription;
+        let mut project = Project::new("t");
+        let mut e = EnumDescription::new("Team");
+        e.size = 2;
+        e.use_flags = true;
+        e.values = vec![("Red".into(), 0), ("Blue".into(), 1)];
+        // Upsert by name (mirrors what `enums.define` does via declare_type).
+        project.enums.push(e.clone());
+        let got = project.enums.iter().find(|x| x.name == "Team").unwrap();
+        assert_eq!(got.size, 2);
+        assert!(got.use_flags);
+        assert_eq!(got.values, vec![("Red".to_string(), 0), ("Blue".to_string(), 1)]);
+        // Overwrite in place keeps a single entry.
+        if let Some(slot) = project.enums.iter_mut().find(|x| x.name == "Team") {
+            slot.values = vec![("Green".into(), 2)];
+        }
+        assert_eq!(project.enums.iter().filter(|x| x.name == "Team").count(), 1);
+        assert_eq!(project.enums[0].values, vec![("Green".to_string(), 2)]);
     }
 
     #[test]

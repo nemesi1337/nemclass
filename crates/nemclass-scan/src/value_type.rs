@@ -72,6 +72,50 @@ impl ScanValueType {
         matches!(self, Self::StringUtf8 | Self::StringUtf16)
     }
 
+    /// The canonical lowercase tag for this type — the stable string used by the
+    /// JS `scan.value` API and by [`crate::pointerscan`]/cheat-table persistence.
+    pub const fn as_tag(&self) -> &'static str {
+        match self {
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::Bytes => "bytes",
+            Self::StringUtf8 => "string_utf8",
+            Self::StringUtf16 => "string_utf16",
+        }
+    }
+
+    /// Parse a type tag (case-insensitive) back into a [`ScanValueType`].
+    ///
+    /// Accepts the canonical [`Self::as_tag`] forms plus common aliases
+    /// (`float`→`f32`, `double`→`f64`, `aob`→`bytes`, `string`→`string_utf8`).
+    /// Returns `None` for an unknown tag.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "i8" => Some(Self::I8),
+            "i16" => Some(Self::I16),
+            "i32" => Some(Self::I32),
+            "i64" => Some(Self::I64),
+            "u8" => Some(Self::U8),
+            "u16" => Some(Self::U16),
+            "u32" => Some(Self::U32),
+            "u64" => Some(Self::U64),
+            "f32" | "float" => Some(Self::F32),
+            "f64" | "double" => Some(Self::F64),
+            "bytes" | "aob" => Some(Self::Bytes),
+            "string_utf8" | "string" | "utf8" => Some(Self::StringUtf8),
+            "string_utf16" | "utf16" => Some(Self::StringUtf16),
+            _ => None,
+        }
+    }
+
     /// Parses a textual `input` into a [`Needle`] of this type.
     ///
     /// Integers accept decimal or `0x`-prefixed hex; floats accept the usual
@@ -416,5 +460,30 @@ fn parse_u128_radix(s: &str) -> Result<u128, NeedleParseError> {
         u128::from_str_radix(hex, 16).map_err(|_| NeedleParseError::Integer)
     } else {
         s.parse::<u128>().map_err(|_| NeedleParseError::Integer)
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::ScanValueType as T;
+
+    #[test]
+    fn tag_round_trips_all_variants() {
+        for ty in [
+            T::I8, T::I16, T::I32, T::I64, T::U8, T::U16, T::U32, T::U64,
+            T::F32, T::F64, T::Bytes, T::StringUtf8, T::StringUtf16,
+        ] {
+            assert_eq!(T::from_tag(ty.as_tag()), Some(ty), "round-trip {:?}", ty);
+        }
+    }
+
+    #[test]
+    fn from_tag_accepts_aliases_and_case() {
+        assert_eq!(T::from_tag("Float"), Some(T::F32));
+        assert_eq!(T::from_tag("DOUBLE"), Some(T::F64));
+        assert_eq!(T::from_tag("aob"), Some(T::Bytes));
+        assert_eq!(T::from_tag(" I32 "), Some(T::I32));
+        assert_eq!(T::from_tag("string"), Some(T::StringUtf8));
+        assert_eq!(T::from_tag("nonsense"), None);
     }
 }

@@ -46,7 +46,10 @@ pub use process::{
 
 // Disassembler wrapper (iced-x86) — consumed by the future scanner/host APIs.
 // `FlowKind` is the coarse control-flow class carried on each `InstructionData`.
-pub use decoder::{FlowKind, InstructionData, disassemble_instructions};
+pub use decoder::{
+    FlowKind, InstructionData, disassemble_instructions, find_code_refs,
+    make_masked_signature, operand_wildcard_mask,
+};
 
 // Memory-dissection analysis surface (M5.1). The `analysis` module tree stays
 // private; callers use these curated names. `disasm`'s live-process walk and the

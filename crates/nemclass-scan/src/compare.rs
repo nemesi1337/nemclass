@@ -60,6 +60,31 @@ impl ScanCompareType {
         )
     }
 
+    /// Parses a compare tag (case-insensitive) into a [`ScanCompareType`].
+    ///
+    /// Accepts the JS-API vocabulary used by `scan.first`/`scan.next` plus short
+    /// aliases: `"exact"|"eq"`, `"notEqual"|"ne"`, `"greater"|"gt"`,
+    /// `"less"|"lt"`, `"between"`, `"unknown"`, `"increased"|"inc"`,
+    /// `"increasedBy"`, `"decreased"|"dec"`, `"decreasedBy"`, `"changed"`,
+    /// `"unchanged"`. Returns `None` for an unknown tag.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "exact" | "eq" | "equal" => Some(Self::Exact),
+            "notequal" | "ne" => Some(Self::NotEqual),
+            "greater" | "gt" | "greaterthan" => Some(Self::GreaterThan),
+            "less" | "lt" | "lessthan" => Some(Self::LessThan),
+            "between" => Some(Self::Between),
+            "unknown" => Some(Self::Unknown),
+            "increased" | "inc" => Some(Self::Increased),
+            "increasedby" => Some(Self::IncreasedBy),
+            "decreased" | "dec" => Some(Self::Decreased),
+            "decreasedby" => Some(Self::DecreasedBy),
+            "changed" => Some(Self::Changed),
+            "unchanged" => Some(Self::Unchanged),
+            _ => None,
+        }
+    }
+
     /// Whether this comparison consults the needle at all. `Unknown` and the
     /// pure change-relative kinds (`Increased`, `Decreased`, `Changed`,
     /// `Unchanged`) ignore it; the delta kinds (`IncreasedBy`/`DecreasedBy`) and
@@ -73,5 +98,28 @@ impl ScanCompareType {
                 | Self::Changed
                 | Self::Unchanged
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScanCompareType;
+
+    #[test]
+    fn from_tag_round_trips_and_aliases() {
+        assert_eq!(ScanCompareType::from_tag("exact"), Some(ScanCompareType::Exact));
+        assert_eq!(ScanCompareType::from_tag("eq"), Some(ScanCompareType::Exact));
+        assert_eq!(ScanCompareType::from_tag("NE"), Some(ScanCompareType::NotEqual));
+        assert_eq!(ScanCompareType::from_tag("Greater"), Some(ScanCompareType::GreaterThan));
+        assert_eq!(ScanCompareType::from_tag("lt"), Some(ScanCompareType::LessThan));
+        assert_eq!(ScanCompareType::from_tag("between"), Some(ScanCompareType::Between));
+        assert_eq!(ScanCompareType::from_tag("unknown"), Some(ScanCompareType::Unknown));
+        assert_eq!(ScanCompareType::from_tag("increased"), Some(ScanCompareType::Increased));
+        assert_eq!(ScanCompareType::from_tag("increasedBy"), Some(ScanCompareType::IncreasedBy));
+        assert_eq!(ScanCompareType::from_tag("  DECREASED "), Some(ScanCompareType::Decreased));
+        assert_eq!(ScanCompareType::from_tag("decreasedby"), Some(ScanCompareType::DecreasedBy));
+        assert_eq!(ScanCompareType::from_tag("changed"), Some(ScanCompareType::Changed));
+        assert_eq!(ScanCompareType::from_tag("unchanged"), Some(ScanCompareType::Unchanged));
+        assert_eq!(ScanCompareType::from_tag("nonsense"), None);
     }
 }

@@ -132,6 +132,14 @@ pub struct DisassemblyPanel {
     /// When set, the table scrolls this row into view next frame.
     scroll_to_row: Option<usize>,
     pending_action: Option<DisasmAction>,
+
+    // ── signature generation ──────────────────────────────────────────────
+    /// Address for which a signature was requested; resolved after the draw.
+    #[cfg(target_os = "linux")]
+    pending_signature: Option<usize>,
+    /// Most recently computed signature: Ok(ida_hex) or Err(reason).
+    #[cfg(target_os = "linux")]
+    last_signature: Option<Result<String, String>>,
 }
 
 /// A cross-panel request from the disassembler's row context menu.
@@ -175,6 +183,10 @@ impl DisassemblyPanel {
             selected_row: None,
             scroll_to_row: None,
             pending_action: None,
+            #[cfg(target_os = "linux")]
+            pending_signature: None,
+            #[cfg(target_os = "linux")]
+            last_signature: None,
         }
     }
 
@@ -263,6 +275,8 @@ impl DisassemblyPanel {
         self.cache = None;
         self.selected_row = None;
         self.scroll_to_row = None;
+        self.pending_signature = None;
+        self.last_signature = None;
     }
 
     // -----------------------------------------------------------------------
@@ -607,6 +621,24 @@ impl DisassemblyPanel {
             ui.colored_label(Color32::from_rgb(220, 160, 40), msg);
         }
 
+        if let Some(sig_result) = &self.last_signature {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                match sig_result {
+                    Ok(sig) => {
+                        ui.colored_label(Color32::from_rgb(100, 220, 100), "Signature:");
+                        ui.monospace(sig);
+                        if ui.small_button("Copy").clicked() {
+                            ui.ctx().copy_text(sig.clone());
+                        }
+                    }
+                    Err(msg) => {
+                        ui.colored_label(Color32::RED, format!("Signature: {msg}"));
+                    }
+                }
+            });
+        }
+
         if let Some(target) = self.pending_navigate.take() {
             self.navigate(target);
         }
@@ -789,6 +821,7 @@ impl DisassemblyPanel {
         let mut nop_target: Option<(usize, usize)> = None;
         let mut queued_action: Option<DisasmAction> = None;
         let mut copy_text: Option<String> = None;
+        let mut pending_sig_addr: Option<usize> = None;
         let mut max_visible: usize = 0;
         let len = self.active_len();
 
@@ -1017,6 +1050,11 @@ impl DisassemblyPanel {
                                     nop_target = Some((addr as usize, length));
                                     ui.close();
                                 }
+                                ui.separator();
+                                if ui.button("Generate signature").clicked() {
+                                    pending_sig_addr = Some(addr as usize);
+                                    ui.close();
+                                }
                             });
                         });
                     });
@@ -1056,6 +1094,42 @@ impl DisassemblyPanel {
                 }
             } else {
                 self.status_msg = Some(format!("NOP write failed at {addr:#x}"));
+            }
+        }
+
+        // ── resolve pending signature request ─────────────────────────────
+        if let Some(target_addr) = pending_sig_addr {
+            self.pending_signature = Some(target_addr);
+        }
+        if let Some(sig_addr) = self.pending_signature.take() {
+            let module = self
+                .modules
+                .iter()
+                .find(|m| sig_addr >= m.base && sig_addr < m.base + m.size);
+            if let Some(m) = module {
+                let offset = sig_addr - m.base;
+                let mut buf = vec![0u8; m.size];
+                match process.read_buf(m.base, &mut buf) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        // Operand-masked signature: wildcards displacement/immediate
+                        // bytes so it survives a rebased image.
+                        let result = nemclass_core::make_masked_signature(&buf, offset, 8, 128);
+                        self.last_signature = Some(match result {
+                            Some(sig) => Ok(sig),
+                            None => Err(
+                                "Not unique within module (try longer max_len)".to_owned(),
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        self.last_signature = Some(Err(format!("Read failed: {e}")));
+                    }
+                }
+            } else {
+                self.last_signature = Some(Err(format!(
+                    "{sig_addr:#x} not found in any loaded module"
+                )));
             }
         }
 

@@ -138,6 +138,8 @@ impl ScannerPanel {
         process: Option<&Process>,
         pid: Option<Pid>,
         mut add_to_class_cb: impl FnMut(usize),
+        mut add_to_table_cb: impl FnMut(usize, &str),
+        mut ptr_scan_cb: impl FnMut(usize),
     ) {
         let attached = process.is_some();
 
@@ -154,7 +156,7 @@ impl ScannerPanel {
 
         // Results table (always drawn, but empty when idle). Values update live
         // from the attached process each frame, like Cheat Engine.
-        self.show_results(ui, process, &mut add_to_class_cb);
+        self.show_results(ui, process, &mut add_to_class_cb, &mut add_to_table_cb, &mut ptr_scan_cb);
 
         ui.separator();
 
@@ -404,6 +406,8 @@ impl ScannerPanel {
         ui: &mut egui::Ui,
         process: Option<&Process>,
         add_to_class_cb: &mut dyn FnMut(usize),
+        add_to_table_cb: &mut dyn FnMut(usize, &str),
+        ptr_scan_cb: &mut dyn FnMut(usize),
     ) {
         // (address, captured-bytes) for the displayed (capped) result set.
         let visible: Vec<(usize, Vec<u8>)> = self
@@ -470,6 +474,13 @@ impl ScannerPanel {
                             }
                             if ui.small_button("Add to class").clicked() {
                                 add_to_class_cb(addr);
+                            }
+                            let tag = value_type.as_tag();
+                            if ui.small_button("Add to table").clicked() {
+                                add_to_table_cb(addr, tag);
+                            }
+                            if ui.small_button("Ptr-scan").clicked() {
+                                ptr_scan_cb(addr);
                             }
                         });
                     });

@@ -57,7 +57,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
-use rustyscript::{json_args, serde_json, Module, Runtime, RuntimeOptions};
+use rustyscript::{json_args, Module, Runtime, RuntimeOptions};
+
+/// Re-export of the `serde_json` rustyscript uses, so host implementors
+/// ([`HostApi::call`]) and tests can build/inspect `Value`s with a matching
+/// version without adding a direct dependency.
+pub use rustyscript::serde_json;
 use serde_json::Value;
 
 use crate::engine::ScriptEngine;
@@ -131,6 +136,13 @@ pub trait HostApi {
 
     /// Emit a log line from a script.
     fn log(&mut self, level: LogLevel, msg: &str);
+
+    /// Generic catalog-driven dispatch for every namespaced host method
+    /// (`mem.*`, `proc.*`, ...). `method` is the dotted catalog key
+    /// (`"mem.readU32"`); `args` is the JSON array of call arguments. The result
+    /// is JSON handed back to JS. This is the single seam every new host method
+    /// flows through (see [`crate::api_catalog`]).
+    fn call(&mut self, method: &str, args: &Value) -> Result<Value, String>;
 }
 
 /// A host-API call marshalled from the worker (JS) thread to the main thread.
@@ -171,6 +183,17 @@ pub enum HostRequest {
         level: LogLevel,
         /// Message body.
         msg: String,
+    },
+    /// The generic catalog-driven `__host_call(method, args)` bridge — the
+    /// single variant every namespaced method (`mem.*`, `proc.*`, ...) routes
+    /// through.
+    Call {
+        /// Dotted catalog method name (`"mem.readU32"`).
+        method: String,
+        /// JSON array of call arguments.
+        args: Value,
+        /// Reply: JSON result, or an error string.
+        reply: SyncSender<Result<Value, String>>,
     },
 }
 
@@ -279,6 +302,13 @@ fn service_host_request(req: HostRequest, host: &mut dyn HostApi) {
         HostRequest::Log { level, msg } => {
             host.log(level, &msg);
         }
+        HostRequest::Call {
+            method,
+            args,
+            reply,
+        } => {
+            let _ = reply.send(host.call(&method, &args));
+        }
     }
 }
 
@@ -348,6 +378,25 @@ globalThis.nemclass = {
 };
 "#;
 
+/// Builds the catalog-driven namespace shim: for every [`crate::api_catalog`]
+/// method `<ns>.<fn>` it installs `nemclass.<ns>.<fn> = (...args) =>
+/// __host_call("<ns>.<fn>", args)`. Loaded after [`NEMCLASS_SHIM`] so the
+/// `nemclass` global already exists. Legacy fns are left untouched.
+fn build_namespace_shim() -> String {
+    let mut s = String::new();
+    for ns in crate::api_catalog::namespaces() {
+        s.push_str(&format!("globalThis.nemclass.{ns} = globalThis.nemclass.{ns} || {{}};\n"));
+    }
+    for m in crate::api_catalog::HOST_METHODS {
+        let (ns, func) = crate::api_catalog::split_name(m.name);
+        s.push_str(&format!(
+            "globalThis.nemclass.{ns}.{func} = (...args) => rustyscript.functions.__host_call({:?}, args);\n",
+            m.name
+        ));
+    }
+    s
+}
+
 /// The runtime-side entrypoint script rustyscript dispatches events into. It
 /// walks handlers registered via `nemclass.on(...)` and, as a convenience, any
 /// matching function `export`ed from a loaded module (recorded by the shim's
@@ -365,6 +414,7 @@ export function __nemclass_dispatch(kind, payload) {
         OnProjectLoad: "onProjectLoad",
         ClassAddressUpdated: "classAddressUpdated",
         GlobalVariableUpdated: "globalVariableUpdated",
+        OnTick: "onTick",
         Custom: "onCustom",
     }[kind];
     if (fallback && typeof globalThis[fallback] === "function") {
@@ -448,6 +498,14 @@ fn worker_main(
     let shim = Module::new("__nemclass_shim.js", NEMCLASS_SHIM);
     if let Err(e) = runtime.load_module(&shim) {
         let _ = ready_tx.send(Err(format!("failed to load nemclass shim: {e}")));
+        return;
+    }
+    // The catalog-driven namespace shim (`nemclass.mem.*`, etc.), loaded after
+    // the base shim so the `nemclass` global exists.
+    let ns_shim_src = build_namespace_shim();
+    let ns_shim = Module::new("__nemclass_ns_shim.js", ns_shim_src.as_str());
+    if let Err(e) = runtime.load_module(&ns_shim) {
+        let _ = ready_tx.send(Err(format!("failed to load nemclass namespace shim: {e}")));
         return;
     }
     let dispatch = Module::new("__nemclass_dispatch.js", NEMCLASS_DISPATCH);
@@ -581,6 +639,30 @@ fn register_host_fns(runtime: &mut Runtime, bridge: &HostBridge) -> Result<(), S
             Ok(Value::Null)
         })
         .map_err(|e| format!("register declare_class: {e}"))?;
+
+    // The generic catalog bridge: `__host_call(method, argsArray)`. Routes
+    // through the same `HostBridge::call` as the legacy fns, so the `resolving`
+    // deadlock-guard applies uniformly.
+    let b = bridge.clone();
+    runtime
+        .register_function("__host_call", move |args: &[Value]| {
+            let method = json_str(args, 0)?;
+            // Second arg is the JS spread `args` array; default to `[]`.
+            let call_args = match args.get(1) {
+                Some(v @ Value::Array(_)) => v.clone(),
+                Some(other) => Value::Array(vec![other.clone()]),
+                None => Value::Array(Vec::new()),
+            };
+            let out = b
+                .call(|reply| HostRequest::Call {
+                    method,
+                    args: call_args,
+                    reply,
+                })
+                .map_err(rustyscript::Error::Runtime)?;
+            Ok(out)
+        })
+        .map_err(|e| format!("register __host_call: {e}"))?;
 
     let b = bridge.clone();
     runtime

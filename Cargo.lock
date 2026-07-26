@@ -3254,6 +3254,7 @@ dependencies = [
  "eframe",
  "egui",
  "env_logger",
+ "log",
  "nemclass-core",
  "nemclass-model",
  "nemclass-script",
@@ -3294,6 +3295,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "nemclass-core",
+ "nemclass-model",
 ]
 
 [[package]]
@@ -3314,6 +3316,7 @@ dependencies = [
 name = "nemclass-ui"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "dirs",
  "eframe",
  "egui",

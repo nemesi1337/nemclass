@@ -31,6 +31,9 @@ pub use internal::{
     InstructionData,
     FlowKind,
     disassemble_instructions,
+    find_code_refs,
+    make_masked_signature,
+    operand_wildcard_mask,
     // Memory-dissection analysis (M5.1): address classification, string
     // detection, and pointer/vtable classification. The pure cores
     // (`RegionIndex::from_sections`, `detect_strings`, `classify_value`) are

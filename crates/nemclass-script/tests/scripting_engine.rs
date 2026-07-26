@@ -31,6 +31,8 @@ struct MockHost {
     declared_classes: Vec<(String, String)>,
     declared_types: Vec<String>,
     pattern_calls: Vec<(String, String)>,
+    /// Generic catalog calls: `(method, args-json-string)`.
+    generic_calls: Vec<(String, String)>,
 }
 
 impl HostApi for MockHost {
@@ -57,6 +59,20 @@ impl HostApi for MockHost {
 
     fn log(&mut self, _level: LogLevel, msg: &str) {
         self.logs.push(msg.to_string());
+    }
+
+    fn call(
+        &mut self,
+        method: &str,
+        args: &nemclass_script::engine_rusty::serde_json::Value,
+    ) -> Result<nemclass_script::engine_rusty::serde_json::Value, String> {
+        self.generic_calls
+            .push((method.to_string(), args.to_string()));
+        // A known value for mem.readU32 so the JS side can assert the round-trip.
+        match method {
+            "mem.readU32" => Ok(nemclass_script::engine_rusty::serde_json::json!(0xCAFE_u32)),
+            _ => Ok(nemclass_script::engine_rusty::serde_json::Value::Null),
+        }
     }
 }
 
@@ -107,6 +123,9 @@ fn engine_dispatch_host_bridge_and_resolver() {
             nemclass.declare_type({ name: "Team", size: 4, use_flags: false, values: [["Red", 0], ["Blue", 1]] });
             const hits = nemclass.pattern_scan("game.exe", "48 8B ?? ??");
             nemclass.log("hits=" + hits.length);
+            // Generic catalog bridge: nemclass.mem.readU32 -> __host_call.
+            const v = nemclass.mem.readU32(0x1000);
+            nemclass.log("readU32=0x" + v.toString(16));
         });
     "#;
     let resolver_js = r#"
@@ -128,6 +147,7 @@ fn engine_dispatch_host_bridge_and_resolver() {
             && !h.declared_types.is_empty()
             && !h.pattern_calls.is_empty()
             && h.logs.iter().any(|l| l.contains("hits=2"))
+            && h.logs.iter().any(|l| l.contains("readU32=0xcafe"))
     });
     {
         let h = host.lock().unwrap();
@@ -144,6 +164,17 @@ fn engine_dispatch_host_bridge_and_resolver() {
         // e.data.pid) — regression guard for the adjacently-tagged Event unwrap.
         assert!(h.logs.iter().any(|l| l.contains("attached pid=4242")));
         assert!(h.logs.iter().any(|l| l.contains("hits=2")));
+
+        // Generic catalog bridge: the mock received the exact method + args, and
+        // the known return value (0xCAFE) round-tripped back into JS.
+        assert!(
+            h.generic_calls
+                .iter()
+                .any(|(m, a)| m == "mem.readU32" && a.contains("4096")),
+            "generic __host_call reached the host: {:?}",
+            h.generic_calls
+        );
+        assert!(h.logs.iter().any(|l| l.contains("readU32=0xcafe")));
     }
 
     // --- Resolver: returns a number when it claims the class ------------------

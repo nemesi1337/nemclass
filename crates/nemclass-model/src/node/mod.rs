@@ -42,4 +42,11 @@ pub trait Node: Send + Sync {
     fn pointer_target_class(&self) -> Option<Uuid> {
         None
     }
+
+    /// For pointer-to-class nodes, set the target class UUID and return `true`.
+    /// The default returns `false` (not a pointer node), so callers such as the
+    /// scripting host can point a Pointer node at a class without downcasting.
+    fn set_pointer_target(&mut self, _target: Uuid) -> bool {
+        false
+    }
 }

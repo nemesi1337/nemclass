@@ -41,15 +41,21 @@
 mod compare;
 mod freeze;
 mod pattern;
+mod pointerscan;
 mod results;
 mod scanner;
 mod target;
+mod signature;
 mod value_type;
 
 pub use compare::ScanCompareType;
 pub use freeze::FreezeSet;
 pub use pattern::{BytePattern, PatternByte, PatternError};
+pub use pointerscan::{
+    pointer_scan, PointerMap, PointerPath, PointerScanConfig, PointerScanResult,
+};
 pub use results::{ScanResult, ScanResults};
+pub use signature::{format_signature, make_signature, SignatureConfig};
 pub use scanner::{ScanProgress, Scanner};
 pub use target::{MockTarget, Region, ScanTarget, WriteTarget};
 pub use value_type::{

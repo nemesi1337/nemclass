@@ -101,6 +101,12 @@ pub fn load_project_from(
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "project file has no parent dir"))?
         .to_path_buf();
 
+    // Regenerate `nemclass.d.ts` on open so the script type surface always tracks
+    // the running build's host-API catalog (methods/events added since the
+    // project was created). Best-effort: a write failure (e.g. a read-only dir)
+    // must not prevent the project from opening.
+    let _ = nemclass_script::write_dts(&project_dir);
+
     Ok((project, project_dir))
 }
 
@@ -214,5 +220,24 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         // An explicit overwrite (Save As) still succeeds.
         create_project_at(dir.path(), &project, &registry, true).expect("overwrite ok");
+    }
+
+    #[test]
+    fn open_regenerates_stale_dts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = make_registry();
+        let project = make_project();
+        create_project_at(dir.path(), &project, &registry, false).expect("create");
+
+        // Simulate a stale `.d.ts` (e.g. created by an older build).
+        let dts = dir.path().join("nemclass.d.ts");
+        std::fs::write(&dts, "// stale").expect("write stale");
+
+        // Opening the project must regenerate it from the current catalog.
+        let _ = load_project_from(dir.path(), &registry).expect("load");
+
+        let content = std::fs::read_to_string(&dts).expect("read dts");
+        assert!(content.len() > 100, "d.ts should be regenerated, got {content:?}");
+        assert!(content.contains("nemclass"), "regenerated d.ts should declare the nemclass global");
     }
 }

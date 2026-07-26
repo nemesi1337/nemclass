@@ -152,6 +152,10 @@ impl Node for PointerNode {
         RenderedValue { value: format!("0x{v:016X}"), type_tag: "Pointer", memory_size: 8 }
     }
     fn pointer_target_class(&self) -> Option<Uuid> { self.target_class_uuid }
+    fn set_pointer_target(&mut self, target: Uuid) -> bool {
+        self.target_class_uuid = Some(target);
+        true
+    }
     fn to_node_def(&self) -> NodeDef {
         let mut attrs = std::collections::HashMap::new();
         if let Some(uuid) = &self.target_class_uuid {

@@ -96,6 +96,21 @@ pub enum Event {
         variable: GlobalVariable,
     },
 
+    /// A periodic tick emitted once per snapshot interval, letting scripts do
+    /// polling / freeze work without a timer of their own. Carries the attached
+    /// `pid` (or `None` when not attached).
+    OnTick {
+        /// The attached process id, if any.
+        pid: Option<i32>,
+    },
+
+    /// A script-registered global hotkey fired. Carries the registration `id`
+    /// returned by `hotkeys.register`; scripts filter on it in their handler.
+    OnHotkey {
+        /// The hotkey registration id (from `hotkeys.register`).
+        id: u32,
+    },
+
     /// A user-raised custom event (`EventBus::raise`). `payload` is arbitrary
     /// serde JSON-shaped data (`serde_json::Value` in M2's JS bridge); modelled
     /// here as [`CustomPayload`] so the M1 crate needs no `serde_json` dep.
@@ -117,6 +132,8 @@ impl Event {
             Event::OnDetach => "OnDetach",
             Event::ClassAddressUpdated { .. } => "ClassAddressUpdated",
             Event::GlobalVariableUpdated { .. } => "GlobalVariableUpdated",
+            Event::OnTick { .. } => "OnTick",
+            Event::OnHotkey { .. } => "OnHotkey",
             Event::Custom { .. } => "Custom",
         }
     }
