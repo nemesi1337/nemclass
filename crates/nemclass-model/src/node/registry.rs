@@ -203,6 +203,9 @@ fn register_builtins(reg: &mut NodeRegistry) {
         reg.register("Utf16Text", ctor, de);
     }
 
+    // StrPtrNode — an 8-byte pointer to a NUL-terminated UTF-8 string.
+    reg_simple!("StrPtr", StrPtrNode);
+
     // VTableNode (container) — recursive via registry; children are VMethodNodes
     {
         use crate::node::vtable::VTableNode;

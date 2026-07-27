@@ -329,6 +329,10 @@ pub(crate) fn resolve_fields(
                 FieldKind::Utf16Text(length)
             }
 
+            // Pointer to a UTF-8 string: an 8-byte `char*` — emit as an untyped
+            // pointer so the field width and semantics stay correct.
+            "StrPtr" => FieldKind::Pointer(None),
+
             // Unknown / Class container nodes embedded as children: emit a
             // raw-bytes fallback so the total size still advances correctly.
             _ => {

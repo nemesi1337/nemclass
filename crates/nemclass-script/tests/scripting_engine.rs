@@ -218,4 +218,35 @@ fn engine_dispatch_host_bridge_and_resolver() {
     // --- Resolver: yields None when every resolver defers (returns null) -------
     let deferred = engine.resolve_class_address(&ClassAddressQuery::new(1, uuid::Uuid::nil()));
     assert_eq!(deferred, None);
+
+    // --- Reload does not stack lifecycle handlers -----------------------------
+    // Regression guard: reloading the same directory must clear the previous
+    // generation's handlers (`__nemclass_reset`), so a subsequent OnAttach fires
+    // the handler exactly once — not once per prior load. Before the fix, handlers
+    // accumulated and OnAttach fired twice after a single reload. (Also guards the
+    // reload path itself, which must not deadlock the v8 worker.)
+    let classes_before = host.lock().unwrap().declared_classes.len();
+    engine.load_scripts(dir.path()).unwrap();
+    engine.on_event(&Event::OnAttach {
+        pid: 555,
+        name: Some("game".into()),
+    });
+    // Pump until the *last* effect of the OnAttach handlers for this dispatch —
+    // importer.ts's "doubled=42" runs after attach.js's whole chain. Waiting for
+    // an earlier effect would return while attach.js is still mid-handler (blocked
+    // on an unanswered host call), leaving the worker unable to see `Shutdown`.
+    // "doubled=42" is logged once per dispatch, so after the reload it appears a
+    // second time.
+    pump_until(&mut engine, &host, Duration::from_secs(20), |h| {
+        h.logs.iter().filter(|l| l.contains("doubled=42")).count() >= 2
+            && h.logs.iter().any(|l| l.contains("attached pid=555"))
+    });
+    let classes_after = host.lock().unwrap().declared_classes.len();
+    assert_eq!(
+        classes_after - classes_before,
+        1,
+        "reload must not stack OnAttach handlers (one declare_class per dispatch); \
+         declared_classes={:?}",
+        host.lock().unwrap().declared_classes
+    );
 }

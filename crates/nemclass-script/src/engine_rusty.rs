@@ -57,7 +57,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
-use rustyscript::{json_args, Module, Runtime, RuntimeOptions};
+use rustyscript::{json_args, Module, ModuleHandle, Runtime, RuntimeOptions};
 
 /// Resolves relative `import` statements against the real files on disk.
 ///
@@ -75,6 +75,30 @@ use rustyscript::{json_args, Module, Runtime, RuntimeOptions};
 /// resolve regardless of the order files were loaded in.
 struct RelativeImportResolver;
 
+/// Path prefix that tags a module specifier with a reload *generation* so each
+/// reload uses fresh specifiers (deno never re-evaluates an already-loaded one).
+/// A real file `/proj/src/a.ts` at generation 3 becomes the specifier path
+/// `/__nemclass_gen__3__/proj/src/a.ts`. The prefix rides along relative-import
+/// resolution automatically (deno resolves `./b` against the referrer's path, so
+/// the generation segment is preserved), keeping a whole reload in one generation.
+/// See [`gen_specifier`] / [`split_gen_path`] and the `LoadScriptsDir` handler.
+const GEN_PREFIX: &str = "/__nemclass_gen__";
+
+/// Builds the generation-tagged specifier path for absolute file `abs`.
+fn gen_specifier(generation: u64, abs: &Path) -> String {
+    format!("{GEN_PREFIX}{generation}__{}", abs.display())
+}
+
+/// Inverse of [`gen_specifier`]: `/__nemclass_gen__<N>__/real/path` → `(N, "/real/path")`.
+/// Returns `None` for non-generation paths (the shims, `LoadScript`, etc.), whose
+/// `__/` boundary can only follow the digits we wrote.
+fn split_gen_path(path: &str) -> Option<(u64, &str)> {
+    let rest = path.strip_prefix(GEN_PREFIX)?;
+    let sep = rest.find("__/")?;
+    let generation: u64 = rest[..sep].parse().ok()?;
+    Some((generation, &rest[sep + 2..]))
+}
+
 impl rustyscript::module_loader::ImportProvider for RelativeImportResolver {
     fn resolve(
         &mut self,
@@ -87,6 +111,21 @@ impl rustyscript::module_loader::ImportProvider for RelativeImportResolver {
             return None;
         }
         let path = specifier.to_file_path().ok()?;
+        let path_str = path.to_str()?;
+        // Generation-tagged import (from a reloaded script): probe the *real*
+        // file for an extension/index, then re-attach the same generation prefix.
+        // We must return `Some` even when the extension is already correct:
+        // rustyscript only bypasses its "module not loaded" filesystem whitelist
+        // for specifiers a resolver claims, and `import` below then serves the
+        // real file's contents.
+        if let Some((generation, real)) = split_gen_path(path_str) {
+            let resolved = resolve_disk_module(Path::new(real))?;
+            let tagged = gen_specifier(generation, &resolved);
+            return Some(
+                rustyscript::deno_core::ModuleSpecifier::from_file_path(Path::new(&tagged))
+                    .map_err(|()| rustyscript::deno_core::anyhow::anyhow!("invalid module path")),
+            );
+        }
         let resolved = resolve_disk_module(&path)?;
         // Only rewrite when we actually found a different, real file; otherwise
         // fall back to the default behavior so error messages stay accurate.
@@ -96,6 +135,26 @@ impl rustyscript::module_loader::ImportProvider for RelativeImportResolver {
         Some(
             rustyscript::deno_core::ModuleSpecifier::from_file_path(&resolved)
                 .map_err(|()| rustyscript::deno_core::anyhow::anyhow!("invalid module path")),
+        )
+    }
+
+    fn import(
+        &mut self,
+        specifier: &rustyscript::deno_core::ModuleSpecifier,
+        _referrer: Option<&rustyscript::deno_core::ModuleSpecifier>,
+        _is_dyn_import: bool,
+        _requested_module_type: rustyscript::deno_core::RequestedModuleType,
+    ) -> Option<Result<String, rustyscript::deno_core::anyhow::Error>> {
+        // Generation-tagged specifiers don't exist on disk; strip the prefix and
+        // serve the real file's current contents (so reloads pick up edits).
+        if specifier.scheme() != "file" {
+            return None;
+        }
+        let path = specifier.to_file_path().ok()?;
+        let (_, real) = split_gen_path(path.to_str()?)?;
+        Some(
+            std::fs::read_to_string(real)
+                .map_err(|e| rustyscript::deno_core::anyhow::anyhow!("read {real}: {e}")),
         )
     }
 }
@@ -518,6 +577,25 @@ export function __nemclass_dispatch(kind, payload) {
     }
 }
 
+// Called before each reload: drop every handler registered by the previous
+// generation of scripts (and any global-fallback functions they defined) so a
+// reload doesn't stack lifecycle callbacks. The freshly-evaluated generation
+// re-registers whatever it still wants.
+export function __nemclass_reset() {
+    globalThis.__nemclass_handlers = {};
+    const fallbacks = [
+        "onAttach", "onDetach", "onProjectLoad", "classAddressUpdated",
+        "globalVariableUpdated", "onTick", "onCustom", "onHotkey",
+        "tryResolveClassAddress",
+    ];
+    for (const name of fallbacks) {
+        try { delete globalThis[name]; } catch (e) { /* non-configurable: ignore */ }
+    }
+    try {
+        if (globalThis.nemclass) delete globalThis.nemclass.tryResolveClassAddress;
+    } catch (e) { /* ignore */ }
+}
+
 export function __nemclass_resolve(query) {
     const handlers = (globalThis.__nemclass_handlers || {})["tryResolveClassAddress"] || [];
     for (const h of handlers) {
@@ -570,6 +648,105 @@ impl HostBridge {
     }
 }
 
+/// Builds the v8 `Runtime` with host functions and the nemclass shims loaded,
+/// returning it together with the dispatch module's handle. Called **once** at
+/// worker startup — the runtime then lives for the worker's whole life.
+///
+/// It is never torn down and rebuilt: recreating a v8 isolate on the same thread
+/// deadlocks deno/v8. Reloads therefore reuse this runtime and get their clean
+/// slate a different way — generation-tagged module specifiers (so deno, which
+/// never re-evaluates an already-loaded specifier, re-reads edited files) plus a
+/// handler reset (so lifecycle callbacks don't stack). See the `LoadScriptsDir`
+/// handler and [`GEN_PREFIX`].
+fn build_runtime(bridge: &HostBridge) -> Result<(Runtime, ModuleHandle), String> {
+    let mut runtime = Runtime::new(RuntimeOptions {
+        // Resolve `import "./helpers"` against real files on disk (extension +
+        // index probing) so multi-file scripts work without whitelist/ordering
+        // constraints. See `RelativeImportResolver`.
+        import_provider: Some(Box::new(RelativeImportResolver)),
+        ..Default::default()
+    })
+    .map_err(|e| format!("failed to create v8 runtime: {e}"))?;
+
+    register_host_fns(&mut runtime, bridge)?;
+
+    // Load the shim (defines the `nemclass` global) and the dispatch module.
+    let shim = Module::new("__nemclass_shim.js", NEMCLASS_SHIM);
+    runtime
+        .load_module(&shim)
+        .map_err(|e| format!("failed to load nemclass shim: {e}"))?;
+    // The catalog-driven namespace shim (`nemclass.mem.*`, etc.), loaded after
+    // the base shim so the `nemclass` global exists.
+    let ns_shim_src = build_namespace_shim();
+    let ns_shim = Module::new("__nemclass_ns_shim.js", ns_shim_src.as_str());
+    runtime
+        .load_module(&ns_shim)
+        .map_err(|e| format!("failed to load nemclass namespace shim: {e}"))?;
+    let dispatch = Module::new("__nemclass_dispatch.js", NEMCLASS_DISPATCH);
+    let dispatch_handle = runtime
+        .load_module(&dispatch)
+        .map_err(|e| format!("failed to load nemclass dispatch: {e}"))?;
+
+    Ok((runtime, dispatch_handle))
+}
+
+/// JS/TS module extensions loaded from a scripts directory.
+fn is_script_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "js" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Loads every JS/TS file directly under `dir` into `runtime`, tagging each with
+/// `generation` (see [`GEN_PREFIX`]) so deno re-evaluates the file's *current*
+/// contents rather than reusing an already-loaded specifier.
+///
+/// The files are pulled in as imports of a single synthetic entry module rather
+/// than each loaded as its own top-level module. That matters: a helper that is
+/// also `import`ed by a sibling would otherwise be evaluated twice (once via the
+/// import, once as top-level), and rustyscript's loader panics when asked to
+/// evaluate an already-evaluated module. Importing them all from one entry lets
+/// deno's module map de-duplicate — each file evaluates exactly once, regardless
+/// of load order. `dir` is expected absolute (the UI passes `<project>/src`).
+fn load_scripts_generation(
+    runtime: &mut Runtime,
+    dir: &Path,
+    generation: u64,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| is_script_file(p))
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // Build `import "<gen-tagged file url>";` lines. deno de-duplicates the graph,
+    // so files that import each other are still evaluated only once.
+    let mut entry = String::new();
+    for path in &paths {
+        let tagged = gen_specifier(generation, path);
+        let url = rustyscript::deno_core::ModuleSpecifier::from_file_path(Path::new(&tagged))
+            .map_err(|()| format!("invalid script path {path:?}"))?;
+        // `{:?}` emits a quoted, escaped JS string literal.
+        entry.push_str(&format!("import {:?};\n", url.as_str()));
+    }
+    let entry_spec = format!("{GEN_PREFIX}{generation}__/__nemclass_entry__.js");
+    let module = Module::new(entry_spec, entry);
+    runtime
+        .load_module(&module)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// The worker thread body: builds the `Runtime`, registers host functions, loads
 /// the shim, then serves commands until `Shutdown`.
 fn worker_main(
@@ -583,49 +760,21 @@ fn worker_main(
         resolving: resolving.clone(),
     };
 
-    let mut runtime = match Runtime::new(RuntimeOptions {
-        // Resolve `import "./helpers"` against real files on disk (extension +
-        // index probing) so multi-file scripts work without whitelist/ordering
-        // constraints. See `RelativeImportResolver`.
-        import_provider: Some(Box::new(RelativeImportResolver)),
-        ..Default::default()
-    }) {
-        Ok(r) => r,
+    let (mut runtime, dispatch_handle) = match build_runtime(&bridge) {
+        Ok(pair) => pair,
         Err(e) => {
-            let _ = ready_tx.send(Err(format!("failed to create v8 runtime: {e}")));
-            return;
-        }
-    };
-
-    if let Err(e) = register_host_fns(&mut runtime, &bridge) {
-        let _ = ready_tx.send(Err(e));
-        return;
-    }
-
-    // Load the shim (defines the `nemclass` global) and the dispatch module.
-    let shim = Module::new("__nemclass_shim.js", NEMCLASS_SHIM);
-    if let Err(e) = runtime.load_module(&shim) {
-        let _ = ready_tx.send(Err(format!("failed to load nemclass shim: {e}")));
-        return;
-    }
-    // The catalog-driven namespace shim (`nemclass.mem.*`, etc.), loaded after
-    // the base shim so the `nemclass` global exists.
-    let ns_shim_src = build_namespace_shim();
-    let ns_shim = Module::new("__nemclass_ns_shim.js", ns_shim_src.as_str());
-    if let Err(e) = runtime.load_module(&ns_shim) {
-        let _ = ready_tx.send(Err(format!("failed to load nemclass namespace shim: {e}")));
-        return;
-    }
-    let dispatch = Module::new("__nemclass_dispatch.js", NEMCLASS_DISPATCH);
-    let dispatch_handle = match runtime.load_module(&dispatch) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = ready_tx.send(Err(format!("failed to load nemclass dispatch: {e}")));
+            let _ = ready_tx.send(Err(e));
             return;
         }
     };
 
     let _ = ready_tx.send(Ok(()));
+
+    // Bumped on every `LoadScriptsDir` so each (re)load tags its modules with a
+    // fresh generation prefix — deno then treats them as new specifiers and
+    // re-evaluates the current file contents (it never re-evaluates an
+    // already-loaded specifier). See [`GEN_PREFIX`] / [`load_scripts_generation`].
+    let mut generation: u64 = 0;
 
     // Command loop.
     for cmd in cmd_rx {
@@ -639,20 +788,22 @@ fn worker_main(
                     bridge_log(&bridge, LogLevel::Error, &format!("cannot read {path:?}"));
                 }
             }
-            Command::LoadScriptsDir(dir) => match Module::load_dir(&dir) {
-                Ok(modules) => {
-                    for module in modules {
-                        if let Err(e) = runtime.load_module(&module) {
-                            bridge_log(
-                                &bridge,
-                                LogLevel::Error,
-                                &format!("load {:?}: {e}", module.filename()),
-                            );
-                        }
-                    }
+            Command::LoadScriptsDir(dir) => {
+                generation += 1;
+                // Clear handlers registered by the previous generation so lifecycle
+                // callbacks (OnAttach, …) fire exactly once — not once per prior
+                // load. New-generation modules re-register as they evaluate.
+                if let Err(e) = runtime.call_function::<()>(
+                    Some(&dispatch_handle),
+                    "__nemclass_reset",
+                    json_args!(),
+                ) {
+                    bridge_log(&bridge, LogLevel::Error, &format!("reset handlers: {e}"));
                 }
-                Err(e) => bridge_log(&bridge, LogLevel::Error, &format!("load dir {dir:?}: {e}")),
-            },
+                if let Err(e) = load_scripts_generation(&mut runtime, &dir, generation) {
+                    bridge_log(&bridge, LogLevel::Error, &format!("load dir {dir:?}: {e}"));
+                }
+            }
             Command::Dispatch(event) => {
                 // `Event` is adjacently tagged (`#[serde(tag="kind", content="data")]`),
                 // so it serializes to `{"kind": "...", "data": {..fields}}`. JS

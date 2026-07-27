@@ -44,7 +44,7 @@ use pointer_scan_panel::{PointerScanPanel, PointerScanAction};
 use cheat_table_panel::{CheatTablePanel, CheatTablePanelAction};
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -337,6 +337,13 @@ pub struct NemclassApp {
     script_log: ScriptLog,
     /// Transient UI state for the Scripts tab.
     scripts_panel: ScriptsPanel,
+    /// Last time the script-file watcher polled mtimes (auto-reload throttle).
+    #[cfg(feature = "scripting")]
+    last_script_watch: Option<Instant>,
+    /// Known modified-times of the files in the scripts dir, used to detect edits
+    /// for auto-reload. Refreshed on every (re)load via `reload_scripts_dir`.
+    #[cfg(feature = "scripting")]
+    script_mtimes: HashMap<PathBuf, std::time::SystemTime>,
     /// Script-registered global hotkeys, polled each frame in `logic`. A match
     /// fires `Event::OnHotkey { id }` into the engine.
     #[cfg(feature = "scripting")]
@@ -560,6 +567,10 @@ impl NemclassApp {
             script_log,
             scripts_panel: ScriptsPanel::new(),
             #[cfg(feature = "scripting")]
+            last_script_watch: None,
+            #[cfg(feature = "scripting")]
+            script_mtimes: HashMap::new(),
+            #[cfg(feature = "scripting")]
             script_hotkeys: Vec::new(),
             #[cfg(feature = "scripting")]
             next_hotkey_id: 1,
@@ -604,19 +615,7 @@ impl NemclassApp {
         // manually clicked Reload in the Scripts panel.
         if let Some(dir) = app.project_dir.clone() {
             let src = dir.join("src");
-            match app.script_host.load_scripts(&src) {
-                Ok(()) if app.script_host.is_active() => script_log::push(
-                    &app.script_log,
-                    LogKind::Lifecycle,
-                    format!("Loaded scripts from {}", src.display()),
-                ),
-                Ok(()) => {}
-                Err(e) => script_log::push(
-                    &app.script_log,
-                    LogKind::Error,
-                    format!("load scripts: {e}"),
-                ),
-            }
+            app.reload_scripts_dir(&src, "Loaded scripts from");
             // Fire OnProjectLoad AFTER load so handlers registered during load
             // can catch it (the worker processes the commands in order).
             app.emit(Event::OnProjectLoad { path: dir.display().to_string() });
@@ -1008,6 +1007,31 @@ impl NemclassApp {
         self.script_host.on_event(&ev);
     }
 
+    /// (Re)loads every script in `dir` into the engine, logs the outcome under
+    /// `label`, and — under the scripting feature — refreshes the mtime cache the
+    /// auto-reload watcher compares against, so a manual load doesn't immediately
+    /// re-trigger it. Central entry point for startup, project-open, the Scripts
+    /// panel Load/Reload buttons, and the file watcher.
+    fn reload_scripts_dir(&mut self, dir: &Path, label: &str) {
+        match self.script_host.load_scripts(dir) {
+            Ok(()) if self.script_host.is_active() => script_log::push(
+                &self.script_log,
+                LogKind::Lifecycle,
+                format!("{label} {}", dir.display()),
+            ),
+            Ok(()) => {}
+            Err(e) => script_log::push(
+                &self.script_log,
+                LogKind::Error,
+                format!("{label} failed: {e}"),
+            ),
+        }
+        #[cfg(feature = "scripting")]
+        {
+            self.script_mtimes = scan_script_mtimes(dir);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Project actions (called after the dialog confirms a path)
     // -----------------------------------------------------------------------
@@ -1042,19 +1066,7 @@ impl NemclassApp {
                 path: dir.display().to_string(),
             });
             let src = dir.join("src");
-            match self.script_host.load_scripts(&src) {
-                Ok(()) if self.script_host.is_active() => script_log::push(
-                    &self.script_log,
-                    LogKind::Lifecycle,
-                    format!("Loaded scripts from {}", src.display()),
-                ),
-                Ok(()) => {}
-                Err(e) => script_log::push(
-                    &self.script_log,
-                    LogKind::Error,
-                    format!("Load scripts failed: {e}"),
-                ),
-            }
+            self.reload_scripts_dir(&src, "Loaded scripts from");
         }
     }
 
@@ -1276,6 +1288,33 @@ impl NemclassApp {
 
             if !any_filled {
                 break;
+            }
+        }
+
+        // StrPtr: dereference each pointer against the live process and replace
+        // its rendered value (a raw pointer, all `render` can produce from the
+        // class buffer) with the NUL-terminated UTF-8 string it points at.
+        if let Some(proc) = &self.process {
+            const STR_PTR_MAX: usize = 256;
+            for snap in &mut self.node_snapshots {
+                if snap.type_tag != "StrPtr" {
+                    continue;
+                }
+                let mut ptr_bytes = [0u8; 8];
+                let n = proc.read_buf(snap.address, &mut ptr_bytes).unwrap_or(0);
+                let target = if n >= 8 {
+                    u64::from_le_bytes(ptr_bytes) as usize
+                } else {
+                    0
+                };
+                if target == 0 {
+                    snap.rendered.value = "0x0 → (null)".to_string();
+                    continue;
+                }
+                let bytes = read_process_buf(proc, target, STR_PTR_MAX);
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                let s = String::from_utf8_lossy(&bytes[..end]);
+                snap.rendered.value = format!("0x{target:X} → \"{s}\"");
             }
         }
     }
@@ -1532,6 +1571,24 @@ impl eframe::App for NemclassApp {
                 let pid = self.process.as_ref().map(|p| p.pid());
                 self.script_host
                     .on_event(&Event::OnTick { pid });
+            }
+
+            // Auto-reload: once per second, poll the scripts dir for a changed
+            // file (by modified-time) and reload once when an edit is detected.
+            // Gated by the Scripts-panel toggle and a live engine.
+            if self.scripts_panel.auto_reload() && self.script_host.is_active() {
+                let watch_due = self
+                    .last_script_watch
+                    .map(|t| t.elapsed() >= Duration::from_millis(1000))
+                    .unwrap_or(true);
+                if watch_due {
+                    self.last_script_watch = Some(Instant::now());
+                    if let Some(dir) = self.project_dir.as_ref().map(|d| d.join("src")) {
+                        if scan_script_mtimes(&dir) != self.script_mtimes {
+                            self.reload_scripts_dir(&dir, "Auto-reloaded (file changed):");
+                        }
+                    }
+                }
             }
 
             // Poll script-registered global hotkeys. For each match this frame,
@@ -2276,37 +2333,14 @@ impl NemclassApp {
             ScriptsPanelAction::None => {}
             ScriptsPanelAction::LoadAll => {
                 if let Some(dir) = scripts_dir {
-                    match self.script_host.load_scripts(&dir) {
-                        Ok(()) => script_log::push(
-                            &self.script_log,
-                            LogKind::Lifecycle,
-                            format!("Loaded scripts from {}", dir.display()),
-                        ),
-                        Err(e) => script_log::push(
-                            &self.script_log,
-                            LogKind::Error,
-                            format!("Load scripts failed: {e}"),
-                        ),
-                    }
+                    self.reload_scripts_dir(&dir, "Loaded scripts from");
                 }
             }
             ScriptsPanelAction::Reload(path) => {
                 // The engine loads a whole directory; reload the file's parent so
                 // a single-file reload still refreshes it.
-                let dir = path.parent().map(|p| p.to_path_buf());
-                if let Some(dir) = dir {
-                    match self.script_host.load_scripts(&dir) {
-                        Ok(()) => script_log::push(
-                            &self.script_log,
-                            LogKind::Lifecycle,
-                            format!("Reloaded {}", path.display()),
-                        ),
-                        Err(e) => script_log::push(
-                            &self.script_log,
-                            LogKind::Error,
-                            format!("Reload failed: {e}"),
-                        ),
-                    }
+                if let Some(dir) = path.parent().map(|p| p.to_path_buf()) {
+                    self.reload_scripts_dir(&dir, "Reloaded scripts from");
                 }
             }
             ScriptsPanelAction::Clear => {
@@ -3218,6 +3252,7 @@ impl NemclassApp {
                 ("UInt 32",  "UInt32"),  ("UInt 64", "UInt64"),
                 ("Float",    "Float"),   ("Double",  "Double"),
                 ("Bool",     "Bool"),    ("Pointer", "Pointer"),
+                ("Str Pointer", "StrPtr"),
             ] {
                 if ui.button(label).clicked() {
                     self.pending_node_edits.push(NodeEditOp::ChangeType {
@@ -3613,6 +3648,34 @@ impl NemclassApp {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+/// Snapshots the modified-times of every `*.js`/`*.ts` file directly under
+/// `dir`. Used by the auto-reload watcher to detect script edits (added, removed,
+/// or touched files all change the resulting map). Returns empty on an unreadable
+/// directory, which compares equal to a previous empty snapshot (no spurious
+/// reload).
+#[cfg(feature = "scripting")]
+fn scan_script_mtimes(dir: &Path) -> HashMap<PathBuf, std::time::SystemTime> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_script = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("js") || e.eq_ignore_ascii_case("ts"))
+            .unwrap_or(false);
+        if !is_script {
+            continue;
+        }
+        if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+            out.insert(path, modified);
+        }
+    }
+    out
+}
+
 // Tree flattening
 // ---------------------------------------------------------------------------
 

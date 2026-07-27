@@ -123,6 +123,29 @@ fn render_utf16_text() {
 }
 
 #[test]
+fn strptr_is_eight_byte_pointer() {
+    let n = StrPtrNode::new("s");
+    assert_eq!(n.memory_size(), 8);
+    assert_eq!(n.type_tag(), "StrPtr");
+    // render surfaces the raw pointer value; the UI dereferences it live.
+    let buf = 0x1234_5678_9ABC_DEF0u64.to_le_bytes();
+    assert_eq!(n.render(&buf, 0).value, "0x123456789ABCDEF0");
+}
+
+#[test]
+fn strptr_round_trips_through_registry() {
+    let reg = NodeRegistry::new().with_builtins();
+    let mut n = StrPtrNode::new("name_ptr");
+    n.comment = "points at a C string".into();
+    let def = n.to_node_def();
+    let back = reg.deserialize_node(def).expect("StrPtr registered");
+    assert_eq!(back.type_tag(), "StrPtr");
+    assert_eq!(back.name(), "name_ptr");
+    assert_eq!(back.comment(), "points at a C string");
+    assert_eq!(back.memory_size(), 8);
+}
+
+#[test]
 fn render_buffer_underrun_returns_placeholder() {
     // buf too small — should return "<?>"
     let r = Int32Node::new("x").render(&[0u8, 1u8], 0);

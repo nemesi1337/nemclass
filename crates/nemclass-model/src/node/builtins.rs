@@ -358,3 +358,44 @@ impl Node for Utf16TextNode {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// StrPtrNode — an 8-byte pointer to a NUL-terminated UTF-8 string.
+//
+// Like ReClass.NET's text-pointer node: the field itself holds a pointer, and
+// the *pointed-to* bytes are the string. `render` (which only sees the local
+// class buffer) can only surface the raw pointer value — the UI dereferences it
+// against the live process to display the actual string.
+// ---------------------------------------------------------------------------
+
+pub struct StrPtrNode {
+    pub name: String,
+    pub comment: String,
+}
+
+impl StrPtrNode {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into(), comment: String::new() }
+    }
+}
+
+impl Node for StrPtrNode {
+    fn type_tag(&self) -> &'static str { "StrPtr" }
+    fn name(&self) -> &str { &self.name }
+    fn set_name(&mut self, n: String) { self.name = n; }
+    fn comment(&self) -> &str { &self.comment }
+    fn set_comment(&mut self, c: String) { self.comment = c; }
+    fn memory_size(&self) -> usize { 8 }
+    fn children(&self) -> &[Box<dyn Node>] { &[] }
+    fn children_mut(&mut self) -> Option<&mut Vec<Box<dyn Node>>> { None }
+    fn render(&self, buf: &[u8], base_offset: usize) -> RenderedValue {
+        let Some(bytes) = read_bytes(buf, base_offset, 8) else {
+            return fallback("StrPtr", 8);
+        };
+        let v = pod_read_unaligned::<u64>(bytes);
+        RenderedValue { value: format!("0x{v:016X}"), type_tag: "StrPtr", memory_size: 8 }
+    }
+    fn to_node_def(&self) -> NodeDef {
+        simple_def("StrPtr", &self.name, &self.comment)
+    }
+}

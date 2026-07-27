@@ -35,11 +35,23 @@ pub enum ScriptsPanelAction {
 pub struct ScriptsPanel {
     /// Case-insensitive substring filter for the script-file list.
     filter: String,
+    /// When set, the app watches the scripts dir and reloads once on file change.
+    auto_reload: bool,
 }
 
 impl ScriptsPanel {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            auto_reload: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether auto-reload-on-change is enabled (the panel checkbox). Only the
+    /// scripting build watches files, so the accessor is unused without it.
+    #[cfg(feature = "scripting")]
+    pub fn auto_reload(&self) -> bool {
+        self.auto_reload
     }
 
     /// Draws the panel and returns the collected action.
@@ -87,6 +99,8 @@ impl ScriptsPanel {
             {
                 action = ScriptsPanelAction::LoadAll;
             }
+            ui.checkbox(&mut self.auto_reload, "Auto-reload on change")
+                .on_hover_text("Reload scripts automatically when a file in src/ changes");
             ui.label("Filter:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
