@@ -14,6 +14,12 @@ bitflags::bitflags! {
         const RX = 0b101;
         /// Read | Write | Execute
         const RWX = 0b111;
+        /// Copy-on-write: a writable, process-private view of a file-backed
+        /// mapping — Windows' `PAGE_WRITECOPY`, and on Linux a writable `p`
+        /// (private) mapping with a backing path. Orthogonal to `R`/`W`/`X`,
+        /// and deliberately outside [`Protection::RWX`] so it never leaks into
+        /// the POSIX `PROT_*` conversions.
+        const COW = 0b1000;
     }
 }
 
@@ -34,6 +40,16 @@ impl Protection {
     #[inline]
     pub const fn execute(&self) -> bool {
         self.contains(Self::X)
+    }
+
+    /// Is this a copy-on-write mapping?
+    ///
+    /// Never set by [`Protection::parse`] — the maps `rwx` chars don't carry it.
+    /// The caller that also has the sharing flag and the backing path sets it
+    /// (see `parse_maps_sections`).
+    #[inline]
+    pub const fn copy_on_write(&self) -> bool {
+        self.contains(Self::COW)
     }
 
     /// Parses a permission string of kind `r-x` (as found in `/proc/<pid>/maps`).
@@ -58,15 +74,23 @@ impl Protection {
     }
 
     /// Converts to os protection type.
+    ///
+    /// Only the `rwx` bits are meaningful as POSIX `PROT_*` flags (which happen
+    /// to share this layout); [`Protection::COW`] is a classification of our own
+    /// and is masked off so it can never be handed to `mprotect`.
     #[cfg(unix)]
     pub const fn to_os(&self) -> i32 {
-        self.bits() as i32
+        (self.bits() & Self::RWX.bits()) as i32
     }
 
     /// Converts from os protection type.
+    ///
+    /// `PROT_*` has no copy-on-write flag, so [`Protection::COW`] is never set
+    /// here — the bit is masked off rather than truncated in, in case a caller
+    /// passes a value with unrelated high bits.
     #[cfg(unix)]
     pub const fn from_os(prot: i32) -> Self {
-        Self::from_bits_truncate(prot as u8)
+        Self::from_bits_truncate(prot as u8 & Self::RWX.bits())
     }
 }
 
@@ -105,6 +129,22 @@ mod tests {
         assert!(rx.read() && !rx.write() && rx.execute());
     }
 
+    #[test]
+    fn parse_never_sets_copy_on_write() {
+        // The rwx chars don't carry it; only a caller with the sharing flag and
+        // the backing path can classify a mapping as copy-on-write.
+        assert!(!Protection::parse("rw-p").copy_on_write());
+        assert!(!Protection::parse("rwx").copy_on_write());
+    }
+
+    #[test]
+    fn copy_on_write_is_orthogonal_to_rwx() {
+        let cow = Protection::RW | Protection::COW;
+        assert!(cow.read() && cow.write() && !cow.execute());
+        assert!(cow.copy_on_write());
+        assert!(!Protection::RW.copy_on_write());
+    }
+
     // `to_os`/`from_os` are `#[cfg(unix)]` (they map to/from POSIX `PROT_*`
     // integers), so this round-trip test is unix-only too.
     #[cfg(unix)]
@@ -112,5 +152,15 @@ mod tests {
     fn os_round_trip_preserves_rwx() {
         let p = Protection::RWX;
         assert_eq!(Protection::from_os(p.to_os()), p);
+    }
+
+    // COW has no `PROT_*` equivalent, so it must not survive a round trip —
+    // and must never reach `mprotect` as a stray bit.
+    #[cfg(unix)]
+    #[test]
+    fn os_conversion_drops_copy_on_write() {
+        let p = Protection::RW | Protection::COW;
+        assert_eq!(p.to_os(), Protection::RW.to_os());
+        assert_eq!(Protection::from_os(p.to_os()), Protection::RW);
     }
 }

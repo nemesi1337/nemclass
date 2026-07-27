@@ -27,7 +27,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+    MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
+    PAGE_EXECUTE_READ,
     PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
     PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtectEx, VirtualQueryEx,
 };
@@ -417,8 +418,9 @@ fn enumerate_modules(handle: HANDLE) -> crate::Result<Vec<Module>> {
 ///
 /// Mirrors the `Protect` decoding in ReClass.NET's
 /// `EnumerateRemoteSectionsAndModules.cpp`; the copy-on-write variants read as
-/// readable+writable (the write bit reflects that the page is writable), and the
-/// `PAGE_GUARD`/`PAGE_NOCACHE` modifier bits are ignored for r/w/x purposes.
+/// readable+writable (the write bit reflects that the page is writable) plus
+/// [`Protection::COW`], and the `PAGE_GUARD`/`PAGE_NOCACHE` modifier bits are
+/// ignored for r/w/x purposes.
 fn protection_from_page_flags(protect: u32) -> Protection {
     // The low 8 bits carry the base protection; `PAGE_GUARD` (0x100) etc. are
     // modifiers we mask off before matching the base constant.
@@ -427,10 +429,10 @@ fn protection_from_page_flags(protect: u32) -> Protection {
         p if p == PAGE_EXECUTE => Protection::X,
         p if p == PAGE_EXECUTE_READ => Protection::RX,
         p if p == PAGE_EXECUTE_READWRITE => Protection::RWX,
-        p if p == PAGE_EXECUTE_WRITECOPY => Protection::RWX,
+        p if p == PAGE_EXECUTE_WRITECOPY => Protection::RWX | Protection::COW,
         p if p == PAGE_READONLY => Protection::R,
         p if p == PAGE_READWRITE => Protection::RW,
-        p if p == PAGE_WRITECOPY => Protection::RW,
+        p if p == PAGE_WRITECOPY => Protection::RW | Protection::COW,
         // PAGE_NOACCESS and anything unrecognised: no access.
         _ => Protection::empty(),
     }
@@ -441,8 +443,8 @@ fn section_type_from_mem_type(mem_type: u32) -> SectionType {
     match mem_type {
         t if t == MEM_IMAGE => SectionType::Image,
         t if t == MEM_MAPPED => SectionType::Mapped,
-        // MEM_PRIVATE (heap/stack/private) — anonymous, like Linux's `Mapped`.
-        _ => SectionType::Mapped,
+        t if t == MEM_PRIVATE => SectionType::Private,
+        _ => SectionType::Unknown,
     }
 }
 

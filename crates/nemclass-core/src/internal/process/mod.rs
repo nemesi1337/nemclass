@@ -400,8 +400,17 @@ fn parse_maps_modules(maps: &str) -> Vec<RawModule> {
 ///
 /// Unlike [`parse_maps_modules`], this keeps every mapping as its own section
 /// (ReClass.NET's `EnumerateRemoteSectionData`): file-backed mappings are
-/// [`SectionType::Image`] and carry their module file name; anonymous mappings
-/// are [`SectionType::Mapped`]. Sections are returned in `maps` order.
+/// [`SectionType::Image`] and carry their module file name, shared (`s`)
+/// mappings are [`SectionType::Mapped`], and everything else — the heap, thread
+/// stacks, plain anonymous memory — is [`SectionType::Private`]. Sections are
+/// returned in `maps` order.
+///
+/// Writable, private, file-backed mappings additionally get
+/// [`Protection::COW`], Linux's analogue of Windows' `PAGE_WRITECOPY`.
+///
+/// One known imprecision: `[vdso]`/`[vvar]` are kernel-provided private
+/// mappings with no path, so they land in [`SectionType::Private`] rather than
+/// `Mapped`. They are tiny and read-only, so no scan filter is affected.
 #[cfg(target_os = "linux")]
 pub(crate) fn parse_maps_sections(maps: &str) -> Vec<Section> {
     let mut out = Vec::new();
@@ -424,19 +433,34 @@ pub(crate) fn parse_maps_sections(maps: &str) -> Vec<Section> {
             continue;
         };
         let perms = fields.next().unwrap_or("----");
-        // Protection is the r/w/x of the first three perm chars ('p'/'s' is the
-        // 4th and irrelevant here).
+        // Protection is the r/w/x of the first three perm chars; the 4th is the
+        // sharing flag ('p' private / 's' shared), which classifies the section
+        // rather than its access rights.
         let prot = Protection::parse(&perms[..perms.len().min(3)]);
+        let shared = perms.as_bytes().get(3) == Some(&b's');
 
         // A file-backed mapping is one with a real path (starts with '/'); the
         // pseudo-mappings [heap]/[stack]/[vvar] start with '[' and are anonymous.
         let (kind, module) = match path {
+            // Shared first: a file-backed *shared* mapping (`/dev/shm/...`, an
+            // mmap'd file with MAP_SHARED) is shared memory, not a module image
+            // — module code and data are always private (`p`) views.
+            _ if shared => (SectionType::Mapped, None),
             Some(p) if p.starts_with('/') => {
                 let p = p.strip_suffix("(deleted)").map(str::trim_end).unwrap_or(p);
                 let name = p.rsplit('/').next().filter(|n| !n.is_empty()).map(str::to_owned);
                 (SectionType::Image, name)
             }
-            _ => (SectionType::Mapped, None),
+            // Everything else is anonymous private memory: [heap], [stack], anon.
+            _ => (SectionType::Private, None),
+        };
+
+        // A writable private view of a file is copy-on-write — the same thing
+        // Windows reports as PAGE_WRITECOPY.
+        let prot = if !shared && kind == SectionType::Image && prot.write() {
+            prot | Protection::COW
+        } else {
+            prot
         };
 
         out.push(Section {
@@ -467,6 +491,14 @@ mod tests {
 7f0000006000-7f0000007000 rw-p 00000000 00:00 0     [heap]
 7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0     [stack]
 7f0000009000-7f000000a000 ---p 00000000 00:00 0 ";
+
+    // The section-classification corner cases, kept separate so they don't
+    // perturb the module-merging expectations above: a writable private view of
+    // a file (copy-on-write) and a shared file-backed mapping.
+    const SHARING_MAPS: &str = "\
+55d000004000-55d000005000 rw-p 00003000 08:01 100   /usr/bin/app
+7f000000b000-7f000000c000 rw-s 00000000 00:05 300   /dev/shm/shared
+7f000000c000-7f000000d000 rw-s 00000000 00:00 0     ";
 
     #[test]
     fn parse_maps_modules_merges_fragments_and_handles_paths() {
@@ -505,13 +537,43 @@ mod tests {
         assert_eq!(secs[3].module.as_deref(), Some("game.exe"));
         assert_eq!(secs[3].kind, SectionType::Image);
 
-        // [heap] is an anonymous, writable mapping.
-        assert_eq!(secs[4].kind, SectionType::Mapped);
+        // [heap] is anonymous private memory, not a shared mapping.
+        assert_eq!(secs[4].kind, SectionType::Private);
         assert_eq!(secs[4].prot, Protection::RW);
         assert_eq!(secs[4].module, None);
 
+        // [stack] likewise.
+        assert_eq!(secs[5].kind, SectionType::Private);
+
         // Trailing `---p` anonymous mapping with no name column.
-        assert_eq!(secs[6].kind, SectionType::Mapped);
+        assert_eq!(secs[6].kind, SectionType::Private);
         assert_eq!(secs[6].prot, Protection::empty());
+
+        // Read-only and executable image pages are never copy-on-write.
+        assert!(!secs[0].prot.copy_on_write());
+        assert!(!secs[1].prot.copy_on_write());
+    }
+
+    #[test]
+    fn parse_maps_sections_classifies_sharing_and_copy_on_write() {
+        let secs = parse_maps_sections(SHARING_MAPS);
+        assert_eq!(secs.len(), 3);
+
+        // A writable *private* view of a file: an image section, and Linux's
+        // equivalent of PAGE_WRITECOPY.
+        assert_eq!(secs[0].kind, SectionType::Image);
+        assert_eq!(secs[0].module.as_deref(), Some("app"));
+        assert!(secs[0].prot.write());
+        assert!(secs[0].prot.copy_on_write());
+
+        // A shared file-backed mapping is Mapped, and shared implies not CoW.
+        assert_eq!(secs[1].kind, SectionType::Mapped);
+        assert!(!secs[1].prot.copy_on_write());
+        // Shared mappings carry no module name — they aren't part of an image.
+        assert_eq!(secs[1].module, None);
+
+        // Anonymous shared memory (no path) is also Mapped, not Private.
+        assert_eq!(secs[2].kind, SectionType::Mapped);
+        assert_eq!(secs[2].module, None);
     }
 }

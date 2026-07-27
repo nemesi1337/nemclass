@@ -57,13 +57,19 @@ pub struct ModuleInfoWithName {
 pub type Module = ModuleInfoWithName;
 
 /// Origin of a memory [`Section`] — mirrors ReClass.NET's `SectionType`, telling
-/// an image mapping (backed by a file / inode) apart from an anonymous mapping.
+/// an image mapping (backed by a file / inode) apart from a shared mapping and
+/// from plain anonymous private memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionType {
     /// Backed by a mapped file (has an inode) — part of a module image.
     Image,
-    /// An anonymous mapping (heap, stack, private, ...).
+    /// A shared mapping: file- or shm-backed and visible to other processes
+    /// (Windows `MEM_MAPPED`, Linux's `s` sharing flag).
     Mapped,
+    /// Anonymous, process-private memory — the heap, thread stacks and plain
+    /// anonymous mappings (Windows `MEM_PRIVATE`). This is where a value scan
+    /// finds most of what it is looking for.
+    Private,
     /// Origin could not be determined.
     Unknown,
 }
