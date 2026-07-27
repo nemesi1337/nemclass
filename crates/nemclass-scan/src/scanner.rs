@@ -11,7 +11,7 @@ use nemclass_core::Result;
 
 use crate::compare::ScanCompareType;
 use crate::results::{ScanResult, ScanResults};
-use crate::target::{Region, ScanTarget};
+use crate::target::{Region, RegionFilter, ScanTarget};
 use crate::value_type::{Needle, ScanValueType};
 
 /// The read buffer size for the first-scan chunked region walk (a handful of
@@ -43,6 +43,16 @@ pub struct ScanProgress {
 pub struct Scanner<T: ScanTarget> {
     target: T,
     value_type: ScanValueType,
+    /// Which parts of the address space [`Scanner::first_scan`] may walk.
+    ///
+    /// Consulted by a first scan only: a next scan re-reads the previous
+    /// results, which are by construction already inside the first scan's
+    /// range. Same contract as ReClass.NET.
+    region_filter: RegionFilter,
+    /// How many regions the last [`Scanner::first_scan`] actually walked, after
+    /// filtering. Zero means the filter excluded everything — a caller should
+    /// report that differently from "scanned everything, found nothing".
+    scanned_regions: usize,
     /// Result generations, oldest first; the last is the current one. Bounded to
     /// [`HISTORY_DEPTH`].
     history: Vec<ScanResults>,
@@ -56,9 +66,36 @@ impl<T: ScanTarget> Scanner<T> {
         Self {
             target,
             value_type,
+            region_filter: RegionFilter::default(),
+            scanned_regions: 0,
             history: Vec::new(),
             has_scanned: false,
         }
+    }
+
+    /// Restricts which parts of the address space a first scan walks.
+    pub fn with_region_filter(mut self, filter: RegionFilter) -> Self {
+        self.region_filter = filter;
+        self
+    }
+
+    /// Replaces the region filter in place. Takes effect on the next
+    /// [`Scanner::first_scan`].
+    pub fn set_region_filter(&mut self, filter: RegionFilter) {
+        self.region_filter = filter;
+    }
+
+    /// The active region filter.
+    pub fn region_filter(&self) -> &RegionFilter {
+        &self.region_filter
+    }
+
+    /// How many regions the last first scan walked after filtering.
+    ///
+    /// Zero after a first scan means the scope matched no memory at all, which
+    /// a UI should distinguish from an honest zero-match result.
+    pub fn scanned_region_count(&self) -> usize {
+        self.scanned_regions
     }
 
     /// The value type this scanner searches for.
@@ -107,8 +144,8 @@ impl<T: ScanTarget> Scanner<T> {
     /// For absolute/delta comparisons pass the parsed `needle`; for the pure
     /// change-relative first-scan baseline ([`ScanCompareType::Unknown`]) pass
     /// `None` (a `None` needle with any needle-requiring compare is rejected).
-    /// Every readable [`Region`] is walked in [`CHUNK_SIZE`] windows and every
-    /// stride-aligned position is compared.
+    /// Every readable [`Region`] that survives the [`RegionFilter`] is walked in
+    /// [`CHUNK_SIZE`] windows and every stride-aligned position is compared.
     pub fn first_scan(
         &mut self,
         compare: ScanCompareType,
@@ -128,7 +165,8 @@ impl<T: ScanTarget> Scanner<T> {
             return Err(needle_error());
         }
 
-        let regions = self.target.regions()?;
+        let regions = self.region_filter.apply(&self.target.regions()?);
+        self.scanned_regions = regions.len();
         let mut results = ScanResults::new();
         let mut buf = vec![0u8; CHUNK_SIZE.max(stride)];
 
@@ -290,6 +328,8 @@ impl<T: ScanTarget + Clone> Scanner<T> {
         Self {
             target: self.target.clone(),
             value_type: self.value_type,
+            region_filter: self.region_filter.clone(),
+            scanned_regions: self.scanned_regions,
             history: self.history.clone(),
             has_scanned: self.has_scanned,
         }

@@ -296,13 +296,6 @@ impl PointerScanPanel {
         action
     }
 
-    /// Parse `0x…`/decimal into a usize address.
-    fn parse_addr(&self, text: &str) -> Option<usize> {
-        let t = text.trim();
-        let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
-        usize::from_str_radix(t, 16).ok()
-    }
-
     /// Launch a pointer scan on the background pool. Building the pointer map and
     /// walking it can take tens of seconds, so it must not block the UI thread.
     /// The `ProcessTarget` is (re)attached inside the worker; the prepared rows
@@ -326,12 +319,12 @@ impl PointerScanPanel {
             self.status_msg = Some("No process attached.".into());
             return;
         };
-        let Some(goal) = self.parse_addr(&self.goal_text) else {
+        let Some(goal) = super::parse_hex_addr(&self.goal_text) else {
             self.status_msg = Some("Enter a valid goal address (hex).".into());
             return;
         };
         let max_depth: usize = self.depth_text.trim().parse().unwrap_or(5).clamp(1, 12);
-        let max_offset = self.parse_addr(&self.max_offset_text).unwrap_or(0x1000);
+        let max_offset = super::parse_hex_addr(&self.max_offset_text).unwrap_or(0x1000);
 
         // Static anchors = module images. Snapshot them (owned) for the worker.
         let static_ranges: Vec<Region> =
@@ -381,7 +374,7 @@ impl PointerScanPanel {
             self.status_msg = Some("No process attached.".into());
             return;
         };
-        let Some(goal) = self.parse_addr(&self.goal_text) else {
+        let Some(goal) = super::parse_hex_addr(&self.goal_text) else {
             self.status_msg = Some("Enter a valid goal address (hex).".into());
             return;
         };

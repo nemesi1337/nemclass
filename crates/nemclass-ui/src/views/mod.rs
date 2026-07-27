@@ -2323,6 +2323,16 @@ impl NemclassApp {
         #[cfg(not(target_os = "linux"))]
         let pid: Option<nemclass_core::Pid> = None;
 
+        // Owned snapshot: `process_ref` below holds an immutable borrow of
+        // `self.process` across the `&mut self.scanner_panel` call, so a
+        // borrowing iterator wouldn't compile.
+        let modules: Vec<nemclass_core::ModuleInfoWithName> = self
+            .process
+            .as_ref()
+            .and_then(|p| p.modules().ok())
+            .map(|it| it.collect())
+            .unwrap_or_default();
+
         let process_ref = self.process.as_deref();
         // Owned handle (cloned) so it doesn't borrow `self` across the panel call.
         let rt = self.runtime.as_ref().expect("bg runtime").handle();
@@ -2335,6 +2345,7 @@ impl NemclassApp {
             ui,
             process_ref,
             pid,
+            &modules,
             &rt,
             |addr| { add_to_class_addr = Some(addr); },
             |addr, tag| { add_to_table = Some((addr, tag.to_owned())); },
@@ -3845,6 +3856,19 @@ fn build_augmented_rows(
 // ---------------------------------------------------------------------------
 // Structural mutation helpers
 // ---------------------------------------------------------------------------
+
+/// Parse a hex address as typed into an address field: an optional `0x`/`0X`
+/// prefix, and `_` group separators for readability. Returns `None` on anything
+/// that isn't a hex number, including an empty string — a caller that treats a
+/// blank field as "unset" must check for that before calling.
+pub(crate) fn parse_hex_addr(text: &str) -> Option<usize> {
+    let t = text.trim();
+    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    if t.is_empty() {
+        return None;
+    }
+    usize::from_str_radix(&t.replace('_', ""), 16).ok()
+}
 
 /// Greedy-fill: produce nodes summing to `count` bytes using Hex64/32/16/8.
 fn hex_fill(count: usize) -> Vec<Box<dyn Node>> {

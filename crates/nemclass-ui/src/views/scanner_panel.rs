@@ -24,13 +24,14 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use nemclass_scan::{
-    FreezeSet, Needle, ScanCompareType, ScanValueType, Scanner,
+    FilterState, FreezeSet, Needle, Region, RegionFilter, ScanCompareType, ScanValueType, Scanner,
+    SectionFilter,
 };
 
 #[cfg(target_os = "linux")]
 use nemclass_scan::ProcessTarget;
 
-use nemclass_core::{Pid, Process};
+use nemclass_core::{ModuleInfoWithName, Pid, Process};
 
 use super::tasks::{BackgroundJob, Poll as JobPoll};
 
@@ -66,6 +67,27 @@ pub struct ScannerPanel {
     /// Upper-bound text field, shown only when `compare == Between`.
     upper_text: String,
 
+    // ── scan scope (first scan only) ───────────────────────────────────
+    /// Master toggle for the whole "Scan range" section.
+    scan_range_enabled: bool,
+    /// Manual window start (hex, inclusive). Empty = no lower bound.
+    range_start_text: String,
+    /// Manual window end (hex, **exclusive**, as in `/proc/<pid>/maps`).
+    /// Empty = no upper bound.
+    range_end_text: String,
+    /// Modules whose image spans restrict the scan, held by *name* so the
+    /// selection survives the per-frame module re-enumeration.
+    selected_modules: std::collections::BTreeSet<String>,
+    /// Filter text for the module checkbox list.
+    module_filter: String,
+    /// Protection and memory-type filters (ReClass.NET's `ScanSettings`).
+    writable: FilterState,
+    executable: FilterState,
+    copy_on_write: FilterState,
+    scan_private: bool,
+    scan_image: bool,
+    scan_mapped: bool,
+
     // ── active scanner (Linux: Option<Scanner<ProcessTarget>>) ─────────
     /// Boxed so it can be `None` on non-Linux, or before the first scan.
     #[cfg(target_os = "linux")]
@@ -74,6 +96,10 @@ pub struct ScannerPanel {
     /// `Scanner` lives inside the worker; it is moved back when the job completes.
     #[cfg(target_os = "linux")]
     scan_job: BackgroundJob<ScanOutcome>,
+    /// Whether the in-flight job is a *first* scan, so [`Self::poll`] knows
+    /// `scanned_region_count()` reflects it.
+    #[cfg(target_os = "linux")]
+    last_job_was_first_scan: bool,
     /// Mirror the result set as a snapshot for the display, so the borrow
     /// checker can let us iterate while also drawing "add to class" buttons.
     result_snapshot: Vec<(usize, Vec<u8>)>,
@@ -94,10 +120,25 @@ impl ScannerPanel {
             compare:      ScanCompareType::Exact,
             needle_text:  String::new(),
             upper_text:   String::new(),
+            scan_range_enabled: false,
+            range_start_text: String::new(),
+            range_end_text:   String::new(),
+            selected_modules: std::collections::BTreeSet::new(),
+            module_filter:    String::new(),
+            // Mirrors `SectionFilter::default()` — writable-only, which is what
+            // the scanner did before the scope controls existed.
+            writable:      FilterState::Yes,
+            executable:    FilterState::Any,
+            copy_on_write: FilterState::No,
+            scan_private: true,
+            scan_image:   true,
+            scan_mapped:  false,
             #[cfg(target_os = "linux")]
             scanner:      None,
             #[cfg(target_os = "linux")]
             scan_job:     BackgroundJob::default(),
+            #[cfg(target_os = "linux")]
+            last_job_was_first_scan: false,
             result_snapshot: Vec::new(),
             freeze_set:   FreezeSet::new(),
             freeze_entries: Vec::new(),
@@ -145,7 +186,23 @@ impl ScannerPanel {
                     match scan_result {
                         Ok(snapshot) => {
                             self.result_snapshot = snapshot;
-                            self.status_msg = None;
+                            // A scope that excluded every region yields an empty
+                            // result set indistinguishable from "value not
+                            // found". Say so explicitly rather than let the user
+                            // conclude their value isn't there. Reported here
+                            // rather than as an `Err` because the error branch
+                            // leaves the *previous* results on screen.
+                            let scope_matched_nothing = self.last_job_was_first_scan
+                                && self
+                                    .scanner
+                                    .as_ref()
+                                    .is_some_and(|s| s.scanned_region_count() == 0);
+                            self.status_msg = scope_matched_nothing.then(|| {
+                                "Scan range matched no memory — the address window, selected \
+                                 modules and memory-type filters don't overlap any region. \
+                                 Widen the range or untick \"Restrict scan range\"."
+                                    .to_string()
+                            });
                         }
                         Err(msg) => self.status_msg = Some(msg),
                     }
@@ -164,7 +221,11 @@ impl ScannerPanel {
             self.scanner = None;
             // Drop any in-flight scan so its (now-stale) result is discarded.
             self.scan_job = BackgroundJob::default();
+            self.last_job_was_first_scan = false;
         }
+        // Module names belong to the process we just left. The address window
+        // and filter toggles are user preferences and deliberately persist.
+        self.selected_modules.clear();
         self.result_snapshot.clear();
         self.freeze_set = FreezeSet::new();
         self.freeze_entries.clear();
@@ -182,6 +243,7 @@ impl ScannerPanel {
         ui: &mut egui::Ui,
         process: Option<&Process>,
         pid: Option<Pid>,
+        modules: &[ModuleInfoWithName],
         rt: &tokio::runtime::Handle,
         mut add_to_class_cb: impl FnMut(usize),
         mut add_to_table_cb: impl FnMut(usize, &str),
@@ -195,7 +257,7 @@ impl ScannerPanel {
         }
 
         ui.add_enabled_ui(attached, |ui| {
-            self.show_controls(ui, pid, rt);
+            self.show_controls(ui, pid, modules, rt);
         });
 
         ui.separator();
@@ -218,7 +280,13 @@ impl ScannerPanel {
 
     // ── controls row ───────────────────────────────────────────────────
 
-    fn show_controls(&mut self, ui: &mut egui::Ui, pid: Option<Pid>, rt: &tokio::runtime::Handle) {
+    fn show_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        pid: Option<Pid>,
+        modules: &[ModuleInfoWithName],
+        rt: &tokio::runtime::Handle,
+    ) {
         ui.horizontal(|ui| {
             // Value type selector.
             egui::ComboBox::from_id_salt("scan_vtype")
@@ -260,6 +328,10 @@ impl ScannerPanel {
 
         ui.add_space(2.0);
 
+        self.show_scan_range(ui, modules);
+
+        ui.add_space(2.0);
+
         // A scan is running on the background pool: gate the scan buttons and show
         // a spinner so the user can't stack scans and sees progress.
         let scanning = {
@@ -273,7 +345,7 @@ impl ScannerPanel {
             // First Scan.
             #[cfg(target_os = "linux")]
             if ui.add_enabled(!scanning, egui::Button::new("First Scan")).clicked() {
-                self.do_first_scan(pid, rt, ui.ctx().clone());
+                self.do_first_scan(pid, modules, rt, ui.ctx().clone());
             }
             #[cfg(not(target_os = "linux"))]
             if ui.button("First Scan").clicked() {
@@ -332,7 +404,273 @@ impl ScannerPanel {
             } else {
                 ui.label(format!("Results: {}", total));
             }
+            // With a scope active, show how much memory it actually covered so
+            // the restriction is visibly taking effect.
+            #[cfg(target_os = "linux")]
+            if self.scan_range_enabled
+                && self.last_job_was_first_scan
+                && let Some(n) = self.scanner.as_ref().map(|s| s.scanned_region_count())
+                && n > 0
+            {
+                ui.weak(format!("({n} region(s) scanned)"));
+            }
         });
+    }
+
+    // ── scan scope ─────────────────────────────────────────────────────
+
+    /// The collapsible "Scan range" section: a manual address window, the
+    /// memory-type and protection filters, and a module multiselect.
+    ///
+    /// Applies to First Scan only — a next scan re-reads the addresses the first
+    /// scan found and never consults the region list.
+    fn show_scan_range(&mut self, ui: &mut egui::Ui, modules: &[ModuleInfoWithName]) {
+        // Built before `.show()` so this `&self` borrow ends before the closure
+        // below takes `&mut self`.
+        let header = self.range_summary(modules);
+        egui::CollapsingHeader::new(header)
+            .id_salt("scan_range")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.checkbox(&mut self.scan_range_enabled, "Restrict scan range")
+                    .on_hover_text(
+                        "Applies to First Scan only — Next Scan re-reads the existing \
+                         results, which are already inside the range.",
+                    );
+                let enabled = self.scan_range_enabled;
+
+                ui.add_enabled_ui(enabled, |ui| {
+                    // ── manual address window ─────────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Start:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.range_start_text)
+                                .desired_width(150.0)
+                                .hint_text("0x0"),
+                        )
+                        .on_hover_text("Hex, inclusive. Empty = no lower bound.");
+                        ui.label("End:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.range_end_text)
+                                .desired_width(150.0)
+                                .hint_text("end (exclusive)"),
+                        )
+                        .on_hover_text(
+                            "Hex, exclusive — the same convention as /proc/<pid>/maps, \
+                             so a range pasted from there scans exactly that mapping. \
+                             Empty = no upper bound.",
+                        );
+                        if ui.small_button("Clear").clicked() {
+                            self.range_start_text.clear();
+                            self.range_end_text.clear();
+                        }
+                    });
+
+                    // ── memory type ───────────────────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Memory type:");
+                        ui.checkbox(&mut self.scan_private, "Private")
+                            .on_hover_text("The heap, thread stacks, anonymous memory.");
+                        ui.checkbox(&mut self.scan_image, "Image")
+                            .on_hover_text("Mappings belonging to a loaded module.");
+                        ui.checkbox(&mut self.scan_mapped, "Mapped")
+                            .on_hover_text("Shared memory visible to other processes.");
+                    });
+
+                    // ── protection tri-states ─────────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Protection:");
+                        tri_state_combo(ui, "scan_prot_w", "Writable", &mut self.writable);
+                        tri_state_combo(ui, "scan_prot_x", "Executable", &mut self.executable);
+                        tri_state_combo(ui, "scan_prot_c", "Copy-on-write", &mut self.copy_on_write);
+                    });
+
+                    // An explicit address window supersedes the module picker,
+                    // so grey the list out rather than let it look effective.
+                    let range_set = !self.range_start_text.trim().is_empty()
+                        || !self.range_end_text.trim().is_empty();
+                    ui.add_enabled_ui(!range_set, |ui| {
+                        self.show_module_picker(ui, modules, range_set);
+                    });
+                });
+            });
+    }
+
+    /// The filterable module checkbox list. `range_set` only affects the hint
+    /// text — the caller has already disabled the surrounding `Ui`.
+    fn show_module_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        modules: &[ModuleInfoWithName],
+        range_set: bool,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label("Modules:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.module_filter)
+                    .desired_width(140.0)
+                    .hint_text("name…"),
+            );
+            if !self.module_filter.is_empty() && ui.small_button("✕").clicked() {
+                self.module_filter.clear();
+            }
+            // Bulk actions respect the active filter, so "All" over a filtered
+            // list selects what the user can actually see.
+            let needle = self.module_filter.to_ascii_lowercase();
+            if ui.small_button("All").clicked() {
+                for m in modules {
+                    if needle.is_empty() || m.name.to_ascii_lowercase().contains(&needle) {
+                        self.selected_modules.insert(m.name.clone());
+                    }
+                }
+            }
+            if ui.small_button("None").clicked() {
+                self.selected_modules.clear();
+            }
+            if range_set {
+                ui.weak("(overridden by the address range)");
+            } else if self.selected_modules.is_empty() {
+                ui.weak("all memory");
+            } else {
+                ui.weak(format!("{} selected", self.selected_modules.len()));
+            }
+        });
+
+        let needle = self.module_filter.to_ascii_lowercase();
+        let mut shown = 0usize;
+        egui::ScrollArea::vertical()
+            .id_salt("scan_range_modules")
+            .max_height(160.0)
+            .show(ui, |ui| {
+                for m in modules {
+                    if !needle.is_empty() && !m.name.to_ascii_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    shown += 1;
+                    let mut checked = self.selected_modules.contains(&m.name);
+                    let label = format!(
+                        "{}   0x{:X}–0x{:X}",
+                        m.name,
+                        m.base,
+                        m.base.saturating_add(m.size)
+                    );
+                    if ui.checkbox(&mut checked, label).changed() {
+                        if checked {
+                            self.selected_modules.insert(m.name.clone());
+                        } else {
+                            self.selected_modules.remove(&m.name);
+                        }
+                    }
+                }
+            });
+        if modules.is_empty() {
+            ui.weak("(no modules enumerated for this process)");
+        } else if shown == 0 {
+            ui.weak("(no modules match the filter)");
+        }
+    }
+
+    /// One-line summary for the collapsed header, so the active scope is
+    /// visible without expanding the section.
+    fn range_summary(&self, modules: &[ModuleInfoWithName]) -> String {
+        if !self.scan_range_enabled {
+            return "Scan range: all writable memory".to_string();
+        }
+        let start = self.range_start_text.trim();
+        let end = self.range_end_text.trim();
+        if !start.is_empty() || !end.is_empty() {
+            let lo = if start.is_empty() { "…" } else { start };
+            let hi = if end.is_empty() { "…" } else { end };
+            return format!("Scan range: {lo}–{hi}");
+        }
+        // Count only the selections that resolve, so a stale name from a
+        // previous target doesn't inflate the number.
+        let picked = modules
+            .iter()
+            .filter(|m| self.selected_modules.contains(&m.name))
+            .count();
+        match picked {
+            0 => "Scan range: all memory (filtered)".to_string(),
+            1 => "Scan range: 1 module".to_string(),
+            n => format!("Scan range: {n} modules"),
+        }
+    }
+
+    /// Build the scan scope from the range fields, mirroring
+    /// [`Self::parse_needle`]: on invalid input it stores a `status_msg` and
+    /// returns `None`, so the caller aborts before spawning any work.
+    ///
+    /// `Some(defaults)` means "explicitly unrestricted" and is distinct from the
+    /// `None` error case.
+    #[cfg(target_os = "linux")]
+    fn build_filters(
+        &mut self,
+        modules: &[ModuleInfoWithName],
+    ) -> Option<(RegionFilter, SectionFilter)> {
+        if !self.scan_range_enabled {
+            return Some((RegionFilter::default(), SectionFilter::default()));
+        }
+
+        let start = match parse_opt_hex(&self.range_start_text) {
+            Ok(v) => v.unwrap_or(0),
+            Err(()) => {
+                self.status_msg =
+                    Some("Bad start address — expected hex, e.g. 0x7f0000000000.".into());
+                return None;
+            }
+        };
+        let stop = match parse_opt_hex(&self.range_end_text) {
+            Ok(v) => v.unwrap_or(usize::MAX),
+            Err(()) => {
+                self.status_msg =
+                    Some("Bad end address — expected hex, e.g. 0x7f0100000000.".into());
+                return None;
+            }
+        };
+        if stop <= start {
+            self.status_msg = Some(format!(
+                "End address (0x{stop:X}) must be greater than start (0x{start:X})."
+            ));
+            return None;
+        }
+
+        if !self.scan_private && !self.scan_image && !self.scan_mapped {
+            self.status_msg =
+                Some("Tick at least one memory type (Private, Image or Mapped).".into());
+            return None;
+        }
+
+        // An explicit window overrides the module selection entirely.
+        let range_set = !self.range_start_text.trim().is_empty()
+            || !self.range_end_text.trim().is_empty();
+        let include: Vec<Region> = if range_set {
+            Vec::new()
+        } else {
+            modules
+                .iter()
+                .filter(|m| self.selected_modules.contains(&m.name))
+                .map(|m| Region::new(m.base, m.size))
+                .collect()
+        };
+        if !range_set && !self.selected_modules.is_empty() && include.is_empty() {
+            self.status_msg = Some(
+                "None of the selected modules are loaded in this process — \
+                 clear the selection or re-attach."
+                    .into(),
+            );
+            return None;
+        }
+
+        let region = RegionFilter { start, stop, include };
+        let section = SectionFilter {
+            writable: self.writable,
+            executable: self.executable,
+            copy_on_write: self.copy_on_write,
+            scan_private: self.scan_private,
+            scan_image: self.scan_image,
+            scan_mapped: self.scan_mapped,
+        };
+        Some((region, section))
     }
 
     // ── scan actions ───────────────────────────────────────────────────
@@ -342,7 +680,13 @@ impl ScannerPanel {
     /// `ProcessTarget` is (re)attached inside the worker; the `Scanner` and its
     /// results are moved back in [`Self::poll`].
     #[cfg(target_os = "linux")]
-    fn do_first_scan(&mut self, pid: Option<Pid>, rt: &tokio::runtime::Handle, ctx: egui::Context) {
+    fn do_first_scan(
+        &mut self,
+        pid: Option<Pid>,
+        modules: &[ModuleInfoWithName],
+        rt: &tokio::runtime::Handle,
+        ctx: egui::Context,
+    ) {
         let Some(pid) = pid else {
             self.status_msg = Some("No process attached.".into());
             return;
@@ -356,14 +700,23 @@ impl ScannerPanel {
             // Error already set by parse_needle.
             return;
         }
+        // Resolved here, on the UI thread: the worker re-attaches its own
+        // `ProcessTarget` and can't see the module list. Both filters are owned,
+        // so they move into the closure cleanly.
+        let Some((region_filter, section_filter)) = self.build_filters(modules) else {
+            // Error already set by build_filters.
+            return;
+        };
 
         let compare = self.compare;
         let value_type = self.value_type;
+        self.last_job_was_first_scan = true;
         self.status_msg = Some("Scanning…".into());
         self.scan_job.spawn(rt, ctx, move || {
-            let target =
-                ProcessTarget::attach(pid).map_err(|e| format!("ProcessTarget: {e}"))?;
-            let mut scanner = Scanner::new(target, value_type);
+            let target = ProcessTarget::attach(pid)
+                .map_err(|e| format!("ProcessTarget: {e}"))?
+                .with_section_filter(section_filter);
+            let mut scanner = Scanner::new(target, value_type).with_region_filter(region_filter);
             let scan_result = scanner
                 .first_scan(compare, needle)
                 .map(snapshot_results)
@@ -389,6 +742,7 @@ impl ScannerPanel {
         };
 
         let compare = self.compare;
+        self.last_job_was_first_scan = false;
         self.status_msg = Some("Scanning…".into());
         self.scan_job.spawn(rt, ctx, move || {
             let scan_result = scanner
@@ -585,6 +939,40 @@ impl Default for ScannerPanel {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
+/// A labelled Yes/No/Any combo for one [`FilterState`]. egui has no tri-state
+/// checkbox, and a three-item combo is unambiguous where a cycling checkbox
+/// would not be.
+fn tri_state_combo(ui: &mut egui::Ui, id: &str, label: &str, state: &mut FilterState) {
+    ui.label(label);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(filter_state_label(*state))
+        .width(60.0)
+        .show_ui(ui, |ui| {
+            for s in [FilterState::Yes, FilterState::No, FilterState::Any] {
+                ui.selectable_value(state, s, filter_state_label(s));
+            }
+        });
+}
+
+fn filter_state_label(state: FilterState) -> &'static str {
+    match state {
+        FilterState::Yes => "Yes",
+        FilterState::No => "No",
+        FilterState::Any => "Any",
+    }
+}
+
+/// Parses an optional hex address field: `Ok(None)` for an empty field,
+/// `Ok(Some(addr))` for a valid one, `Err(())` for garbage — so "unset" and
+/// "invalid" stay distinguishable and a blank field is never an error.
+#[cfg(target_os = "linux")]
+fn parse_opt_hex(text: &str) -> Result<Option<usize>, ()> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    super::parse_hex_addr(text).map(Some).ok_or(())
+}
+
 /// Collapse a scan's [`ScanResults`] into the `(address, captured-bytes)` display
 /// snapshot the panel renders. Owned output, so it outlives the borrow of the
 /// `Scanner` and can travel back from the worker.
@@ -703,3 +1091,194 @@ const ALL_COMPARE_TYPES: &[ScanCompareType] = &[
     ScanCompareType::Unchanged,
 ];
 
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn module(name: &str, base: usize, size: usize) -> ModuleInfoWithName {
+        ModuleInfoWithName { base, size, name: name.to_string() }
+    }
+
+    /// Two loaded modules to resolve a selection against.
+    fn modules() -> Vec<ModuleInfoWithName> {
+        vec![module("game.exe", 0x1000, 0x1000), module("libc.so.6", 0x8000, 0x2000)]
+    }
+
+    /// A panel with the scope section switched on, as a user would.
+    fn scoped_panel() -> ScannerPanel {
+        let mut p = ScannerPanel::new();
+        p.scan_range_enabled = true;
+        p
+    }
+
+    #[test]
+    fn disabled_scope_yields_unrestricted_defaults() {
+        let mut p = ScannerPanel::new();
+        let (region, section) = p.build_filters(&modules()).expect("no error");
+        assert!(region.is_unrestricted());
+        assert_eq!(section, SectionFilter::default());
+        assert!(p.status_msg.is_none());
+    }
+
+    #[test]
+    fn blank_range_fields_mean_unbounded_not_invalid() {
+        let mut p = scoped_panel();
+        let (region, _) = p.build_filters(&modules()).expect("blank fields are not an error");
+        assert_eq!(region.start, 0);
+        assert_eq!(region.stop, usize::MAX);
+        assert!(region.include.is_empty());
+    }
+
+    #[test]
+    fn manual_range_is_parsed_with_optional_prefix_and_separators() {
+        let mut p = scoped_panel();
+        p.range_start_text = "0x1_000".into();
+        p.range_end_text = "2000".into();
+        let (region, _) = p.build_filters(&modules()).expect("valid hex");
+        assert_eq!((region.start, region.stop), (0x1000, 0x2000));
+    }
+
+    #[test]
+    fn manual_range_overrides_module_selection() {
+        let mut p = scoped_panel();
+        p.selected_modules.insert("game.exe".into());
+        p.range_start_text = "0x1000".into();
+        let (region, _) = p.build_filters(&modules()).expect("valid");
+        assert_eq!(region.start, 0x1000);
+        assert!(
+            region.include.is_empty(),
+            "an explicit window supersedes the module picker",
+        );
+    }
+
+    #[test]
+    fn selected_modules_become_include_spans() {
+        let mut p = scoped_panel();
+        p.selected_modules.insert("game.exe".into());
+        p.selected_modules.insert("libc.so.6".into());
+        let (region, _) = p.build_filters(&modules()).expect("valid");
+        assert_eq!(
+            region.include,
+            vec![Region::new(0x1000, 0x1000), Region::new(0x8000, 0x2000)],
+        );
+    }
+
+    #[test]
+    fn a_module_no_longer_loaded_is_skipped() {
+        let mut p = scoped_panel();
+        p.selected_modules.insert("game.exe".into());
+        p.selected_modules.insert("unloaded.so".into());
+        let (region, _) = p.build_filters(&modules()).expect("one still resolves");
+        assert_eq!(region.include, vec![Region::new(0x1000, 0x1000)]);
+        assert!(p.status_msg.is_none());
+    }
+
+    #[test]
+    fn selection_that_resolves_to_nothing_is_an_error() {
+        let mut p = scoped_panel();
+        p.selected_modules.insert("unloaded.so".into());
+        assert!(p.build_filters(&modules()).is_none());
+        assert!(p.status_msg.as_deref().unwrap().contains("None of the selected modules"));
+    }
+
+    #[test]
+    fn bad_hex_in_either_field_is_reported() {
+        let mut p = scoped_panel();
+        p.range_start_text = "not-hex".into();
+        assert!(p.build_filters(&modules()).is_none());
+        assert!(p.status_msg.as_deref().unwrap().contains("start address"));
+
+        let mut p = scoped_panel();
+        p.range_end_text = "zzz".into();
+        assert!(p.build_filters(&modules()).is_none());
+        assert!(p.status_msg.as_deref().unwrap().contains("end address"));
+    }
+
+    #[test]
+    fn inverted_or_empty_window_is_rejected_before_scanning() {
+        let mut p = scoped_panel();
+        p.range_start_text = "0x2000".into();
+        p.range_end_text = "0x1000".into();
+        assert!(p.build_filters(&modules()).is_none());
+        assert!(p.status_msg.as_deref().unwrap().contains("must be greater than"));
+
+        // Equal bounds are an empty half-open range, not "everything".
+        let mut p = scoped_panel();
+        p.range_start_text = "0x1000".into();
+        p.range_end_text = "0x1000".into();
+        assert!(p.build_filters(&modules()).is_none());
+    }
+
+    #[test]
+    fn every_memory_type_unticked_is_rejected() {
+        let mut p = scoped_panel();
+        p.scan_private = false;
+        p.scan_image = false;
+        p.scan_mapped = false;
+        assert!(p.build_filters(&modules()).is_none());
+        assert!(p.status_msg.as_deref().unwrap().contains("at least one memory type"));
+    }
+
+    #[test]
+    fn protection_tri_states_reach_the_section_filter() {
+        let mut p = scoped_panel();
+        p.writable = FilterState::Any;
+        p.executable = FilterState::Yes;
+        p.copy_on_write = FilterState::Any;
+        p.scan_mapped = true;
+        let (_, section) = p.build_filters(&modules()).expect("valid");
+        assert_eq!(section.writable, FilterState::Any);
+        assert_eq!(section.executable, FilterState::Yes);
+        assert_eq!(section.copy_on_write, FilterState::Any);
+        assert!(section.scan_mapped);
+    }
+
+    #[test]
+    fn range_summary_describes_the_active_scope() {
+        let mods = modules();
+
+        // Off: the pre-existing behaviour, stated plainly.
+        let p = ScannerPanel::new();
+        assert_eq!(p.range_summary(&mods), "Scan range: all writable memory");
+
+        // A window wins over a selection, matching build_filters' precedence.
+        let mut p = scoped_panel();
+        p.range_start_text = "0x1000".into();
+        p.selected_modules.insert("game.exe".into());
+        assert_eq!(p.range_summary(&mods), "Scan range: 0x1000–…");
+
+        // Modules are counted only when they actually resolve, so a stale name
+        // from a previous target can't inflate the number.
+        let mut p = scoped_panel();
+        p.selected_modules.insert("game.exe".into());
+        p.selected_modules.insert("unloaded.so".into());
+        assert_eq!(p.range_summary(&mods), "Scan range: 1 module");
+    }
+
+    #[test]
+    fn on_detach_clears_the_module_selection_but_keeps_preferences() {
+        let mut p = scoped_panel();
+        p.selected_modules.insert("game.exe".into());
+        p.range_start_text = "0x1000".into();
+        p.scan_mapped = true;
+
+        p.on_detach();
+
+        // Names belong to the process we left.
+        assert!(p.selected_modules.is_empty());
+        // The window and filter toggles are user preferences.
+        assert_eq!(p.range_start_text, "0x1000");
+        assert!(p.scan_mapped);
+        assert!(p.scan_range_enabled);
+    }
+
+    #[test]
+    fn parse_opt_hex_separates_unset_from_invalid() {
+        assert_eq!(parse_opt_hex(""), Ok(None));
+        assert_eq!(parse_opt_hex("   "), Ok(None));
+        assert_eq!(parse_opt_hex("0x20"), Ok(Some(0x20)));
+        assert_eq!(parse_opt_hex("20"), Ok(Some(0x20)));
+        assert_eq!(parse_opt_hex("nope"), Err(()));
+    }
+}

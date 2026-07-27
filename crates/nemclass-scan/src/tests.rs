@@ -6,9 +6,10 @@
 //! runs deterministically on any platform.
 
 use crate::{
-    BytePattern, FreezeSet, MockTarget, Region, ScanCompareType, ScanValueType, Scanner,
-    WriteTarget,
+    BytePattern, FilterState, FreezeSet, MockTarget, Region, RegionFilter, ScanCompareType,
+    ScanValueType, Scanner, SectionFilter, WriteTarget,
 };
+use nemclass_core::{Protection, Section, SectionType};
 
 /// Base address the mock buffer is mapped at (arbitrary, non-zero).
 const BASE: usize = 0x1_0000;
@@ -370,4 +371,281 @@ impl WriteTarget for CellTarget {
         b[off..off + n].copy_from_slice(&buf[..n]);
         Ok(n)
     }
+}
+
+// ── region filter: address-space scope ─────────────────────────────────────
+//
+// `RegionFilter` is pure, so these need no target at all. The end-to-end cases
+// below then prove `first_scan` actually honours it.
+
+/// Shorthand for the `(base, size)` pairs an assertion cares about.
+fn spans(regions: &[Region]) -> Vec<(usize, usize)> {
+    regions.iter().map(|r| (r.base, r.size)).collect()
+}
+
+#[test]
+fn region_filter_default_is_identity() {
+    let filter = RegionFilter::default();
+    assert!(filter.is_unrestricted());
+    let regions = vec![Region::new(0x1000, 0x1000), Region::new(0x8000, 0x400)];
+    assert_eq!(filter.apply(&regions), regions);
+}
+
+#[test]
+fn region_filter_window_clamps_head_and_tail() {
+    let regions = vec![Region::new(0x1000, 0x1000)];
+    let out = RegionFilter::window(0x1400, 0x1C00).apply(&regions);
+    assert_eq!(spans(&out), vec![(0x1400, 0x800)]);
+}
+
+#[test]
+fn region_filter_drops_non_overlapping_and_touching_windows() {
+    let regions = vec![Region::new(0x1000, 0x1000)];
+    // Wholly below, wholly above.
+    assert!(RegionFilter::window(0x100, 0x200).apply(&regions).is_empty());
+    assert!(RegionFilter::window(0x9000, 0x9100).apply(&regions).is_empty());
+    // The window is half-open, so `stop == region.base` selects nothing.
+    assert!(RegionFilter::window(0x0, 0x1000).apply(&regions).is_empty());
+    // ...and `start == region.end()` likewise.
+    assert!(RegionFilter::window(0x2000, 0x3000).apply(&regions).is_empty());
+}
+
+#[test]
+fn region_filter_inverted_window_is_empty() {
+    let regions = vec![Region::new(0x1000, 0x1000)];
+    assert!(RegionFilter::window(0x2000, 0x1000).apply(&regions).is_empty());
+    // Equal bounds are an empty half-open range, not "everything".
+    assert!(RegionFilter::window(0x1500, 0x1500).apply(&regions).is_empty());
+}
+
+#[test]
+fn region_filter_include_splits_one_region_into_many() {
+    let regions = vec![Region::new(0x1000, 0x1000)];
+    let out = RegionFilter::default()
+        .with_include(vec![Region::new(0x1100, 0x100), Region::new(0x1800, 0x100)])
+        .apply(&regions);
+    assert_eq!(spans(&out), vec![(0x1100, 0x100), (0x1800, 0x100)]);
+}
+
+#[test]
+fn region_filter_include_outside_window_is_dropped() {
+    let regions = vec![Region::new(0x1000, 0x1000)];
+    let out = RegionFilter::window(0x1000, 0x1400)
+        .with_include(vec![Region::new(0x1800, 0x100)])
+        .apply(&regions);
+    assert!(out.is_empty(), "an include span outside the window selects nothing");
+}
+
+#[test]
+fn region_filter_overlapping_includes_do_not_duplicate() {
+    // Two selected modules whose spans overlap must not make the same address
+    // match twice — that would give duplicate rows and an inflated count.
+    let regions = vec![Region::new(0x1000, 0x1000)];
+    let out = RegionFilter::default()
+        .with_include(vec![Region::new(0x1000, 0x400), Region::new(0x1200, 0x400)])
+        .apply(&regions);
+    assert_eq!(spans(&out), vec![(0x1000, 0x600)]);
+
+    // Exactly abutting spans coalesce too, and order doesn't matter.
+    let out = RegionFilter::default()
+        .with_include(vec![Region::new(0x1400, 0x400), Region::new(0x1000, 0x400)])
+        .apply(&regions);
+    assert_eq!(spans(&out), vec![(0x1000, 0x800)]);
+}
+
+#[test]
+fn region_filter_never_emits_zero_sized_regions() {
+    let regions = vec![Region::new(0x1000, 0x1000), Region::new(0x4000, 0)];
+    let out = RegionFilter::window(0x1000, 0x5000)
+        .with_include(vec![
+            Region::new(0x1000, 0),      // zero-size include span
+            Region::new(0x2000, 0x100),  // starts exactly at the region's end
+            Region::new(0x0F00, 0x100),  // ends exactly at the region's base
+            Region::new(0x1100, 0x100),
+        ])
+        .apply(&regions);
+    assert!(out.iter().all(|r| r.size > 0), "got a zero-sized region: {out:?}");
+    assert_eq!(spans(&out), vec![(0x1100, 0x100)]);
+}
+
+#[test]
+fn region_filter_saturates_at_top_of_address_space() {
+    let regions = vec![Region::new(usize::MAX - 8, 16)];
+    // Region::end() saturates, so the region is effectively [MAX-8, MAX).
+    assert_eq!(spans(&RegionFilter::default().apply(&regions)), vec![(usize::MAX - 8, 16)]);
+    let out = RegionFilter::window(usize::MAX - 4, usize::MAX).apply(&regions);
+    assert_eq!(spans(&out), vec![(usize::MAX - 4, 4)]);
+}
+
+#[test]
+fn region_filter_output_is_sorted_by_base() {
+    let regions = vec![Region::new(0x8000, 0x100), Region::new(0x1000, 0x100)];
+    let out = RegionFilter::window(0, usize::MAX - 1).apply(&regions);
+    assert_eq!(spans(&out), vec![(0x1000, 0x100), (0x8000, 0x100)]);
+}
+
+// ── region filter: end-to-end through the scanner ──────────────────────────
+
+/// The `multi_region_scan_across_chunks` fixture: `7i32` at `BASE+4` and
+/// `BASE+40`, in two disjoint 16-byte regions.
+fn two_region_target() -> MockTarget {
+    let mut buf = vec![0u8; 64];
+    buf[4..8].copy_from_slice(&7i32.to_le_bytes());
+    buf[40..44].copy_from_slice(&7i32.to_le_bytes());
+    let regions = vec![Region::new(BASE, 16), Region::new(BASE + 32, 16)];
+    MockTarget::with_regions(BASE, buf, regions)
+}
+
+fn scan_for_seven(scanner: &mut Scanner<MockTarget>) -> Vec<usize> {
+    let n = needle(ScanValueType::I32, "7");
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(n))
+        .unwrap()
+        .iter()
+        .map(|r| r.address)
+        .collect()
+}
+
+#[test]
+fn first_scan_respects_region_filter_window() {
+    let mut scanner = Scanner::new(two_region_target(), ScanValueType::I32)
+        .with_region_filter(RegionFilter::window(BASE + 32, usize::MAX));
+    assert_eq!(scan_for_seven(&mut scanner), vec![BASE + 40]);
+    assert_eq!(scanner.scanned_region_count(), 1);
+}
+
+#[test]
+fn first_scan_respects_include_list() {
+    let mut scanner = Scanner::new(two_region_target(), ScanValueType::I32)
+        .with_region_filter(
+            RegionFilter::default().with_include(vec![Region::new(BASE + 32, 16)]),
+        );
+    assert_eq!(scan_for_seven(&mut scanner), vec![BASE + 40]);
+}
+
+#[test]
+fn first_scan_window_clamp_drops_straddling_match() {
+    // The value at BASE+4 occupies 4..8; a window starting at BASE+6 truncates
+    // the region under it, so it is not found. This mirrors ReClass.NET and is
+    // deliberate — documenting it here so nobody "fixes" it later.
+    let mut scanner = Scanner::new(two_region_target(), ScanValueType::I32)
+        .with_region_filter(RegionFilter::window(BASE + 6, BASE + 16));
+    assert!(scan_for_seven(&mut scanner).is_empty());
+}
+
+#[test]
+fn first_scan_reports_zero_scanned_regions_when_filter_excludes_everything() {
+    // A window over the gap between the two regions. The UI keys its "scope
+    // matched no memory" message off this count, so it must stay accurate —
+    // an empty result set alone is indistinguishable from "value not found".
+    let mut scanner = Scanner::new(two_region_target(), ScanValueType::I32)
+        .with_region_filter(RegionFilter::window(BASE + 16, BASE + 32));
+    assert!(scan_for_seven(&mut scanner).is_empty());
+    assert_eq!(scanner.scanned_region_count(), 0);
+}
+
+#[test]
+fn next_scan_ignores_region_filter() {
+    // Scope is a first-scan concept: a next scan re-reads the previous match
+    // addresses and must not re-filter them.
+    let mut scanner = Scanner::new(two_region_target(), ScanValueType::I32);
+    assert_eq!(scan_for_seven(&mut scanner), vec![BASE + 4, BASE + 40]);
+
+    scanner.set_region_filter(RegionFilter::window(BASE + 32, usize::MAX));
+    let after = scanner
+        .next_scan(ScanCompareType::Unchanged, None)
+        .unwrap()
+        .iter()
+        .map(|r| r.address)
+        .collect::<Vec<_>>();
+    assert_eq!(after, vec![BASE + 4, BASE + 40]);
+}
+
+#[test]
+fn filtered_region_narrower_than_stride_yields_no_match() {
+    // A 3-byte window can't hold an i32; the walk must come up empty, not panic.
+    let mut scanner = Scanner::new(two_region_target(), ScanValueType::I32)
+        .with_region_filter(RegionFilter::window(BASE + 4, BASE + 7));
+    assert!(scan_for_seven(&mut scanner).is_empty());
+    assert_eq!(scanner.scanned_region_count(), 1);
+}
+
+// ── section filter: protection and memory type ─────────────────────────────
+
+fn section(kind: SectionType, prot: Protection) -> Section {
+    Section { base: 0x1000, size: 0x1000, prot, kind, module: None }
+}
+
+#[test]
+fn filter_state_tri_state_truth_table() {
+    assert!(FilterState::Yes.accepts(true) && !FilterState::Yes.accepts(false));
+    assert!(!FilterState::No.accepts(true) && FilterState::No.accepts(false));
+    assert!(FilterState::Any.accepts(true) && FilterState::Any.accepts(false));
+    // `Any` is the do-nothing default.
+    assert_eq!(FilterState::default(), FilterState::Any);
+}
+
+#[test]
+fn section_filter_default_matches_previous_writable_only_behaviour() {
+    let filter = SectionFilter::default();
+    // A writable heap mapping — what a value scan is looking for.
+    assert!(filter.keep(&section(SectionType::Private, Protection::RW)));
+    // A module's writable data section.
+    assert!(filter.keep(&section(SectionType::Image, Protection::RW)));
+    // Executable, non-writable code is skipped.
+    assert!(!filter.keep(&section(SectionType::Image, Protection::RX)));
+    // Shared memory is off by default (ReClass.NET's `ScanMappedMemory = false`).
+    assert!(!filter.keep(&section(SectionType::Mapped, Protection::RW)));
+    // Copy-on-write is excluded by default.
+    assert!(!filter.keep(&section(SectionType::Image, Protection::RW | Protection::COW)));
+    // An unclassifiable mapping is never scanned.
+    assert!(!filter.keep(&section(SectionType::Unknown, Protection::RW)));
+}
+
+#[test]
+fn section_filter_memory_type_toggles_are_independent() {
+    let only_private = SectionFilter { scan_image: false, ..SectionFilter::default() };
+    assert!(only_private.keep(&section(SectionType::Private, Protection::RW)));
+    assert!(!only_private.keep(&section(SectionType::Image, Protection::RW)));
+
+    let with_shared = SectionFilter { scan_mapped: true, ..SectionFilter::default() };
+    assert!(with_shared.keep(&section(SectionType::Mapped, Protection::RW)));
+
+    // No type ticked: nothing passes, whatever the protection.
+    let none = SectionFilter {
+        scan_private: false,
+        scan_image: false,
+        scan_mapped: false,
+        ..SectionFilter::default()
+    };
+    assert!(!none.keep(&section(SectionType::Private, Protection::RW)));
+}
+
+#[test]
+fn section_filter_protection_tri_states_apply_independently() {
+    // Executable-only, ignoring writability: how you'd scan a module's code.
+    let code = SectionFilter {
+        writable: FilterState::Any,
+        executable: FilterState::Yes,
+        ..SectionFilter::default()
+    };
+    assert!(code.keep(&section(SectionType::Image, Protection::RX)));
+    assert!(!code.keep(&section(SectionType::Image, Protection::RW)));
+
+    // Explicitly asking for copy-on-write inverts the default.
+    let cow = SectionFilter { copy_on_write: FilterState::Yes, ..SectionFilter::default() };
+    assert!(cow.keep(&section(SectionType::Image, Protection::RW | Protection::COW)));
+    assert!(!cow.keep(&section(SectionType::Image, Protection::RW)));
+
+    // Fully permissive: everything with a known type passes.
+    let any = SectionFilter {
+        writable: FilterState::Any,
+        executable: FilterState::Any,
+        copy_on_write: FilterState::Any,
+        scan_private: true,
+        scan_image: true,
+        scan_mapped: true,
+    };
+    assert!(any.keep(&section(SectionType::Mapped, Protection::empty())));
+    assert!(!any.keep(&section(SectionType::Unknown, Protection::RW)));
 }

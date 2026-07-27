@@ -57,7 +57,9 @@ pub use pointerscan::{
 pub use results::{ScanResult, ScanResults};
 pub use signature::{format_signature, make_signature, SignatureConfig};
 pub use scanner::{ScanProgress, Scanner};
-pub use target::{MockTarget, Region, ScanTarget, WriteTarget};
+pub use target::{
+    FilterState, MockTarget, Region, RegionFilter, ScanTarget, SectionFilter, WriteTarget,
+};
 pub use value_type::{
     DEFAULT_FLOAT_TOLERANCE, Needle, NeedleParseError, ScanValueType,
 };
