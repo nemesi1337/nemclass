@@ -29,6 +29,7 @@ mod scripts_panel;
 mod host_api_impl;
 mod pointer_scan_panel;
 pub(crate) mod cheat_table_panel;
+mod tasks;
 
 pub use scanner_panel::ScannerPanel;
 pub use debugger_panel::DebuggerPanel;
@@ -43,7 +44,10 @@ use cheat_table_panel::{CheatTablePanel, CheatTablePanelAction};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tasks::{BackgroundJob, Poll as JobPoll, Runtime as BgRuntime};
 
 use eframe::egui;
 use egui_dock::DockState;
@@ -242,6 +246,11 @@ pub fn saved_window_size() -> Option<[f32; 2]> {
 // NemclassApp
 // ---------------------------------------------------------------------------
 
+/// Result of a background attach: the pid and display name captured at spawn
+/// time, plus the opened [`Process`] (or an error message). The UI-thread-only
+/// follow-ups (`on_attach`, `OnAttach` event) run when this is ingested.
+type AttachOutcome = (libc::pid_t, String, Result<Process, String>);
+
 pub struct NemclassApp {
     // Backend / process
     registry: ProviderRegistry,
@@ -255,9 +264,24 @@ pub struct NemclassApp {
     /// process name or pid). Empty shows everything.
     process_filter: String,
     selected_process_idx: Option<usize>,
-    process: Option<Process>,
+    /// The attached target, shared as `Arc` so background workers (scans, dissect,
+    /// project I/O) can hold a clone while the UI keeps rendering.
+    process: Option<Arc<Process>>,
     attached_name: Option<String>,
     last_error: Option<String>,
+
+    /// Shared background thread pool for discrete long-running operations. `Option`
+    /// so `Drop` can `take()` it and shut it down without blocking on exit.
+    runtime: Option<BgRuntime>,
+    /// In-flight process enumeration (the "Refresh" button); result merged in
+    /// `logic`. See [`tasks`].
+    enumerate_job: BackgroundJob<(String, Result<Vec<ProcessEntry>, String>)>,
+    /// In-flight attach (the "Attach" button). Payload: `(pid, name, result)`.
+    attach_job: BackgroundJob<AttachOutcome>,
+    /// In-flight script class-address resolve (the "Try resolve (script)" button).
+    /// Payload: `(class uuid, resolved address)`. The v8 round-trip blocks, so it
+    /// runs on the pool. See [`Self::do_resolve_class_address`].
+    resolve_job: BackgroundJob<(Uuid, Option<usize>)>,
 
     // Project
     project: Project,
@@ -346,6 +370,8 @@ pub struct NemclassApp {
     class_picker: Option<ClassPickerState>,
     /// Add/Insert bytes dialog.
     add_bytes_dialog: Option<AddBytesState>,
+    /// Rename-class modal: `(class uuid, edited name)`. `Some` while open.
+    class_rename: Option<(Uuid, String)>,
 
     /// Non-modal status message shown below the menu bar (e.g. last save path).
     status_msg: Option<String>,
@@ -500,6 +526,10 @@ impl NemclassApp {
             process: None,
             attached_name: None,
             last_error: None,
+            runtime: Some(BgRuntime::new()),
+            enumerate_job: BackgroundJob::default(),
+            attach_job: BackgroundJob::default(),
+            resolve_job: BackgroundJob::default(),
             project,
             node_registry,
             project_dir,
@@ -540,6 +570,7 @@ impl NemclassApp {
             pending_node_edits: Vec::new(),
             class_picker: None,
             add_bytes_dialog: None,
+            class_rename: None,
             status_msg: script_spawn_msg
                 .map(|m| format!("Scripting: {m}"))
                 .or(key_status)
@@ -638,13 +669,25 @@ impl NemclassApp {
     // Process actions
     // -----------------------------------------------------------------------
 
-    fn do_refresh(&mut self) {
-        let Some(provider) = self.registry.get(&self.selected_backend) else {
-            self.process_list_status = format!("Backend '{}' not found.", self.selected_backend);
+    /// Kicks off process enumeration on the background pool (it scans `/proc` /
+    /// Toolhelp, which can stall for hundreds of ms on a busy machine). The result
+    /// is merged in `logic` via [`Self::ingest_enumerate`]; the button is gated on
+    /// the job already running so it can't stack.
+    fn do_refresh(&mut self, ctx: &egui::Context) {
+        if self.enumerate_job.is_running() {
+            return;
+        }
+        let backend = self.selected_backend.clone();
+        let Some(provider) = self.registry.get_arc(&backend) else {
+            self.process_list_status = format!("Backend '{backend}' not found.");
             return;
         };
-        match provider.enumerate_processes() {
-            Ok(mut list) => {
+        let Some(rt) = self.runtime.as_ref().map(|r| r.handle()) else {
+            return;
+        };
+        self.process_list_status = "Enumerating…".into();
+        self.enumerate_job.spawn(&rt, ctx.clone(), move || {
+            let result = provider.enumerate_processes().map(|mut list| {
                 // Sort by name (case-insensitive), pid as a stable tiebreak, so a
                 // busy machine — and especially a Wine prefix, where the game and
                 // Wine's service processes share the loader — lists predictably
@@ -655,6 +698,16 @@ impl NemclassApp {
                         .cmp(&b.name.to_ascii_lowercase())
                         .then(a.id.cmp(&b.id))
                 });
+                list
+            });
+            (backend, result.map_err(|e| e.to_string()))
+        });
+    }
+
+    /// Merges a completed enumeration result into the process list.
+    fn ingest_enumerate(&mut self, result: Result<Vec<ProcessEntry>, String>) {
+        match result {
+            Ok(list) => {
                 self.process_list_status = format!("{} processes", list.len());
                 self.process_list = list;
                 self.selected_process_idx = None;
@@ -679,10 +732,18 @@ impl NemclassApp {
         }
     }
 
-    fn do_attach(&mut self) {
+    /// Kicks off an attach on the background pool (`provider.open` may do device
+    /// opens / permission checks). The detach-first teardown runs on the UI thread
+    /// here; the opened handle and its `on_attach`/`OnAttach` follow-ups are
+    /// applied in `logic` via [`Self::ingest_attach`].
+    fn do_attach(&mut self, ctx: &egui::Context) {
         // Ensure the keyed provider is in the registry before we look it up.
         #[cfg(target_os = "linux")]
         self.ensure_kernel_key_registered();
+
+        if self.attach_job.is_running() {
+            return;
+        }
 
         let Some(idx) = self.selected_process_idx else {
             self.last_error = Some("No process selected.".into());
@@ -695,7 +756,7 @@ impl NemclassApp {
         let pid = entry.id as libc::pid_t;
         let name = entry.name.clone();
 
-        // Detach first.
+        // Detach first (UI thread; touches panel state the worker can't).
         if self.process.is_some() {
             self.emit(Event::OnDetach);
             self.process = None;
@@ -705,13 +766,32 @@ impl NemclassApp {
             self.disassembly_panel.on_detach();
         }
 
-        let Some(provider) = self.registry.get(&self.selected_backend) else {
+        let Some(provider) = self.registry.get_arc(&self.selected_backend) else {
             self.last_error = Some(format!("Backend '{}' not found.", self.selected_backend));
             return;
         };
+        let Some(rt) = self.runtime.as_ref().map(|r| r.handle()) else {
+            return;
+        };
+        self.last_error = None;
+        self.status_msg = Some(format!(
+            "Attaching to {}…",
+            if name.is_empty() { format!("pid:{pid}") } else { name.clone() }
+        ));
+        self.attach_job.spawn(&rt, ctx.clone(), move || {
+            let result = provider.open(pid).map_err(|e| format!("Attach failed: {e}"));
+            (pid, name, result)
+        });
+    }
 
-        match provider.open(pid) {
+    /// Applies a completed attach: wires the opened handle into the panels and
+    /// fires `OnAttach`, or surfaces the error. Runs on the UI thread from `logic`.
+    fn ingest_attach(&mut self, outcome: AttachOutcome) {
+        let (pid, name, result) = outcome;
+        self.status_msg = None;
+        match result {
             Ok(proc) => {
+                let proc = Arc::new(proc);
                 self.attached_name = Some(if name.is_empty() {
                     format!("pid:{pid}")
                 } else {
@@ -728,7 +808,7 @@ impl NemclassApp {
                 });
             }
             Err(e) => {
-                self.last_error = Some(format!("Attach failed: {e}"));
+                self.last_error = Some(e);
             }
         }
     }
@@ -757,7 +837,7 @@ impl NemclassApp {
         self.memory_viewer.on_attach(&proc);
         self.disassembly_panel.on_attach(&proc);
         self.attached_name = Some(format!("pid:{pid}"));
-        self.process = Some(proc);
+        self.process = Some(Arc::new(proc));
         self.last_error = None;
 
         // Take the process out to satisfy the borrow checker, drive the panel,
@@ -786,8 +866,27 @@ impl NemclassApp {
     pub fn debug_dissect(&mut self) {
         #[cfg(target_os = "linux")]
         if let Some(proc) = self.process.take() {
-            self.disassembly_panel.dissect_selected(&proc);
+            // Synchronous so the screenshot capture sees the result this frame.
+            self.disassembly_panel.dissect_selected_blocking(&proc);
             self.process = Some(proc);
+        }
+    }
+
+    /// Ingests results from all in-flight background jobs. Called first each frame
+    /// from `logic` so completed work is merged before the snapshot/draw pass.
+    fn poll_background_jobs(&mut self) {
+        if let JobPoll::Done((backend, result)) = self.enumerate_job.poll() {
+            // Ignore a stale result from a backend the user has since switched away
+            // from, so it can't clobber the current list.
+            if backend == self.selected_backend {
+                self.ingest_enumerate(result);
+            }
+        }
+        if let JobPoll::Done(outcome) = self.attach_job.poll() {
+            self.ingest_attach(outcome);
+        }
+        if let JobPoll::Done((uuid, resolved)) = self.resolve_job.poll() {
+            self.ingest_resolve(uuid, resolved);
         }
     }
 
@@ -1383,8 +1482,21 @@ impl Default for NemclassApp {
 // eframe::App — egui 0.35 API
 // ---------------------------------------------------------------------------
 
+impl Drop for NemclassApp {
+    fn drop(&mut self) {
+        // Tear the background runtime down without waiting on in-flight
+        // `spawn_blocking` work, so quitting mid-scan doesn't hang the window.
+        if let Some(rt) = self.runtime.take() {
+            rt.shutdown();
+        }
+    }
+}
+
 impl eframe::App for NemclassApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drain any background operations that finished since the last frame.
+        self.poll_background_jobs();
+
         let needs_snapshot = self.selected_class.is_some()
             && self
                 .last_snapshot
@@ -1434,11 +1546,16 @@ impl eframe::App for NemclassApp {
         }
 
         // Drive scanner freeze write-back and debugger event polling.
+        self.scanner_panel.poll();
         self.scanner_panel.tick_freeze();
+        #[cfg(target_os = "linux")]
+        self.pointer_scan_panel.poll();
+        #[cfg(target_os = "linux")]
+        self.disassembly_panel.poll();
         self.debugger_panel.tick_events();
         #[cfg(target_os = "linux")]
         self.cheat_table_panel.tick_freeze(
-            self.process.as_ref(),
+            self.process.as_deref(),
             self.process.as_ref().map(|p| p.pid()),
         );
         #[cfg(all(feature = "scripting", target_os = "linux"))]
@@ -1454,7 +1571,7 @@ impl eframe::App for NemclassApp {
                 let mut host = host_api_impl::UiHostApi {
                     project: &mut self.project,
                     node_registry: &self.node_registry,
-                    process: self.process.as_ref(),
+                    process: self.process.as_deref(),
                     log: self.script_log.clone(),
                     last_error: &mut self.last_error,
                     ui_actions: &mut ui_actions,
@@ -1485,7 +1602,7 @@ impl eframe::App for NemclassApp {
             i.key_pressed(egui::Key::F) && i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt
         });
         if freeze_hotkey {
-            let process = self.process.as_ref();
+            let process = self.process.as_deref();
             let now_frozen = self.cheat_table_panel.toggle_freeze_all(process);
             self.cheat_table_panel.status_msg = Some(if now_frozen {
                 "All entries frozen (Ctrl+F to unfreeze)".to_owned()
@@ -1524,6 +1641,7 @@ impl eframe::App for NemclassApp {
         // Modal dialogs (rendered on top of everything else).
         self.show_class_picker(ui.ctx());
         self.show_add_bytes_dialog(ui.ctx());
+        self.show_class_rename_modal(ui.ctx());
     }
 }
 
@@ -1730,13 +1848,17 @@ impl NemclassApp {
             }
 
             // "Try get class address" via the script/plugin resolver chain.
+            let resolving = self.resolve_job.is_running();
             if ui
-                .add_enabled(attached, egui::Button::new("Try resolve (script)"))
+                .add_enabled(attached && !resolving, egui::Button::new("Try resolve (script)"))
                 .on_hover_text("Ask a script's tryResolveClassAddress resolver for this class's base address")
                 .on_disabled_hover_text("Attach to a process first")
                 .clicked()
             {
                 do_resolve = true;
+            }
+            if resolving {
+                ui.spinner();
             }
             ui.separator();
 
@@ -1764,20 +1886,54 @@ impl NemclassApp {
             self.script_resolved_base = None;
         }
         if do_resolve {
-            self.do_resolve_class_address();
+            self.do_resolve_class_address(ui.ctx());
         }
     }
 
     /// Runs the script/plugin resolver chain for the selected class and, on
-    /// success, sets a sticky script-resolved base. Triggered only by the
-    /// explicit "Try resolve (script)" button — never per-frame — because the
-    /// live engine blocks the UI thread on the v8 worker reply.
-    fn do_resolve_class_address(&mut self) {
+    /// success, sets a sticky script-resolved base. Triggered only by the explicit
+    /// "Try resolve (script)" button. The live engine's resolve is a blocking v8
+    /// round-trip, so it runs on the background pool (via a detached
+    /// [`nemclass_script::ScriptResolver`]) to keep the window responsive; the
+    /// answer is merged in `logic` via [`Self::ingest_resolve`].
+    #[cfg_attr(not(feature = "scripting"), allow(unused_variables))]
+    fn do_resolve_class_address(&mut self, ctx: &egui::Context) {
         let (Some(uuid), Some(proc)) = (self.selected_class, self.process.as_ref()) else {
             return;
         };
         let q = ClassAddressQuery { pid: proc.pid(), class: uuid };
-        match self.script_host.resolve_class_address(&q) {
+
+        #[cfg(feature = "scripting")]
+        {
+            if self.resolve_job.is_running() {
+                return;
+            }
+            // A live engine → run the blocking resolve off-thread.
+            if let Some(resolver) = self.script_host.resolver() {
+                let Some(rt) = self.runtime.as_ref().map(|r| r.handle()) else {
+                    return;
+                };
+                self.status_msg = Some("Resolving class address…".into());
+                self.resolve_job.spawn(&rt, ctx.clone(), move || {
+                    (uuid, resolver.resolve(&q))
+                });
+                return;
+            }
+        }
+
+        // No live resolver (feature off, or engine disabled): resolves instantly.
+        self.ingest_resolve(uuid, None);
+    }
+
+    /// Applies a completed class-address resolve: sets the sticky script-resolved
+    /// base and logs, or reports that nothing resolved. Runs on the UI thread.
+    fn ingest_resolve(&mut self, uuid: Uuid, resolved: Option<usize>) {
+        self.status_msg = None;
+        // Ignore a stale result if the user changed the selected class meanwhile.
+        if self.selected_class != Some(uuid) {
+            return;
+        }
+        match resolved {
             Some(addr) => {
                 self.script_resolved_base = Some(addr);
                 self.class_base = Some(addr);
@@ -1837,11 +1993,27 @@ impl NemclassApp {
         // Process list.
         ui.heading("Processes");
         ui.horizontal(|ui| {
-            if ui.button("Refresh").clicked() {
-                self.do_refresh();
+            let refresh = ui.add_enabled(
+                !self.enumerate_job.is_running(),
+                egui::Button::new("Refresh"),
+            );
+            if refresh.clicked() {
+                self.do_refresh(ui.ctx());
             }
-            if self.selected_process_idx.is_some() && ui.button("Attach").clicked() {
-                self.do_attach();
+            if self.enumerate_job.is_running() {
+                ui.spinner();
+            }
+            if self.selected_process_idx.is_some() {
+                let attach = ui.add_enabled(
+                    !self.attach_job.is_running(),
+                    egui::Button::new("Attach"),
+                );
+                if attach.clicked() {
+                    self.do_attach(ui.ctx());
+                }
+            }
+            if self.attach_job.is_running() {
+                ui.spinner();
             }
             if self.process.is_some() && ui.button("Detach").clicked() {
                 self.do_detach();
@@ -1901,9 +2073,8 @@ impl NemclassApp {
         // Class list.
         ui.horizontal(|ui| {
             ui.heading("Classes");
-            // Create an empty, auto-named class container. The layout is then
-            // shaped with the node editor / auto-dissect / scripts and the name
-            // is not hand-editable (classes are not manually renamed).
+            // Create an empty, auto-named class container; rename via double-click,
+            // delete via the trash button (both below).
             if ui.button("+ Add class").on_hover_text("Create an empty class").clicked() {
                 let cls = blank_class(&self.project);
                 let uuid = cls.uuid;
@@ -1914,6 +2085,10 @@ impl NemclassApp {
             }
         });
 
+        // Deferred class-list mutations (can't mutate the project while the list
+        // borrows it in the scroll closure).
+        let mut to_delete: Option<Uuid> = None;
+        let mut start_rename: Option<Uuid> = None;
         egui::ScrollArea::vertical()
             .id_salt("class_list")
             .show(ui, |ui| {
@@ -1929,15 +2104,52 @@ impl NemclassApp {
                         .map(|c| c.name.clone())
                         .unwrap_or_else(|| uuid.to_string());
                     let selected = self.selected_class == Some(uuid);
-                    if ui.selectable_label(selected, &label).clicked()
-                        && self.selected_class != Some(uuid)
-                    {
-                        self.selected_class = Some(uuid);
-                        self.last_snapshot = None;
-                        self.clear_memory_state();
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("🗑")
+                            .on_hover_text("Delete class")
+                            .clicked()
+                        {
+                            to_delete = Some(uuid);
+                        }
+                        let resp = ui
+                            .selectable_label(selected, &label)
+                            .on_hover_text("Double-click to rename");
+                        if resp.clicked() && self.selected_class != Some(uuid) {
+                            self.selected_class = Some(uuid);
+                            self.last_snapshot = None;
+                            self.clear_memory_state();
+                        }
+                        if resp.double_clicked() {
+                            start_rename = Some(uuid);
+                        }
+                    });
                 }
             });
+
+        // Apply deferred class deletion (guarded against removing a class another
+        // class still references) and open the rename modal.
+        if let Some(uuid) = to_delete {
+            match self.project.remove_class(&uuid) {
+                Ok(_) => {
+                    if self.selected_class == Some(uuid) {
+                        self.selected_class =
+                            self.project.classes_in_order().next().map(|c| c.uuid);
+                        self.clear_memory_state();
+                        self.last_snapshot = None;
+                    }
+                }
+                Err(e) => self.last_error = Some(e.to_string()),
+            }
+        }
+        if let Some(uuid) = start_rename {
+            let cur = self
+                .project
+                .get_class(&uuid)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            self.class_rename = Some((uuid, cur));
+        }
 
         ui.separator();
 
@@ -2100,7 +2312,9 @@ impl NemclassApp {
         #[cfg(not(target_os = "linux"))]
         let pid: Option<nemclass_core::Pid> = None;
 
-        let process_ref = self.process.as_ref();
+        let process_ref = self.process.as_deref();
+        // Owned handle (cloned) so it doesn't borrow `self` across the panel call.
+        let rt = self.runtime.as_ref().expect("bg runtime").handle();
 
         let mut add_to_class_addr: Option<usize> = None;
         let mut add_to_table: Option<(usize, String)> = None;
@@ -2110,6 +2324,7 @@ impl NemclassApp {
             ui,
             process_ref,
             pid,
+            &rt,
             |addr| { add_to_class_addr = Some(addr); },
             |addr, tag| { add_to_table = Some((addr, tag.to_owned())); },
             |addr| { ptr_scan_addr = Some(addr); },
@@ -2161,11 +2376,13 @@ impl NemclassApp {
             .map(|it| it.collect())
             .unwrap_or_default();
 
+        let rt = self.runtime.as_ref().expect("bg runtime").handle();
         let action = self.pointer_scan_panel.show(
             ui,
-            self.process.as_ref(),
+            self.process.clone(),
             pid,
             &modules,
+            &rt,
         );
 
         // Stash the action for application after the dock draw closes all borrows.
@@ -2202,7 +2419,7 @@ impl NemclassApp {
     }
 
     pub(crate) fn show_cheat_table_tab(&mut self, ui: &mut egui::Ui) {
-        let process = self.process.as_ref();
+        let process = self.process.as_deref();
         #[cfg(target_os = "linux")]
         let pid: Option<nemclass_core::Pid> = self.process.as_ref().map(|p| p.pid());
         #[cfg(not(target_os = "linux"))]
@@ -2264,7 +2481,7 @@ impl NemclassApp {
     }
 
     fn show_memory_viewer(&mut self, ui: &mut egui::Ui) {
-        self.memory_viewer.show(ui, self.process.as_ref());
+        self.memory_viewer.show(ui, self.process.as_deref());
         // If the "Disassemble here" button was clicked, switch tabs and navigate.
         if let Some(addr) = self.memory_viewer.take_disassemble_request() {
             self.pending_focus = Some(TabKind::Disassembly);
@@ -2289,7 +2506,7 @@ impl NemclassApp {
         let action = {
             let epoch = self.disassembly_panel.dissect_epoch();
             let dissect = self.disassembly_panel.dissect_result().map(|d| (epoch, d));
-            self.navigator_panel.show(ui, dissect, self.process.as_ref())
+            self.navigator_panel.show(ui, dissect, self.process.as_deref())
         };
         #[cfg(not(target_os = "linux"))]
         let action = self.navigator_panel.show(ui);
@@ -2305,9 +2522,10 @@ impl NemclassApp {
             }
             Some(NavAction::RunDissect) => {
                 #[cfg(target_os = "linux")]
-                if let Some(proc) = self.process.take() {
-                    self.disassembly_panel.dissect_selected(&proc);
-                    self.process = Some(proc);
+                if let Some(proc) = self.process.clone() {
+                    let rt = self.runtime.as_ref().expect("bg runtime").handle();
+                    self.disassembly_panel
+                        .dissect_selected(proc, &rt, ui.ctx().clone());
                 }
             }
             None => {}
@@ -2315,7 +2533,8 @@ impl NemclassApp {
     }
 
     fn show_disassembly_tab(&mut self, ui: &mut egui::Ui) {
-        self.disassembly_panel.show(ui, self.process.as_ref());
+        let rt = self.runtime.as_ref().expect("bg runtime").handle();
+        self.disassembly_panel.show(ui, self.process.clone(), &rt);
 
         // Apply a row-context-menu action (set-as-class-base / add-address-node)
         // raised inside the disassembler, targeting the selected class.
@@ -3187,6 +3406,57 @@ impl NemclassApp {
                     }
                 };
                 self.pending_node_edits.push(op);
+            }
+        }
+    }
+
+    /// Modal to rename the selected class (opened by double-clicking it in the
+    /// class list).
+    fn show_class_rename_modal(&mut self, ctx: &egui::Context) {
+        if self.class_rename.is_none() {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Rename class")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    // Clone out / write back to avoid borrowing self twice.
+                    let mut text = self.class_rename.as_ref().unwrap().1.clone();
+                    let resp = ui.text_edit_singleline(&mut text);
+                    if let Some(s) = &mut self.class_rename {
+                        s.1 = text;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirm = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            self.class_rename = None;
+            return;
+        }
+        if confirm
+            && let Some((uuid, name)) = self.class_rename.take()
+        {
+            let name = name.trim().to_string();
+            if !name.is_empty()
+                && let Some(c) = self.project.get_class_mut(&uuid)
+            {
+                c.name = name;
             }
         }
     }

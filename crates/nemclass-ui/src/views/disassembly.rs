@@ -16,11 +16,16 @@
 //! On non-Linux platforms the panel shows a static notice — the underlying
 //! disassembly is Linux-only.
 
+use std::sync::Arc;
+
 use eframe::egui;
 #[cfg(target_os = "linux")]
 use eframe::egui::{Color32, RichText};
 #[cfg(target_os = "linux")]
 use egui_extras::{Column, TableBuilder};
+
+#[cfg(target_os = "linux")]
+use super::tasks::{BackgroundJob, Poll as JobPoll};
 
 use nemclass_core::Process;
 #[cfg(target_os = "linux")]
@@ -114,6 +119,14 @@ pub struct DisassemblyPanel {
     dissect: Option<(usize, DissectResult)>,
     #[cfg(target_os = "linux")]
     dissect_status: Option<String>,
+    /// In-flight dissect running on the background pool (scanning a whole module's
+    /// code can take seconds). Payload: `(module_index, result)`.
+    #[cfg(target_os = "linux")]
+    dissect_job: BackgroundJob<(usize, Result<DissectResult, String>)>,
+    /// Set by the "Dissect" button during the draw; the spawn (which needs the
+    /// `Arc<Process>` + runtime) happens after the top bar returns.
+    #[cfg(target_os = "linux")]
+    pending_dissect: bool,
     /// Bumped on each successful dissect so the Navigator panel knows when to
     /// rebuild its cached lists.
     #[cfg(target_os = "linux")]
@@ -174,6 +187,10 @@ impl DisassemblyPanel {
             #[cfg(target_os = "linux")]
             dissect_status: None,
             #[cfg(target_os = "linux")]
+            dissect_job: BackgroundJob::default(),
+            #[cfg(target_os = "linux")]
+            pending_dissect: false,
+            #[cfg(target_os = "linux")]
             dissect_epoch: 0,
             #[cfg(target_os = "linux")]
             cache: None,
@@ -209,11 +226,28 @@ impl DisassemblyPanel {
         self.dissect_epoch
     }
 
-    /// Run a dissect over the currently-selected module (public entry point for
-    /// the Navigator's "Scan" button).
+    /// Drain a completed background dissect. Call each frame from the parent's
+    /// `logic()` so results land even when the Disassembly tab is not visible.
     #[cfg(target_os = "linux")]
-    pub fn dissect_selected(&mut self, process: &Process) {
-        self.do_dissect(process);
+    pub fn poll(&mut self) {
+        if let JobPoll::Done((idx, result)) = self.dissect_job.poll() {
+            self.apply_dissect(idx, result);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn poll(&mut self) {}
+
+    /// Run a dissect over the currently-selected module (public entry point for
+    /// the Navigator's "Scan" button). Async — spawns on the background pool.
+    #[cfg(target_os = "linux")]
+    pub fn dissect_selected(
+        &mut self,
+        process: Arc<Process>,
+        rt: &tokio::runtime::Handle,
+        ctx: egui::Context,
+    ) {
+        self.do_dissect(process, rt, ctx);
     }
 
     /// Debug/screenshot hook: refresh modules and enter linear mode over the
@@ -272,6 +306,9 @@ impl DisassemblyPanel {
         self.linear_next = None;
         self.dissect = None;
         self.dissect_status = None;
+        // Discard any in-flight dissect so a stale result can't land post-detach.
+        self.dissect_job = BackgroundJob::default();
+        self.pending_dissect = false;
         self.cache = None;
         self.selected_row = None;
         self.scroll_to_row = None;
@@ -523,9 +560,19 @@ impl DisassemblyPanel {
         }
     }
 
-    /// Run a Dissect Code scan over the selected module's executable regions.
+    /// Launch a Dissect Code scan over the selected module's executable regions on
+    /// the background pool (scanning a whole module can take seconds). The result
+    /// lands via [`Self::poll`].
     #[cfg(target_os = "linux")]
-    fn do_dissect(&mut self, process: &Process) {
+    fn do_dissect(
+        &mut self,
+        process: Arc<Process>,
+        rt: &tokio::runtime::Handle,
+        ctx: egui::Context,
+    ) {
+        if self.dissect_job.is_running() {
+            return;
+        }
         let Some(idx) = self.selected_module else {
             self.dissect_status = Some("Select a module first.".to_owned());
             return;
@@ -534,9 +581,34 @@ impl DisassemblyPanel {
             return;
         };
         let (base, size) = (m.base, m.size);
-        let scan = module_exec_regions(process.pid(), base, size)
-            .and_then(|regions| dissect_regions(process, &regions));
-        match scan {
+        self.dissect_status = Some("Dissecting…".to_owned());
+        self.dissect_job.spawn(rt, ctx, move || {
+            (idx, compute_dissect(&process, base, size))
+        });
+    }
+
+    /// Synchronous dissect of the selected module (blocks the caller). Only for
+    /// the `--screenshot` debug hooks, where the capture must see the result in
+    /// the same frame; interactive dissects go through [`Self::do_dissect`].
+    #[cfg(target_os = "linux")]
+    pub fn dissect_selected_blocking(&mut self, process: &Process) {
+        let Some(idx) = self.selected_module else {
+            self.dissect_status = Some("Select a module first.".to_owned());
+            return;
+        };
+        let Some(m) = self.modules.get(idx) else {
+            return;
+        };
+        let (base, size) = (m.base, m.size);
+        let result = compute_dissect(process, base, size);
+        self.apply_dissect(idx, result);
+    }
+
+    /// Merge a completed dissect (from the worker or the sync debug path) into
+    /// panel state, bumping the epoch so the Navigator rebuilds its lists.
+    #[cfg(target_os = "linux")]
+    fn apply_dissect(&mut self, idx: usize, result: Result<DissectResult, String>) {
+        match result {
             Ok(result) => {
                 self.dissect_status = Some(format!(
                     "{} call targets, {} jump targets, {} strings",
@@ -587,10 +659,15 @@ impl DisassemblyPanel {
     // Draw
     // -----------------------------------------------------------------------
 
-    pub fn show(&mut self, ui: &mut egui::Ui, process: Option<&Process>) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        process: Option<Arc<Process>>,
+        rt: &tokio::runtime::Handle,
+    ) {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = process;
+            let _ = (process, rt);
             ui.centered_and_justified(|ui| {
                 ui.label("Disassembly is Linux-only for now.");
             });
@@ -598,23 +675,35 @@ impl DisassemblyPanel {
         }
 
         #[cfg(target_os = "linux")]
-        self.show_linux(ui, process);
+        self.show_linux(ui, process, rt);
     }
 
     #[cfg(target_os = "linux")]
-    fn show_linux(&mut self, ui: &mut egui::Ui, process: Option<&Process>) {
-        let Some(process) = process else {
+    fn show_linux(
+        &mut self,
+        ui: &mut egui::Ui,
+        process: Option<Arc<Process>>,
+        rt: &tokio::runtime::Handle,
+    ) {
+        let Some(proc_arc) = process else {
             ui.centered_and_justified(|ui| {
                 ui.colored_label(Color32::YELLOW, "Attach to a process to disassemble.");
             });
             return;
         };
+        let process: &Process = &proc_arc;
 
         self.ensure_function_disasm(process);
         self.show_top_bar(ui, process);
         ui.separator();
         self.handle_keyboard(ui);
         self.show_table(ui, process);
+
+        // Spawn a deferred dissect (the "Dissect" button set the flag; we have the
+        // shared handle + runtime here).
+        if std::mem::take(&mut self.pending_dissect) {
+            self.do_dissect(Arc::clone(&proc_arc), rt, ui.ctx().clone());
+        }
 
         if let Some(msg) = &self.status_msg {
             ui.add_space(4.0);
@@ -803,7 +892,9 @@ impl DisassemblyPanel {
             self.enter_linear_mode(i, process);
         }
         if dissect_clicked {
-            self.do_dissect(process);
+            // Defer: the actual spawn needs the `Arc<Process>` + runtime, which
+            // `show_linux` has. Applied right after the top bar returns.
+            self.pending_dissect = true;
         }
     }
 
@@ -1146,6 +1237,15 @@ impl DisassemblyPanel {
 
 /// Combo/label text for a module: `name (0xbase, NN KiB)`.
 #[cfg(target_os = "linux")]
+/// Scan a module's executable regions for call/jump/string cross-references.
+/// Runs off the UI thread (from `do_dissect`'s worker) or inline (debug path).
+#[cfg(target_os = "linux")]
+fn compute_dissect(process: &Process, base: usize, size: usize) -> Result<DissectResult, String> {
+    module_exec_regions(process.pid(), base, size)
+        .and_then(|regions| dissect_regions(process, &regions))
+        .map_err(|e| e.to_string())
+}
+
 fn module_label(m: &ModuleInfoWithName) -> String {
     format!("{} (0x{:x}, {} KiB)", m.name, m.base, m.size / 1024)
 }

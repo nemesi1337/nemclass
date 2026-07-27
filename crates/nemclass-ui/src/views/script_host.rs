@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use nemclass_script::{ClassAddressQuery, Event};
+use nemclass_script::Event;
 
 /// The active scripting back-end held by `NemclassApp`.
 ///
@@ -75,22 +75,13 @@ impl ScriptHost {
         }
     }
 
-    /// Runs the engine's `tryResolveClassAddress` resolver for `q`, returning
-    /// the first address a script supplies, or `None`.
-    ///
-    /// Always returns `None` for `Disabled`.
-    ///
-    /// **Do not call this from the per-frame pump or snapshot loop.** The real
-    /// engine blocks the calling thread on the v8 worker reply; only invoke it
-    /// from an explicit user action (the "Try resolve (script)" button).
-    #[cfg_attr(not(feature = "scripting"), allow(unused_variables))]
-    pub fn resolve_class_address(&mut self, q: &ClassAddressQuery) -> Option<usize> {
+    /// A detached, `Send` resolver handle for running `tryResolveClassAddress`
+    /// off the UI thread (so the window keeps repainting), or `None` when no live
+    /// engine is running. Only compiled under the `scripting` feature.
+    #[cfg(feature = "scripting")]
+    pub fn resolver(&self) -> Option<nemclass_script::ScriptResolver> {
         match self {
-            #[cfg(feature = "scripting")]
-            ScriptHost::Rusty(engine) => {
-                use nemclass_script::ScriptEngine as _;
-                engine.resolve_class_address(q)
-            }
+            ScriptHost::Rusty(engine) => Some(engine.resolver()),
             ScriptHost::Disabled => None,
         }
     }

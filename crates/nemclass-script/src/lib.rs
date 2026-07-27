@@ -59,4 +59,4 @@ pub use plugin::{Plugin, PluginHost, PluginRegistry, register_builtin_plugins};
 pub use scaffold::{write_dts, write_script_scaffold, EVENT_KINDS};
 
 #[cfg(feature = "scripting")]
-pub use engine_rusty::{HostApi, HostRequest, LogLevel, RustyScriptEngine};
+pub use engine_rusty::{HostApi, HostRequest, LogLevel, RustyScriptEngine, ScriptResolver};

@@ -928,6 +928,16 @@ mod inner {
                 "classes.setFormula" => {
                     let key = as_str(arg(args, 0)?)?;
                     let formula = as_str(arg(args, 1)?)?;
+                    // Validate before storing. Without this an unparseable formula
+                    // (e.g. a stray `0x0x1234` from double-prefixing) is silently
+                    // accepted and the class simply never resolves — a confusing,
+                    // silent failure for script authors. Empty is the valid
+                    // "unresolved" default a freshly-created class carries.
+                    if !formula.trim().is_empty()
+                        && let Err(e) = nemclass_model::parse_address(&formula)
+                    {
+                        return Err(format!("invalid address formula {formula:?}: {e}"));
+                    }
                     let Some(uuid) = self.find_class_uuid(&key) else { return Ok(json!(false)) };
                     self.project.get_class_mut(&uuid).unwrap().address_formula = formula;
                     Ok(json!(true))

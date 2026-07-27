@@ -59,6 +59,77 @@ use std::thread::JoinHandle;
 
 use rustyscript::{json_args, Module, Runtime, RuntimeOptions};
 
+/// Resolves relative `import` statements against the real files on disk.
+///
+/// rustyscript's default loader (without the `fs_import` feature) rejects an
+/// `import { x } from "./helpers"` for two reasons: the specifier resolves to an
+/// *extensionless* URL (`file://…/helpers`, not `helpers.ts`), and on-demand
+/// file imports must appear in an internal whitelist that is populated in module
+/// load order — so a script importing a sibling that hasn't been loaded yet
+/// fails with `requested module is not loaded: ./helpers`.
+///
+/// This provider fixes both: for any `file:` specifier it probes disk, adding a
+/// TypeScript/JavaScript extension (or an `index.*`) when the import is written
+/// without one, exactly like Node/Deno resolution. Returning `Some(Ok(url))`
+/// from `resolve` makes rustyscript skip its whitelist check, so sibling imports
+/// resolve regardless of the order files were loaded in.
+struct RelativeImportResolver;
+
+impl rustyscript::module_loader::ImportProvider for RelativeImportResolver {
+    fn resolve(
+        &mut self,
+        specifier: &rustyscript::deno_core::ModuleSpecifier,
+        _referrer: &str,
+        _kind: rustyscript::deno_core::ResolutionKind,
+    ) -> Option<Result<rustyscript::deno_core::ModuleSpecifier, rustyscript::deno_core::anyhow::Error>>
+    {
+        if specifier.scheme() != "file" {
+            return None;
+        }
+        let path = specifier.to_file_path().ok()?;
+        let resolved = resolve_disk_module(&path)?;
+        // Only rewrite when we actually found a different, real file; otherwise
+        // fall back to the default behavior so error messages stay accurate.
+        if resolved == path {
+            return None;
+        }
+        Some(
+            rustyscript::deno_core::ModuleSpecifier::from_file_path(&resolved)
+                .map_err(|()| rustyscript::deno_core::anyhow::anyhow!("invalid module path")),
+        )
+    }
+}
+
+/// Extensions probed (in order) when a relative import omits one, mirroring the
+/// TypeScript/Node resolution preference for `.ts` sources over compiled `.js`.
+const MODULE_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "mjs", "cjs", "js", "json"];
+
+/// Maps an imported path to the concrete file on disk, adding an extension or an
+/// `index.*` when needed. Returns the input unchanged when it is already a file
+/// (so the caller can fall through to default handling).
+fn resolve_disk_module(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    if path.extension().is_none() {
+        for ext in MODULE_EXTS {
+            let cand = path.with_extension(ext);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    if path.is_dir() {
+        for ext in MODULE_EXTS {
+            let cand = path.join(format!("index.{ext}"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 /// Re-export of the `serde_json` rustyscript uses, so host implementors
 /// ([`HostApi::call`]) and tests can build/inspect `Value`s with a matching
 /// version without adding a direct dependency.
@@ -344,6 +415,34 @@ impl ScriptEngine for RustyScriptEngine {
     }
 
     fn resolve_class_address(&mut self, query: &ClassAddressQuery) -> Option<usize> {
+        self.resolver().resolve(query)
+    }
+}
+
+impl RustyScriptEngine {
+    /// A detached, `Send` handle that runs the `tryResolveClassAddress` resolver.
+    ///
+    /// The UI uses this to run the (blocking) resolve on a background thread so
+    /// the window keeps repainting. It clones only the command `Sender`; the v8
+    /// worker and its `Runtime` stay put. Safe to move across threads.
+    pub fn resolver(&self) -> ScriptResolver {
+        ScriptResolver { tx: self.tx.clone() }
+    }
+}
+
+/// A cloneable, `Send` handle to the v8 `tryResolveClassAddress` resolver,
+/// obtained from [`RustyScriptEngine::resolver`]. It can be moved onto a
+/// background worker: the resolver makes no host callbacks, so the blocking
+/// round-trip in [`ScriptResolver::resolve`] cannot deadlock (see the module
+/// docs) even off the UI thread.
+pub struct ScriptResolver {
+    tx: Sender<Command>,
+}
+
+impl ScriptResolver {
+    /// Runs the JS resolver for `query` and blocks for the answer. Returns `None`
+    /// if the worker is gone or no script resolved the class.
+    pub fn resolve(&self, query: &ClassAddressQuery) -> Option<usize> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         if self
             .tx
@@ -355,9 +454,6 @@ impl ScriptEngine for RustyScriptEngine {
         {
             return None;
         }
-        // Block for the worker's answer. Host functions are unavailable inside
-        // the resolver (see the module docs), so the worker never depends on the
-        // main thread here — this simple blocking wait cannot deadlock.
         reply_rx.recv().ok().flatten()
     }
 }
@@ -428,6 +524,12 @@ export function __nemclass_resolve(query) {
         const r = h(query);
         if (typeof r === "number") return r;
     }
+    // Member form advertised by nemclass.d.ts: `nemclass.tryResolveClassAddress = q => ...`.
+    if (typeof nemclass.tryResolveClassAddress === "function") {
+        const r = nemclass.tryResolveClassAddress(query);
+        if (typeof r === "number") return r;
+    }
+    // Global-function fallback: `globalThis.tryResolveClassAddress = q => ...`.
     if (typeof globalThis.tryResolveClassAddress === "function") {
         const r = globalThis.tryResolveClassAddress(query);
         if (typeof r === "number") return r;
@@ -481,7 +583,13 @@ fn worker_main(
         resolving: resolving.clone(),
     };
 
-    let mut runtime = match Runtime::new(RuntimeOptions::default()) {
+    let mut runtime = match Runtime::new(RuntimeOptions {
+        // Resolve `import "./helpers"` against real files on disk (extension +
+        // index probing) so multi-file scripts work without whitelist/ordering
+        // constraints. See `RelativeImportResolver`.
+        import_provider: Some(Box::new(RelativeImportResolver)),
+        ..Default::default()
+    }) {
         Ok(r) => r,
         Err(e) => {
             let _ = ready_tx.send(Err(format!("failed to create v8 runtime: {e}")));

@@ -11,6 +11,7 @@
 //! entry is `"linux-native"`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::internal::process::{
     Module, Pid, Process, ProcessEntry, Section,
@@ -46,7 +47,13 @@ pub const WINDOWS_NATIVE: &str = "windows-native";
 ///
 /// Object-safe so registries can hold `Box<dyn ProcessProvider>`. Implementors:
 /// [`LinuxProvider`] today; a future `WindowsProvider` / `LeechCoreProvider`.
-pub trait ProcessProvider {
+///
+/// `Send + Sync` so the UI can hand an opened target's provider/handle to a
+/// background `spawn_blocking` worker (enumeration, attach) without stalling the
+/// eframe frame. Every implementor is thread-agnostic: Linux/kernel providers
+/// hold a pid/key/fd, the Windows provider an `OpenProcess` handle (see
+/// [`crate::MemoryBackend`]).
+pub trait ProcessProvider: Send + Sync {
     /// The provider's stable, human-readable name (its registry key).
     fn name(&self) -> &str;
 
@@ -226,7 +233,10 @@ impl ProcessProvider for KernelProvider {
 /// list and select backends. [`ProviderRegistry::default`] pre-registers the
 /// `"linux-native"` provider on Linux.
 pub struct ProviderRegistry {
-    providers: HashMap<String, Box<dyn ProcessProvider>>,
+    // `Arc` (not `Box`) so a caller can clone a provider out via [`get_arc`] and
+    // hand it to a background worker thread (the UI runs enumerate/attach off the
+    // frame). Providers are `Send + Sync`, so the clone is cheap and shareable.
+    providers: HashMap<String, Arc<dyn ProcessProvider>>,
 }
 
 impl ProviderRegistry {
@@ -240,12 +250,19 @@ impl ProviderRegistry {
     /// Registers `provider` under its own [`ProcessProvider::name`], replacing
     /// any provider previously registered under that name.
     pub fn register(&mut self, provider: Box<dyn ProcessProvider>) {
-        self.providers.insert(provider.name().to_owned(), provider);
+        self.providers.insert(provider.name().to_owned(), Arc::from(provider));
     }
 
     /// Looks up a provider by name.
     pub fn get(&self, name: &str) -> Option<&dyn ProcessProvider> {
         self.providers.get(name).map(|b| b.as_ref())
+    }
+
+    /// Looks up a provider by name and returns a cloned [`Arc`] handle, so the
+    /// caller can move it onto a background thread (enumeration / attach) without
+    /// borrowing the registry for the duration.
+    pub fn get_arc(&self, name: &str) -> Option<Arc<dyn ProcessProvider>> {
+        self.providers.get(name).cloned()
     }
 
     /// The registered provider names, in arbitrary order.

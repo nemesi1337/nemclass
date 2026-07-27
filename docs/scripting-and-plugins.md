@@ -12,6 +12,9 @@ optional embedded **JavaScript engine**.
 - `TryResolveClassAddress` — a query (`ClassAddressQuery`) a subscriber can
   answer to override how a class base is resolved
 - `ClassAddressUpdated`, `GlobalVariableUpdated` (`GlobalVariable`)
+- `OnTick` — emitted once per snapshot interval (carries the attached `pid`),
+  so trainers can poll / re-apply values without their own timer
+- `OnHotkey` — a script-registered global hotkey fired (carries its `id`)
 - `Custom` (`CustomPayload`) — user-raised events
 
 `EventBus` lets `Subscriber`s register and the app `publish` events. Both
@@ -25,6 +28,16 @@ Host-side capabilities exposed to scripts/plugins (`host_api`):
   `scan_module` (a tested matcher with `??` wildcards).
 - **Type / class declaration** — `TypeDeclare` / `PatternScan` traits for
   declaring custom types and classes programmatically.
+
+For the JS engine, the full script-facing surface is **catalog-driven**:
+`api_catalog::HOST_METHODS` is the single source of truth (one entry per method:
+name, TypeScript signature, doc) and generates the JS namespace shim, the
+`nemclass.d.ts` type declarations, and the in-app reference panel. It spans
+`mem.*` (typed/struct/array reads & writes, `resolveRip`, `freeze`), `scan.*`
+(aob/value/range/pointer/rescan/signature, `aobResolveRip`), `classes.*`
+(add/dissect/set-name/comment, `addNodeAt`), `disasm.*`, `proc.*`, `enums.*`,
+`hotkeys.*`, and `table.*`. Adding a method is one catalog line plus one
+`UiHostApi::call` match arm.
 
 ## Compile-time plugins
 
@@ -46,11 +59,21 @@ command channel. Design invariants keep it purely additive over the M1 traits:
 
 `ScriptEngine` + `NoopEngine` are always available; the real engine is opt-in.
 
-> **Status:** the `scripting` feature currently **does not compile** due to an
-> upstream dependency conflict in the deno/v8 tree (`swc_config` requires a
-> `serde` private module layout that conflicts with the `serde` version the rest
-> of the tree needs). It is deferred; the default build has no v8 dependency and
-> uses `NoopEngine`. Do not build with `--all-features`.
+### Multi-file scripts (`import "./helpers"`)
+
+Scripts in a project's `src/` can be split across files and use ordinary
+relative ES imports — `import { addressToFormula } from "./helpers"` — with or
+without a file extension. A custom `RelativeImportResolver`
+(`rustyscript::module_loader::ImportProvider`, wired via
+`RuntimeOptions.import_provider`) resolves each specifier against the real file
+on disk, probing `.ts`/`.tsx`/`.mts`/`.cts`/`.mjs`/`.cjs`/`.js`/`.json` and
+`index.*` when the extension is omitted. This bypasses rustyscript's default
+whitelist, so imports resolve regardless of the order files are loaded in.
+
+> **Build note:** the `scripting` feature has strict dependency pins (see the
+> [scripting build constraint](../CLAUDE.md) / project memory): it compiles only
+> with `serde = 1.0.219`, `toml 0.8`, and `deno_media_type 0.2.1`. Build with
+> `--features scripting`, not `--all-features`.
 
 ## TypeScript scaffolding
 

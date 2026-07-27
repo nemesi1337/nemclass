@@ -57,17 +57,35 @@ use crate::internal::process::{
 const DESIRED_ACCESS: u32 =
     PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION;
 
+/// An `OpenProcess` handle that is safe to move and share across threads.
+///
+/// A raw `HANDLE` is a `*mut c_void`, so the compiler infers `!Send`/`!Sync`. But
+/// a handle returned by `OpenProcess` names a process-scoped kernel object with no
+/// thread affinity (unlike, e.g., window handles): it is valid to use — and to
+/// `CloseHandle` — from any thread, and the kernel synchronises the read/write
+/// syscalls per handle internally. All access here is through `&self`, so shared
+/// concurrent reads are sound. This assertion is what lets [`MemoryBackend`]
+/// (hence `Arc<Process>`) carry the `Send + Sync` bound the UI's background
+/// workers require.
+struct SendHandle(HANDLE);
+
+// SAFETY: see the `SendHandle` doc — `OpenProcess` handles are thread-agnostic
+// kernel objects; using/closing one from another thread is well-defined, and all
+// access here goes through `&self` (no `&mut` aliasing of the handle itself).
+unsafe impl Send for SendHandle {}
+unsafe impl Sync for SendHandle {}
+
 /// Native Windows [`MemoryBackend`] over an open process `HANDLE`.
 ///
 /// Backed by `ReadProcessMemory` / `WriteProcessMemory`, the direct analogue of
 /// the Linux `process_vm_readv` / `process_vm_writev` backend. Owns the handle
 /// and closes it on [`Drop`].
 ///
-/// Not `Send`/`Sync`: a raw `HANDLE` is a `*mut c_void`, so the backend inherits
-/// the same thread-affinity the `Box<dyn MemoryBackend>` seam already allows
-/// (the trait carries no `Send` bound).
+/// `Send`/`Sync` via [`SendHandle`]: an `OpenProcess` handle has no thread
+/// affinity, so the backend can be shared as `Arc<Process>` and driven from a
+/// background `spawn_blocking` worker (the trait now requires `Send + Sync`).
 pub struct WindowsBackend {
-    handle: HANDLE,
+    handle: SendHandle,
 }
 
 impl WindowsBackend {
@@ -84,12 +102,12 @@ impl WindowsBackend {
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return Error::last_win32();
         }
-        Ok(WindowsBackend { handle })
+        Ok(WindowsBackend { handle: SendHandle(handle) })
     }
 
     /// The raw process handle, for callers that need further Win32 calls.
     pub fn handle(&self) -> HANDLE {
-        self.handle
+        self.handle.0
     }
 }
 
@@ -97,8 +115,9 @@ impl Drop for WindowsBackend {
     fn drop(&mut self) {
         // SAFETY: `self.handle` is a live handle returned by `OpenProcess` and
         // never closed elsewhere (we own it), so this is the single, valid close.
+        // Closing from a non-opening thread is well-defined (see `SendHandle`).
         unsafe {
-            CloseHandle(self.handle);
+            CloseHandle(self.handle.0);
         }
     }
 }
@@ -113,7 +132,7 @@ impl MemoryBackend for WindowsBackend {
         // us. `self.handle` is a live process handle.
         let ok = unsafe {
             ReadProcessMemory(
-                self.handle,
+                self.handle.0,
                 address as *const c_void,
                 buf.as_mut_ptr() as *mut c_void,
                 buf.len(),
@@ -162,7 +181,7 @@ impl MemoryBackend for WindowsBackend {
         // copy-on-write pages (patching `.text`, editing RO data) land instead of
         // failing with `ERROR_NOACCESS`. The original protection is restored by
         // `_restore` on every exit path (including the early `?` below).
-        let _restore = ProtectionGuard::apply(self.handle, address, buf.len(), PAGE_EXECUTE_READWRITE);
+        let _restore = ProtectionGuard::apply(self.handle.0, address, buf.len(), PAGE_EXECUTE_READWRITE);
 
         let mut written: usize = 0;
         // SAFETY: `buf` is a live, readable slice of `buf.len()` bytes matching
@@ -171,7 +190,7 @@ impl MemoryBackend for WindowsBackend {
         // rather than faulting us. `self.handle` is a live handle.
         let ok = unsafe {
             WriteProcessMemory(
-                self.handle,
+                self.handle.0,
                 address as *const c_void,
                 buf.as_ptr() as *const c_void,
                 buf.len(),

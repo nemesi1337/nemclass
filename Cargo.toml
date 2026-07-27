@@ -80,6 +80,15 @@ egui_dock = { version = "0.20", features = ["serde"] }
 rfd = "0.15"
 # XDG data dir → ~/.local/share/nemclass/settings.json
 dirs = "6"
+# Background thread pool for the UI's discrete long-running ops (value/pointer
+# scan, dissect, project I/O, script-resolve): each runs on `spawn_blocking` so
+# the eframe frame never stalls. `rt-multi-thread` alone gives the runtime + the
+# blocking pool; result channels are `std::sync::mpsc` (UI polls with `try_recv`),
+# so no `sync`/`net`/`macros` feature is needed. tokio 1.x is ALREADY resolved in
+# Cargo.lock (transitive via the deno/rustyscript tree), so this reuses that exact
+# version and does NOT perturb the serde =1.0.219 pin (tokio's serde is optional
+# and off here).
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
 # NOTE: egui_kittest (the obvious headless-UI test harness) is intentionally NOT
 # used: egui_kittest 0.35 hard-depends on `toml ^1.0`, which pulls `serde_core`
 # and forces serde >= 1.0.225 — this breaks the deliberate `serde = "=1.0.219"`

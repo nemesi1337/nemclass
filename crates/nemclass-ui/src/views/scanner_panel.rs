@@ -32,6 +32,16 @@ use nemclass_scan::ProcessTarget;
 
 use nemclass_core::{Pid, Process};
 
+use super::tasks::{BackgroundJob, Poll as JobPoll};
+
+/// Result of a background scan. The outer `Err` is a fatal failure with no usable
+/// scanner (e.g. the target couldn't be attached); `Ok` carries the (moved-back)
+/// `Scanner` plus the inner scan result — so even a failed scan returns the
+/// session handle, and a Next Scan never loses the user's result set.
+#[cfg(target_os = "linux")]
+type ScanOutcome =
+    Result<(Scanner<ProcessTarget>, Result<Vec<(usize, Vec<u8>)>, String>), String>;
+
 /// How many results to display at most (the full set can be millions of
 /// addresses; capping keeps the table from stalling the frame).
 const MAX_DISPLAY: usize = 1_000;
@@ -60,6 +70,10 @@ pub struct ScannerPanel {
     /// Boxed so it can be `None` on non-Linux, or before the first scan.
     #[cfg(target_os = "linux")]
     scanner: Option<Scanner<ProcessTarget>>,
+    /// In-flight First/Next scan running on the background pool. While set, the
+    /// `Scanner` lives inside the worker; it is moved back when the job completes.
+    #[cfg(target_os = "linux")]
+    scan_job: BackgroundJob<ScanOutcome>,
     /// Mirror the result set as a snapshot for the display, so the borrow
     /// checker can let us iterate while also drawing "add to class" buttons.
     result_snapshot: Vec<(usize, Vec<u8>)>,
@@ -82,6 +96,8 @@ impl ScannerPanel {
             upper_text:   String::new(),
             #[cfg(target_os = "linux")]
             scanner:      None,
+            #[cfg(target_os = "linux")]
+            scan_job:     BackgroundJob::default(),
             result_snapshot: Vec::new(),
             freeze_set:   FreezeSet::new(),
             freeze_entries: Vec::new(),
@@ -115,11 +131,39 @@ impl ScannerPanel {
     #[cfg(not(target_os = "linux"))]
     pub fn tick_freeze(&mut self) {}
 
+    /// Drain a completed background scan, moving the `Scanner` and its results
+    /// back onto the panel. Call each frame from the parent's `logic()` (runs even
+    /// when the Scanner tab is not visible, so results land promptly).
+    #[cfg(target_os = "linux")]
+    pub fn poll(&mut self) {
+        if let JobPoll::Done(outcome) = self.scan_job.poll() {
+            match outcome {
+                // Fatal: no scanner to restore (e.g. attach failed).
+                Err(msg) => self.status_msg = Some(msg),
+                Ok((scanner, scan_result)) => {
+                    self.scanner = Some(scanner);
+                    match scan_result {
+                        Ok(snapshot) => {
+                            self.result_snapshot = snapshot;
+                            self.status_msg = None;
+                        }
+                        Err(msg) => self.status_msg = Some(msg),
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn poll(&mut self) {}
+
     /// Reset the scanner when the user detaches from the process.
     pub fn on_detach(&mut self) {
         #[cfg(target_os = "linux")]
         {
             self.scanner = None;
+            // Drop any in-flight scan so its (now-stale) result is discarded.
+            self.scan_job = BackgroundJob::default();
         }
         self.result_snapshot.clear();
         self.freeze_set = FreezeSet::new();
@@ -132,11 +176,13 @@ impl ScannerPanel {
     /// Draw the full scanner panel. `process` is the currently-attached handle
     /// (or `None`); `pid` is its OS pid on Linux. `add_to_class_cb` is called
     /// when "Add to class" is clicked for a result address.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         process: Option<&Process>,
         pid: Option<Pid>,
+        rt: &tokio::runtime::Handle,
         mut add_to_class_cb: impl FnMut(usize),
         mut add_to_table_cb: impl FnMut(usize, &str),
         mut ptr_scan_cb: impl FnMut(usize),
@@ -149,7 +195,7 @@ impl ScannerPanel {
         }
 
         ui.add_enabled_ui(attached, |ui| {
-            self.show_controls(ui, pid);
+            self.show_controls(ui, pid, rt);
         });
 
         ui.separator();
@@ -172,7 +218,7 @@ impl ScannerPanel {
 
     // ── controls row ───────────────────────────────────────────────────
 
-    fn show_controls(&mut self, ui: &mut egui::Ui, pid: Option<Pid>) {
+    fn show_controls(&mut self, ui: &mut egui::Ui, pid: Option<Pid>, rt: &tokio::runtime::Handle) {
         ui.horizontal(|ui| {
             // Value type selector.
             egui::ComboBox::from_id_salt("scan_vtype")
@@ -214,11 +260,20 @@ impl ScannerPanel {
 
         ui.add_space(2.0);
 
+        // A scan is running on the background pool: gate the scan buttons and show
+        // a spinner so the user can't stack scans and sees progress.
+        let scanning = {
+            #[cfg(target_os = "linux")]
+            { self.scan_job.is_running() }
+            #[cfg(not(target_os = "linux"))]
+            { false }
+        };
+
         ui.horizontal(|ui| {
             // First Scan.
             #[cfg(target_os = "linux")]
-            if ui.button("First Scan").clicked() {
-                self.do_first_scan(pid);
+            if ui.add_enabled(!scanning, egui::Button::new("First Scan")).clicked() {
+                self.do_first_scan(pid, rt, ui.ctx().clone());
             }
             #[cfg(not(target_os = "linux"))]
             if ui.button("First Scan").clicked() {
@@ -232,14 +287,18 @@ impl ScannerPanel {
                 #[cfg(not(target_os = "linux"))]
                 { false }
             };
-            ui.add_enabled_ui(has_scan, |ui| {
+            ui.add_enabled_ui(has_scan && !scanning, |ui| {
                 #[cfg(target_os = "linux")]
                 if ui.button("Next Scan").clicked() {
-                    self.do_next_scan();
+                    self.do_next_scan(rt, ui.ctx().clone());
                 }
                 #[cfg(not(target_os = "linux"))]
                 { ui.button("Next Scan"); }
             });
+
+            if scanning {
+                ui.spinner();
+            }
 
             // Undo.
             let can_undo = {
@@ -278,21 +337,19 @@ impl ScannerPanel {
 
     // ── scan actions ───────────────────────────────────────────────────
 
+    /// Launches a first scan on the background pool. Scanning the whole address
+    /// space can take seconds, so it must not run on the UI thread. The
+    /// `ProcessTarget` is (re)attached inside the worker; the `Scanner` and its
+    /// results are moved back in [`Self::poll`].
     #[cfg(target_os = "linux")]
-    fn do_first_scan(&mut self, pid: Option<Pid>) {
+    fn do_first_scan(&mut self, pid: Option<Pid>, rt: &tokio::runtime::Handle, ctx: egui::Context) {
         let Some(pid) = pid else {
             self.status_msg = Some("No process attached.".into());
             return;
         };
-
-        // Build a fresh ProcessTarget.
-        let target = match ProcessTarget::attach(pid) {
-            Ok(t) => t,
-            Err(e) => {
-                self.status_msg = Some(format!("ProcessTarget: {e}"));
-                return;
-            }
-        };
+        if self.scan_job.is_running() {
+            return;
+        }
 
         let needle = self.parse_needle();
         if self.compare.needs_needle() && needle.is_none() {
@@ -300,43 +357,46 @@ impl ScannerPanel {
             return;
         }
 
-        let mut scanner = Scanner::new(target, self.value_type);
-        match scanner.first_scan(self.compare, needle) {
-            Ok(results) => {
-                self.result_snapshot = results
-                    .iter()
-                    .map(|r| (r.address, r.previous_value_bytes.clone()))
-                    .collect();
-                self.status_msg = None;
-            }
-            Err(e) => {
-                self.status_msg = Some(format!("First scan: {e}"));
-            }
-        }
-        self.scanner = Some(scanner);
+        let compare = self.compare;
+        let value_type = self.value_type;
+        self.status_msg = Some("Scanning…".into());
+        self.scan_job.spawn(rt, ctx, move || {
+            let target =
+                ProcessTarget::attach(pid).map_err(|e| format!("ProcessTarget: {e}"))?;
+            let mut scanner = Scanner::new(target, value_type);
+            let scan_result = scanner
+                .first_scan(compare, needle)
+                .map(snapshot_results)
+                .map_err(|e| format!("First scan: {e}"));
+            Ok((scanner, scan_result))
+        });
     }
 
+    /// Launches a next scan on the background pool. The existing `Scanner` is
+    /// moved into the worker and returned in [`Self::poll`] (even on error, so the
+    /// session survives a failed narrowing).
     #[cfg(target_os = "linux")]
-    fn do_next_scan(&mut self) {
+    fn do_next_scan(&mut self, rt: &tokio::runtime::Handle, ctx: egui::Context) {
+        if self.scan_job.is_running() {
+            return;
+        }
         let needle = self.parse_needle();
         if self.compare.needs_needle() && needle.is_none() {
             return;
         }
+        let Some(mut scanner) = self.scanner.take() else {
+            return;
+        };
 
-        if let Some(scanner) = &mut self.scanner {
-            match scanner.next_scan(self.compare, needle) {
-                Ok(results) => {
-                    self.result_snapshot = results
-                        .iter()
-                        .map(|r| (r.address, r.previous_value_bytes.clone()))
-                        .collect();
-                    self.status_msg = None;
-                }
-                Err(e) => {
-                    self.status_msg = Some(format!("Next scan: {e}"));
-                }
-            }
-        }
+        let compare = self.compare;
+        self.status_msg = Some("Scanning…".into());
+        self.scan_job.spawn(rt, ctx, move || {
+            let scan_result = scanner
+                .next_scan(compare, needle)
+                .map(snapshot_results)
+                .map_err(|e| format!("Next scan: {e}"));
+            Ok((scanner, scan_result))
+        });
     }
 
     #[cfg(target_os = "linux")]
@@ -524,6 +584,17 @@ impl Default for ScannerPanel {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+/// Collapse a scan's [`ScanResults`] into the `(address, captured-bytes)` display
+/// snapshot the panel renders. Owned output, so it outlives the borrow of the
+/// `Scanner` and can travel back from the worker.
+#[cfg(target_os = "linux")]
+fn snapshot_results(results: &nemclass_scan::ScanResults) -> Vec<(usize, Vec<u8>)> {
+    results
+        .iter()
+        .map(|r| (r.address, r.previous_value_bytes.clone()))
+        .collect()
+}
 
 /// Reads the raw bytes of a fixed-width value live from the target. Returns
 /// `None` for variable-width types (Bytes/strings), on a short read, or when

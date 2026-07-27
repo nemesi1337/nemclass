@@ -130,11 +130,31 @@ fn engine_dispatch_host_bridge_and_resolver() {
     "#;
     let resolver_js = r#"
         nemclass.on("tryResolveClassAddress", (q) => q.pid === 7 ? 0xDEAD : null);
+        // Member form advertised by nemclass.d.ts — must also be honored. Claims a
+        // different pid so it can't collide with the `on(...)` resolver above.
+        nemclass.tryResolveClassAddress = (q) => q.pid === 9 ? 0xBEEF : null;
+    "#;
+
+    // Multi-file import: a helper module imported *without* a file extension
+    // (`./mathlib`, not `./mathlib.ts`) from another script. This exercises the
+    // `RelativeImportResolver` — the default rustyscript loader would reject it
+    // with `requested module is not loaded: ./mathlib`. The importer registers
+    // an OnAttach handler so its effect (a log line) surfaces through the host.
+    let helper_ts = r#"
+        export function doubler(n: number): number { return n * 2; }
+    "#;
+    let importer_ts = r#"
+        import { doubler } from "./mathlib";
+        nemclass.on("OnAttach", () => {
+            nemclass.log("doubled=" + doubler(21));
+        });
     "#;
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("attach.js"), attach_js).unwrap();
     std::fs::write(dir.path().join("resolver.js"), resolver_js).unwrap();
+    std::fs::write(dir.path().join("mathlib.ts"), helper_ts).unwrap();
+    std::fs::write(dir.path().join("importer.ts"), importer_ts).unwrap();
     engine.load_scripts(dir.path()).unwrap();
 
     // --- Event dispatch reaches every host fn ---------------------------------
@@ -148,6 +168,7 @@ fn engine_dispatch_host_bridge_and_resolver() {
             && !h.pattern_calls.is_empty()
             && h.logs.iter().any(|l| l.contains("hits=2"))
             && h.logs.iter().any(|l| l.contains("readU32=0xcafe"))
+            && h.logs.iter().any(|l| l.contains("doubled=42"))
     });
     {
         let h = host.lock().unwrap();
@@ -175,13 +196,26 @@ fn engine_dispatch_host_bridge_and_resolver() {
             h.generic_calls
         );
         assert!(h.logs.iter().any(|l| l.contains("readU32=0xcafe")));
+
+        // Multi-file import worked: the extensionless `import { doubler } from
+        // "./mathlib"` resolved and executed (21 * 2 == 42).
+        assert!(
+            h.logs.iter().any(|l| l.contains("doubled=42")),
+            "extensionless relative import resolved and ran: {:?}",
+            h.logs
+        );
     }
 
     // --- Resolver: returns a number when it claims the class ------------------
     let got = engine.resolve_class_address(&ClassAddressQuery::new(7, uuid::Uuid::nil()));
     assert_eq!(got, Some(0xDEAD));
 
-    // --- Resolver: yields None when the handler defers (returns null) ---------
+    // --- Resolver: the `nemclass.tryResolveClassAddress = ...` member form -----
+    // (the `on(...)` resolver defers on pid 9, so the member form must answer.)
+    let member = engine.resolve_class_address(&ClassAddressQuery::new(9, uuid::Uuid::nil()));
+    assert_eq!(member, Some(0xBEEF));
+
+    // --- Resolver: yields None when every resolver defers (returns null) -------
     let deferred = engine.resolve_class_address(&ClassAddressQuery::new(1, uuid::Uuid::nil()));
     assert_eq!(deferred, None);
 }

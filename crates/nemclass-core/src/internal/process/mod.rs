@@ -90,6 +90,17 @@ pub struct Process {
     symbol_cache: std::sync::Mutex<HashMap<usize, symbol_resolver::SymbolResolver>>,
 }
 
+// `Process` must stay `Send + Sync` so the UI can share it as `Arc<Process>` and
+// run heavy reads (dissect, scans) on a background `spawn_blocking` worker off the
+// eframe frame. This holds because `Box<dyn MemoryBackend>` now carries the
+// `Send + Sync` bound, and the optional `symbol_cache` is a `Mutex<..>` (a `Mutex`
+// is `Sync` whenever its contents are `Send`, and `SymbolResolver` is `Send`).
+// This static assertion fails the build if a future field breaks the invariant.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Process>();
+};
+
 impl Process {
     /// Builds a `Process` from an already-opened backend. Used by providers.
     pub(crate) fn from_backend(pid: Pid, backend: Box<dyn MemoryBackend>) -> Self {

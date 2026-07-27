@@ -18,7 +18,15 @@ pub use iovec::*;
 /// The `*_batch` variants exist so a caller reading/writing many small,
 /// scattered regions pays a single syscall (per `IOV_MAX` chunk) instead of one
 /// per region.
-pub trait MemoryBackend {
+///
+/// `Send + Sync` so an [`super::Process`] can be shared as `Arc<Process>` across
+/// threads: the UI runs heavy reads (dissect, scans) on a `spawn_blocking` worker
+/// off the eframe frame. All backends are thread-agnostic — the Linux backend
+/// holds a pid, the kernel backend a device fd, and the Windows backend an
+/// `OpenProcess` handle (a process-scoped kernel object with no thread affinity;
+/// see `win_backend::SendHandle`). All access is through `&self`, so concurrent
+/// reads are sound.
+pub trait MemoryBackend: Send + Sync {
     /// Reads into `buf` starting at `address`. Returns the number of bytes read.
     fn read_buf(&self, address: usize, buf: &mut [u8]) -> crate::Result<usize>;
 

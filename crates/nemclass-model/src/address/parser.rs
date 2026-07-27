@@ -208,4 +208,15 @@ mod tests {
         assert!(parse(formula).is_ok(), "moderate nesting should parse");
         assert!(parse("-(-(-(1)))").is_ok(), "shallow unary should parse");
     }
+
+    /// A double-prefixed hex literal (`0x0x1234`) — a common script mistake when
+    /// a helper already prepends `0x` — must be rejected, not silently swallowed.
+    /// The JS `classes.setFormula` host method relies on `parse` returning `Err`
+    /// here so it can surface the error instead of storing a dead formula.
+    #[test]
+    fn double_hex_prefix_is_rejected() {
+        assert!(parse("0x0x1234").is_err(), "0x0x1234 must not parse");
+        // But the correctly-formed single-prefix literal is fine.
+        assert!(parse("0x1234").is_ok(), "0x1234 should parse");
+    }
 }

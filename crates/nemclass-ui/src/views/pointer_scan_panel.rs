@@ -20,6 +20,8 @@
 //! Disabled (greyed) when no process is attached. A `ProcessTarget` is built
 //! from the attached process when Scan fires.
 
+use std::sync::Arc;
+
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
@@ -28,6 +30,9 @@ use nemclass_scan::{PointerScanConfig, Region};
 
 #[cfg(target_os = "linux")]
 use nemclass_scan::{pointer_scan, PointerPath};
+
+#[cfg(target_os = "linux")]
+use super::tasks::{BackgroundJob, Poll as JobPoll};
 
 /// Cap on rendered rows (a scan can return thousands of paths).
 const MAX_DISPLAY: usize = 500;
@@ -70,6 +75,14 @@ pub struct PointerScanPanel {
     map_entries: usize,
     /// True if the last scan hit a result/entry cap.
     truncated: bool,
+    /// In-flight pointer scan (can take tens of seconds — must be off the UI
+    /// thread). Payload: the prepared rows plus the truncation flag, or an error.
+    #[cfg(target_os = "linux")]
+    scan_job: BackgroundJob<Result<(Vec<PathRow>, bool), String>>,
+    /// In-flight rescan (re-reads the live process for every path). Payload: the
+    /// retained rows plus the pre-rescan count for the status line.
+    #[cfg(target_os = "linux")]
+    rescan_job: BackgroundJob<(Vec<PathRow>, usize)>,
     /// Status / error line.
     pub status_msg: Option<String>,
 }
@@ -89,6 +102,10 @@ impl PointerScanPanel {
             rows: Vec::new(),
             map_entries: 0,
             truncated: false,
+            #[cfg(target_os = "linux")]
+            scan_job: BackgroundJob::default(),
+            #[cfg(target_os = "linux")]
+            rescan_job: BackgroundJob::default(),
             status_msg: None,
         }
     }
@@ -98,8 +115,44 @@ impl PointerScanPanel {
         self.rows.clear();
         self.map_entries = 0;
         self.truncated = false;
+        #[cfg(target_os = "linux")]
+        {
+            // Discard any in-flight scan/rescan so stale results don't land.
+            self.scan_job = BackgroundJob::default();
+            self.rescan_job = BackgroundJob::default();
+        }
         self.status_msg = None;
     }
+
+    /// Drain completed pointer scan / rescan jobs. Call each frame from the
+    /// parent's `logic()`.
+    #[cfg(target_os = "linux")]
+    pub fn poll(&mut self) {
+        if let JobPoll::Done(outcome) = self.scan_job.poll() {
+            match outcome {
+                Ok((rows, truncated)) => {
+                    self.rows = rows;
+                    self.truncated = truncated;
+                    self.status_msg = if self.rows.is_empty() {
+                        Some("No paths found. Try a larger depth or max offset.".into())
+                    } else {
+                        None
+                    };
+                }
+                Err(e) => self.status_msg = Some(e),
+            }
+        }
+        if let JobPoll::Done((kept, before)) = self.rescan_job.poll() {
+            let kept_len = kept.len();
+            self.rows = kept;
+            self.status_msg = Some(format!(
+                "Rescan: {kept_len}/{before} paths still resolve to the goal.",
+            ));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn poll(&mut self) {}
 
     /// Seed the goal field (e.g. from a scanner "pointer-scan this address").
     pub fn set_goal(&mut self, addr: usize) {
@@ -111,9 +164,10 @@ impl PointerScanPanel {
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        process: Option<&Process>,
+        process: Option<Arc<Process>>,
         pid: Option<Pid>,
         modules: &[ModuleInfoWithName],
+        rt: &tokio::runtime::Handle,
     ) -> PointerScanAction {
         let attached = process.is_some();
         if !attached {
@@ -143,22 +197,29 @@ impl PointerScanPanel {
 
                 #[cfg(target_os = "linux")]
                 {
-                    if ui.button("Scan").clicked() {
-                        self.run_scan(pid, modules);
+                    let busy = self.scan_job.is_running() || self.rescan_job.is_running();
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Scan"))
+                        .clicked()
+                    {
+                        self.run_scan(pid, modules, rt, ui.ctx().clone());
                     }
                     // Rescan verifies existing results against current memory —
                     // enabled only once a scan has produced rows.
                     if ui
-                        .add_enabled(!self.rows.is_empty(), egui::Button::new("Rescan"))
+                        .add_enabled(!busy && !self.rows.is_empty(), egui::Button::new("Rescan"))
                         .on_hover_text("Keep only chains that still resolve to the goal (after a restart / relocation)")
                         .clicked()
                     {
-                        self.rescan(process);
+                        self.rescan(process.clone(), rt, ui.ctx().clone());
+                    }
+                    if busy {
+                        ui.spinner();
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let _ = (pid, modules, process);
+                    let _ = (pid, modules, &process, rt);
                     ui.add_enabled(false, egui::Button::new("Scan"));
                 }
             });
@@ -242,10 +303,21 @@ impl PointerScanPanel {
         usize::from_str_radix(t, 16).ok()
     }
 
+    /// Launch a pointer scan on the background pool. Building the pointer map and
+    /// walking it can take tens of seconds, so it must not block the UI thread.
+    /// The `ProcessTarget` is (re)attached inside the worker; the prepared rows
+    /// land via [`Self::poll`].
     #[cfg(target_os = "linux")]
-    fn run_scan(&mut self, pid: Option<Pid>, modules: &[ModuleInfoWithName]) {
-        use nemclass_scan::ProcessTarget;
-
+    fn run_scan(
+        &mut self,
+        pid: Option<Pid>,
+        modules: &[ModuleInfoWithName],
+        rt: &tokio::runtime::Handle,
+        ctx: egui::Context,
+    ) {
+        if self.scan_job.is_running() {
+            return;
+        }
         self.rows.clear();
         self.truncated = false;
         self.map_entries = 0;
@@ -261,74 +333,50 @@ impl PointerScanPanel {
         let max_depth: usize = self.depth_text.trim().parse().unwrap_or(5).clamp(1, 12);
         let max_offset = self.parse_addr(&self.max_offset_text).unwrap_or(0x1000);
 
-        let target = match ProcessTarget::attach(pid) {
-            Ok(t) => t,
-            Err(e) => {
-                self.status_msg = Some(format!("ProcessTarget: {e}"));
-                return;
-            }
-        };
-
-        // Static anchors = module images.
+        // Static anchors = module images. Snapshot them (owned) for the worker.
         let static_ranges: Vec<Region> =
             modules.iter().map(|m| Region::new(m.base, m.size)).collect();
         if static_ranges.is_empty() {
             self.status_msg = Some("No modules enumerated to anchor a chain.".into());
             return;
         }
+        let modules: Vec<ModuleInfoWithName> = modules.to_vec();
 
-        let cfg = PointerScanConfig {
-            max_depth,
-            max_offset,
-            static_ranges,
-            ..Default::default()
-        };
-
-        let result = match pointer_scan(&target, goal, &cfg) {
-            Ok(r) => r,
-            Err(e) => {
-                self.status_msg = Some(format!("Pointer scan: {e}"));
-                return;
-            }
-        };
-        self.truncated = result.truncated;
-
-        // Turn each path into a module-relative formula.
-        self.rows = result
-            .paths
-            .iter()
-            .map(|p| self.path_row(p, modules))
-            .collect();
-
-        if self.rows.is_empty() {
-            self.status_msg = Some(
-                "No paths found. Try a larger depth or max offset.".into(),
-            );
-        } else {
-            self.status_msg = None;
-        }
-    }
-
-    /// Map a path's static base to its owning module and render the formula.
-    #[cfg(target_os = "linux")]
-    fn path_row(&self, p: &PointerPath, modules: &[ModuleInfoWithName]) -> PathRow {
-        let module = modules
-            .iter()
-            .find(|m| p.base >= m.base && p.base < m.base.saturating_add(m.size));
-        let formula = match module {
-            Some(m) => p.to_formula(&m.name, m.base),
-            // Fallback: no owning module (shouldn't happen) → absolute anchor.
-            None => p.to_formula("unknown", 0),
-        };
-        PathRow { formula, depth: p.offsets.len(), base: p.base, offsets: p.offsets.clone() }
+        self.status_msg = Some("Scanning…".into());
+        self.scan_job.spawn(rt, ctx, move || {
+            use nemclass_scan::ProcessTarget;
+            let target =
+                ProcessTarget::attach(pid).map_err(|e| format!("ProcessTarget: {e}"))?;
+            let cfg = PointerScanConfig {
+                max_depth,
+                max_offset,
+                static_ranges,
+                ..Default::default()
+            };
+            let result =
+                pointer_scan(&target, goal, &cfg).map_err(|e| format!("Pointer scan: {e}"))?;
+            // Turn each path into a module-relative formula.
+            let rows: Vec<PathRow> =
+                result.paths.iter().map(|p| path_row(p, &modules)).collect();
+            Ok((rows, result.truncated))
+        });
     }
 
     /// Re-resolve every discovered path against the live process and keep only
     /// those that still point at the goal. This is Cheat Engine's pointer-scan
     /// "rescan": run once, restart/relocate the target, rescan to drop the
-    /// chains that were coincidental.
+    /// chains that were coincidental. Runs on the background pool (one live read
+    /// per path); the retained rows land via [`Self::poll`].
     #[cfg(target_os = "linux")]
-    fn rescan(&mut self, process: Option<&Process>) {
+    fn rescan(
+        &mut self,
+        process: Option<Arc<Process>>,
+        rt: &tokio::runtime::Handle,
+        ctx: egui::Context,
+    ) {
+        if self.rescan_job.is_running() {
+            return;
+        }
         let Some(proc) = process else {
             self.status_msg = Some("No process attached.".into());
             return;
@@ -337,18 +385,36 @@ impl PointerScanPanel {
             self.status_msg = Some("Enter a valid goal address (hex).".into());
             return;
         };
-        let read_ptr = |addr: usize| -> Option<usize> {
-            proc.read::<u64>(addr).ok().map(|v| v as usize)
-        };
-        let before = self.rows.len();
-        self.rows.retain(|row| {
-            let path = PointerPath { base: row.base, offsets: row.offsets.clone() };
-            path.resolve(read_ptr) == Some(goal)
+        // Move the rows into the worker; they return filtered (or intact on error).
+        let rows = std::mem::take(&mut self.rows);
+        let before = rows.len();
+        self.status_msg = Some("Rescanning…".into());
+        self.rescan_job.spawn(rt, ctx, move || {
+            let read_ptr = |addr: usize| -> Option<usize> {
+                proc.read::<u64>(addr).ok().map(|v| v as usize)
+            };
+            let kept: Vec<PathRow> = rows
+                .into_iter()
+                .filter(|row| {
+                    let path = PointerPath { base: row.base, offsets: row.offsets.clone() };
+                    path.resolve(read_ptr) == Some(goal)
+                })
+                .collect();
+            (kept, before)
         });
-        self.status_msg = Some(format!(
-            "Rescan: {}/{} paths still resolve to the goal.",
-            self.rows.len(),
-            before
-        ));
     }
+}
+
+/// Map a path's static base to its owning module and render the formula.
+#[cfg(target_os = "linux")]
+fn path_row(p: &PointerPath, modules: &[ModuleInfoWithName]) -> PathRow {
+    let module = modules
+        .iter()
+        .find(|m| p.base >= m.base && p.base < m.base.saturating_add(m.size));
+    let formula = match module {
+        Some(m) => p.to_formula(&m.name, m.base),
+        // Fallback: no owning module (shouldn't happen) → absolute anchor.
+        None => p.to_formula("unknown", 0),
+    };
+    PathRow { formula, depth: p.offsets.len(), base: p.base, offsets: p.offsets.clone() }
 }
