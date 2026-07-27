@@ -344,7 +344,7 @@ mod linux {
     /// or dropped by a [`SectionFilter`] whose default is the writable-only
     /// policy a value scan wants (Cheat Engine's default). Reads go through
     /// [`Process::read_buf`] (one `process_vm_readv`), writes through
-    /// [`Process::write`].
+    /// [`Process::write_buf`].
     ///
     /// The handle is an `Arc` so a caller that already has one — the UI holds
     /// `Arc<Process>` precisely so background workers can share it — can pass it
@@ -435,15 +435,10 @@ mod linux {
 
     impl WriteTarget for ProcessTarget {
         fn write(&self, addr: usize, buf: &[u8]) -> Result<usize> {
-            // `Process` exposes a typed `write<T>` but no raw-buffer write, so a
-            // freeze span is written a byte at a time (`write::<u8>`). Freeze
-            // entries are only a handful of bytes and written periodically, so
-            // the per-byte cost is negligible; a bulk `Process::write_buf` in
-            // core would let this become a single `process_vm_writev`.
-            for (i, &b) in buf.iter().enumerate() {
-                self.process.write::<u8>(addr + i, b)?;
-            }
-            Ok(buf.len())
+            // One `process_vm_writev` for the whole span. This used to loop
+            // `write::<u8>`, i.e. one syscall per byte per freeze entry, every
+            // 200 ms.
+            self.process.write_buf(addr, buf)
         }
     }
 }

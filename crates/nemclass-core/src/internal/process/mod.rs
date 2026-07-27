@@ -225,6 +225,17 @@ impl Process {
         self.backend.read_buf(address, buf)
     }
 
+    /// Bulk-writes `buf` starting at `address` in a single backend call (one
+    /// `process_vm_writev` on Linux). Returns the number of bytes written, which
+    /// may be short if the span is partly unmapped or read-only.
+    ///
+    /// The counterpart to [`Process::read_buf`]. Prefer it over a loop of
+    /// [`Process::write`] when writing a whole value or struct span — a freeze
+    /// write-back through the typed API costs one syscall *per byte*.
+    pub fn write_buf(&self, address: usize, buf: &[u8]) -> crate::Result<usize> {
+        self.backend.write_buf(address, buf)
+    }
+
     /// Writes a single `T` to `address`. A short write is reported as
     /// [`Error::PartialTransfer`].
     pub fn write<T: bytemuck::Pod>(&self, address: usize, value: T) -> crate::Result<()> {
@@ -575,5 +586,38 @@ mod tests {
         // Anonymous shared memory (no path) is also Mapped, not Private.
         assert_eq!(secs[2].kind, SectionType::Mapped);
         assert_eq!(secs[2].module, None);
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod buf_io_tests {
+    use super::*;
+    use crate::MockMemoryBackend;
+
+    const BASE: usize = 0x4000;
+
+    fn process(bytes: Vec<u8>) -> Process {
+        Process::from_backend_for_test(1, Box::new(MockMemoryBackend::new(BASE, bytes)))
+    }
+
+    #[test]
+    fn write_buf_round_trips_through_read_buf() {
+        let p = process(vec![0u8; 64]);
+        let payload = [0xDEu8, 0xAD, 0xBE, 0xEF];
+
+        assert_eq!(p.write_buf(BASE + 8, &payload).unwrap(), payload.len());
+
+        let mut back = [0u8; 4];
+        assert_eq!(p.read_buf(BASE + 8, &mut back).unwrap(), 4);
+        assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn write_buf_reports_a_short_write_rather_than_erroring() {
+        // The tail of the span runs past the mapping, exactly as a partly
+        // unmapped freeze target would.
+        let p = process(vec![0u8; 16]);
+        let written = p.write_buf(BASE + 12, &[1u8; 8]).unwrap();
+        assert_eq!(written, 4);
     }
 }
