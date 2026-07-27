@@ -56,7 +56,7 @@ pub use pointerscan::{
 };
 pub use results::{ScanResult, ScanResults};
 pub use signature::{format_signature, make_signature, SignatureConfig};
-pub use scanner::{ScanError, ScanProgress, ScanStats, Scanner};
+pub use scanner::{NoObserver, ScanError, ScanObserver, ScanProgress, ScanStats, Scanner};
 pub use target::{
     FilterState, MockTarget, Region, RegionFilter, ScanTarget, SectionFilter, WriteTarget,
 };

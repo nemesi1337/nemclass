@@ -50,6 +50,15 @@ pub enum ScanError {
     TargetUnreadable(nemclass_core::Error),
     /// Enumerating the target's regions failed.
     Target(nemclass_core::Error),
+    /// A [`ScanObserver`] aborted the pass. The current generation is untouched.
+    Cancelled,
+}
+
+/// Whether a region walk ran to completion or was stopped by the observer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkOutcome {
+    Completed,
+    Cancelled,
 }
 
 impl core::fmt::Display for ScanError {
@@ -82,6 +91,7 @@ impl core::fmt::Display for ScanError {
                 write!(f, "no result address could be read ({e}) — has the process exited?")
             }
             Self::Target(e) => write!(f, "{e}"),
+            Self::Cancelled => write!(f, "scan stopped"),
         }
     }
 }
@@ -127,16 +137,49 @@ const HISTORY_DEPTH: usize = 3;
 /// killed" into "narrow your scan range", which is a message a user can act on.
 const DEFAULT_RESULT_LIMIT: usize = 5_000_000;
 
-/// Progress of an in-progress or completed scan pass.
+/// How often a scan reports progress: every this many candidate positions on a
+/// first scan, or previous results on a next scan. Frequent enough for a smooth
+/// bar and a responsive Stop, rare enough that the callback is not measurable.
+const PROGRESS_INTERVAL: usize = 4096;
+
+/// Progress of an in-flight scan pass, as passed to a [`ScanObserver`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanProgress {
-    /// Work units processed (regions on a first scan, previous results on a next
-    /// scan).
+    /// Work units processed so far: candidate positions on a first scan,
+    /// previous results re-read on a next scan.
     pub done: usize,
-    /// Total work units for this pass.
+    /// Total work units for this pass. An estimate on a first scan (the region
+    /// span divided by the alignment), exact on a next scan.
     pub total: usize,
     /// Matches found so far.
     pub matches: usize,
+}
+
+/// Called periodically during a scan. Returning `false` aborts the pass, which
+/// then leaves the current result generation untouched.
+///
+/// Scans run on a background worker that cannot be killed from outside, so
+/// stopping one has to be cooperative. This is also the only honest source of
+/// progress: the total is not known until the region walk has been set up.
+pub trait ScanObserver {
+    /// Reports progress. Return `false` to abort.
+    fn tick(&mut self, progress: ScanProgress) -> bool;
+}
+
+impl<F: FnMut(ScanProgress) -> bool> ScanObserver for F {
+    fn tick(&mut self, progress: ScanProgress) -> bool {
+        self(progress)
+    }
+}
+
+/// A [`ScanObserver`] that ignores progress and never aborts, for the
+/// non-cancellable entry points.
+pub struct NoObserver;
+
+impl ScanObserver for NoObserver {
+    fn tick(&mut self, _progress: ScanProgress) -> bool {
+        true
+    }
 }
 
 /// A stateful scan session over a target `T`.
@@ -279,6 +322,11 @@ impl<T: ScanTarget> Scanner<T> {
         self.last_stats
     }
 
+    /// Whether a first scan has completed, i.e. whether a next scan is valid.
+    pub fn has_scanned(&self) -> bool {
+        self.has_scanned
+    }
+
     /// The current result generation, or an empty set before any scan.
     pub fn results(&self) -> &ScanResults {
         self.history.last().unwrap_or(&EMPTY_RESULTS)
@@ -330,6 +378,17 @@ impl<T: ScanTarget> Scanner<T> {
         compare: ScanCompareType,
         needle: Option<Needle>,
     ) -> Result<&ScanResults> {
+        self.first_scan_with(compare, needle, &mut NoObserver)
+    }
+
+    /// [`Scanner::first_scan`] with progress reporting and cooperative
+    /// cancellation. An aborted scan leaves the current generation untouched.
+    pub fn first_scan_with(
+        &mut self,
+        compare: ScanCompareType,
+        needle: Option<Needle>,
+        observer: &mut dyn ScanObserver,
+    ) -> Result<&ScanResults> {
         // A first scan cannot use a change-relative compare (there is no previous
         // value yet) — except `Unknown`, which is *defined* as the baseline.
         if compare.needs_previous() {
@@ -351,15 +410,29 @@ impl<T: ScanTarget> Scanner<T> {
         let mut scanned = 0usize;
         self.truncated = false;
 
+        // An estimate, since a region may read short: the walked span divided by
+        // the candidate step. Good enough to drive a bar, and the only number
+        // available before the walk starts.
+        let align = self.alignment();
+        let total: usize = regions.iter().map(|r| r.size / align).sum();
+
         for region in &regions {
-            scanned += self.scan_region_first(
+            let outcome = self.scan_region_first(
                 region,
                 compare,
                 needle.as_ref(),
                 stride,
                 &mut buf,
                 &mut results,
+                observer,
+                &mut scanned,
+                total,
             )?;
+            if outcome == WalkOutcome::Cancelled {
+                // Deliberately before `push_generation`: a stopped scan must
+                // leave the previous results exactly as they were.
+                return Err(ScanError::Cancelled);
+            }
             if results.len() >= self.result_limit {
                 self.truncated = true;
                 break;
@@ -395,6 +468,17 @@ impl<T: ScanTarget> Scanner<T> {
         compare: ScanCompareType,
         needle: Option<Needle>,
     ) -> Result<&ScanResults> {
+        self.next_scan_with(compare, needle, &mut NoObserver)
+    }
+
+    /// [`Scanner::next_scan`] with progress reporting and cooperative
+    /// cancellation. An aborted scan leaves the current generation untouched.
+    pub fn next_scan_with(
+        &mut self,
+        compare: ScanCompareType,
+        needle: Option<Needle>,
+        observer: &mut dyn ScanObserver,
+    ) -> Result<&ScanResults> {
         if !self.has_scanned {
             return Err(ScanError::NeedsFirstScan);
         }
@@ -419,7 +503,18 @@ impl<T: ScanTarget> Scanner<T> {
         let mut unreadable = 0usize;
         let mut last_err = None;
 
-        for prev in previous.iter() {
+        for (i, prev) in previous.iter().enumerate() {
+            if i.is_multiple_of(PROGRESS_INTERVAL)
+                && !observer.tick(ScanProgress {
+                    done: i,
+                    total: previous.len(),
+                    matches: results.len(),
+                })
+            {
+                // Before `push_generation`, so a stopped narrowing leaves the
+                // user's result set exactly as it was.
+                return Err(ScanError::Cancelled);
+            }
             // Re-read exactly this result's span and re-compare against its
             // captured previous bytes. An address that has since been freed or
             // unmapped drops just that result: a long-running target recycles
@@ -469,19 +564,12 @@ impl<T: ScanTarget> Scanner<T> {
         Ok(self.results())
     }
 
-    /// Progress snapshot for the current (last completed) generation.
-    pub fn progress(&self) -> ScanProgress {
-        let matches = self.results().len();
-        ScanProgress {
-            done: matches,
-            total: matches,
-            matches,
-        }
-    }
-
     /// Walks one region in overlapping [`CHUNK_SIZE`] windows, comparing every
-    /// stride-aligned position, and appends matches (ascending address).
-    /// Returns how many candidate positions were examined.
+    /// aligned position, and appends matches (ascending address).
+    ///
+    /// `scanned` accumulates across regions so progress is reported against the
+    /// whole pass, not per region.
+    #[allow(clippy::too_many_arguments)]
     fn scan_region_first(
         &self,
         region: &Region,
@@ -490,13 +578,18 @@ impl<T: ScanTarget> Scanner<T> {
         stride: usize,
         buf: &mut [u8],
         out: &mut ScanResults,
-    ) -> Result<usize> {
+        observer: &mut dyn ScanObserver,
+        scanned: &mut usize,
+        total: usize,
+    ) -> Result<WalkOutcome> {
         let align = self.alignment();
         // Start on an aligned address so every candidate in this region sits on
         // the same lattice, independent of where the region happens to begin.
         let mut addr = region.base.next_multiple_of(align);
         let region_end = region.end();
-        let mut scanned = 0usize;
+        // Candidates since the last observer tick, so the check itself costs
+        // nothing per position.
+        let mut since_tick = 0usize;
 
         while addr < region_end {
             // Never read past the region: cap the request to what remains.
@@ -514,7 +607,19 @@ impl<T: ScanTarget> Scanner<T> {
             // `addr` is aligned, so offset 0 is a candidate and every `align`
             // bytes after it is too.
             for off in (0..=last).step_by(align) {
-                scanned += 1;
+                *scanned += 1;
+                since_tick += 1;
+                if since_tick >= PROGRESS_INTERVAL {
+                    since_tick = 0;
+                    let go = observer.tick(ScanProgress {
+                        done: *scanned,
+                        total,
+                        matches: out.len(),
+                    });
+                    if !go {
+                        return Ok(WalkOutcome::Cancelled);
+                    }
+                }
                 let matched = match needle {
                     Some(n) => n.compare_first(&buf[..read], off, compare),
                     None => matches!(compare, ScanCompareType::Unknown),
@@ -526,7 +631,7 @@ impl<T: ScanTarget> Scanner<T> {
                     let value = &buf[off..off + stride];
                     out.push(addr + off, value, value);
                     if out.len() >= self.result_limit {
-                        return Ok(scanned);
+                        return Ok(WalkOutcome::Completed);
                     }
                 }
             }
@@ -539,7 +644,7 @@ impl<T: ScanTarget> Scanner<T> {
             let step = (read - (stride - 1)).max(1);
             addr = (addr + step).next_multiple_of(align).max(addr + align);
         }
-        Ok(scanned)
+        Ok(WalkOutcome::Completed)
     }
 
     /// The scan stride: the needle's width when present, else the type's fixed

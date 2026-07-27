@@ -1072,3 +1072,102 @@ fn results_stride_round_trips_for_a_bytes_scan() {
     assert_eq!(row.address, BASE + 5);
     assert_eq!(row.current, [0x11, 0x22, 0x33, 0x44, 0x55]);
 }
+
+// ── progress reporting and cancellation ────────────────────────────────────
+
+#[test]
+fn first_scan_reports_monotonic_progress() {
+    // Big enough to cross the progress interval several times.
+    let mut scanner = Scanner::new(
+        MockTarget::new(BASE, vec![0u8; 200_000]),
+        ScanValueType::I32,
+    );
+
+    let mut ticks: Vec<crate::ScanProgress> = Vec::new();
+    scanner
+        .first_scan_with(ScanCompareType::Unknown, None, &mut |p| {
+            ticks.push(p);
+            true
+        })
+        .unwrap();
+
+    assert!(!ticks.is_empty(), "a 200 KiB scan must report progress");
+    assert!(
+        ticks.windows(2).all(|w| w[1].done >= w[0].done),
+        "progress must never go backwards"
+    );
+    assert!(
+        ticks.iter().all(|p| p.done <= p.total),
+        "done must stay within total"
+    );
+    assert!(ticks.iter().all(|p| p.total > 0));
+}
+
+#[test]
+fn a_cancelled_first_scan_leaves_the_results_untouched() {
+    let mut scanner = Scanner::new(
+        MockTarget::new(BASE, vec![0u8; 200_000]),
+        ScanValueType::I32,
+    );
+    // Seed a session worth protecting.
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "0")))
+        .unwrap();
+    let before = scanner.results().len();
+    assert!(before > 0);
+
+    let err = scanner
+        .first_scan_with(ScanCompareType::Unknown, None, &mut |_| false)
+        .unwrap_err();
+
+    assert!(matches!(err, crate::ScanError::Cancelled));
+    assert_eq!(
+        scanner.results().len(),
+        before,
+        "stopping a scan must not push a partial generation"
+    );
+}
+
+#[test]
+fn a_cancelled_next_scan_leaves_the_results_untouched() {
+    let mut scanner = Scanner::new(
+        MockTarget::new(BASE, vec![0u8; 200_000]),
+        ScanValueType::I32,
+    );
+    scanner.first_scan(ScanCompareType::Unknown, None).unwrap();
+    let before = scanner.results().len();
+
+    let err = scanner
+        .next_scan_with(ScanCompareType::Unchanged, None, &mut |_| false)
+        .unwrap_err();
+
+    assert!(matches!(err, crate::ScanError::Cancelled));
+    assert_eq!(scanner.results().len(), before);
+    assert!(!scanner.can_undo(), "no generation should have been pushed");
+}
+
+#[test]
+fn next_scan_progress_totals_the_previous_generation() {
+    let mut scanner = Scanner::new(
+        MockTarget::new(BASE, vec![0u8; 200_000]),
+        ScanValueType::I32,
+    );
+    let candidates = scanner
+        .first_scan(ScanCompareType::Unknown, None)
+        .unwrap()
+        .len();
+
+    let mut totals = Vec::new();
+    scanner
+        .next_scan_with(ScanCompareType::Unchanged, None, &mut |p: crate::ScanProgress| {
+            totals.push(p.total);
+            true
+        })
+        .unwrap();
+
+    assert!(!totals.is_empty());
+    assert!(
+        totals.iter().all(|&t| t == candidates),
+        "a next scan's total is exactly the previous generation's size"
+    );
+}

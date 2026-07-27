@@ -44,7 +44,7 @@ use nemclass_scan::ProcessTarget;
 
 use nemclass_core::{ModuleInfoWithName, Process};
 
-use super::tasks::{BackgroundJob, Poll as JobPoll};
+use super::tasks::{BackgroundJob, JobHandle, Poll as JobPoll};
 
 /// Result of a background scan. The outer `Err` is a fatal failure with no usable
 /// scanner (e.g. the target couldn't be attached); `Ok` carries the (moved-back)
@@ -336,7 +336,19 @@ impl ScannerPanel {
                                 None
                             };
                         }
-                        Err(msg) => self.status_msg = Some(msg),
+                        Err(msg) => {
+                            self.status_msg = Some(msg);
+                            // A first scan builds a fresh `Scanner`, so one that
+                            // failed or was stopped leaves a session that has
+                            // never scanned — Next Scan would be enabled but
+                            // could only error. Drop it back to "no session".
+                            if self.scanner.as_ref().is_some_and(|s| !s.has_scanned()) {
+                                self.scanner = None;
+                                self.result_snapshot.clear();
+                                self.compare = snap_compare(self.compare, false);
+                                self.invalidate_live_cache();
+                            }
+                        }
                     }
                 }
             }
@@ -527,6 +539,30 @@ impl ScannerPanel {
                 { ui.button("Next Scan"); }
             });
 
+            // A whole-address-space scan takes seconds; without a bar it is
+            // indistinguishable from a hang, and without a Stop the only way out
+            // used to be waiting it out.
+            #[cfg(target_os = "linux")]
+            if scanning {
+                match self.scan_job.handle().and_then(|h| h.fraction()) {
+                    Some(f) => {
+                        ui.add(
+                            egui::ProgressBar::new(f)
+                                .desired_width(140.0)
+                                .show_percentage(),
+                        );
+                    }
+                    // No total yet (still enumerating regions), or a next scan
+                    // over an empty set.
+                    None => {
+                        ui.spinner();
+                    }
+                }
+                if ui.button("Stop").clicked() {
+                    self.scan_job.cancel();
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
             if scanning {
                 ui.spinner();
             }
@@ -870,7 +906,7 @@ impl ScannerPanel {
         let alignment = if self.fast_scan { 0 } else { 1 };
         self.last_job_was_first_scan = true;
         self.status_msg = Some("Scanning…".into());
-        self.scan_job.spawn(rt, ctx, move || {
+        self.scan_job.spawn_cancellable(rt, ctx, move |job| {
             // Shares the app's handle rather than opening a second one, so the
             // scan reads through whichever backend the user attached with — the
             // same one the live value column reads through.
@@ -880,7 +916,7 @@ impl ScannerPanel {
                 .with_region_filter(region_filter)
                 .with_alignment(alignment);
             let scan_result = scanner
-                .first_scan(compare, needle)
+                .first_scan_with(compare, needle, &mut observer_for(job))
                 .map(snapshot_results)
                 .map_err(|e| format!("First scan: {e}"));
             Ok((scanner, scan_result))
@@ -906,9 +942,9 @@ impl ScannerPanel {
         let compare = self.compare;
         self.last_job_was_first_scan = false;
         self.status_msg = Some("Scanning…".into());
-        self.scan_job.spawn(rt, ctx, move || {
+        self.scan_job.spawn_cancellable(rt, ctx, move |job| {
             let scan_result = scanner
-                .next_scan(compare, needle)
+                .next_scan_with(compare, needle, &mut observer_for(job))
                 .map(snapshot_results)
                 .map_err(|e| format!("Next scan: {e}"));
             Ok((scanner, scan_result))
@@ -1231,6 +1267,16 @@ fn parse_opt_hex(text: &str) -> Result<Option<usize>, ()> {
         return Ok(None);
     }
     super::parse_hex_addr(text).map(Some).ok_or(())
+}
+
+/// Bridges the scan engine's observer to the job handle: publishes progress and
+/// aborts as soon as the UI's Stop button sets the cancel flag.
+#[cfg(target_os = "linux")]
+fn observer_for(job: &JobHandle) -> impl nemclass_scan::ScanObserver + '_ {
+    move |p: nemclass_scan::ScanProgress| {
+        job.set_progress(p.done as u64, p.total as u64);
+        !job.is_cancelled()
+    }
 }
 
 /// Collapse a scan's [`ScanResults`] into the display snapshot the panel renders.
