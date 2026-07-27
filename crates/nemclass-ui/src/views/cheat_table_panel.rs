@@ -6,6 +6,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use nemclass_core::{Pid, Process};
+use crate::process_reader::ProcessReader;
 use nemclass_model::{CheatEntry, CheatTable};
 use nemclass_scan::{FreezeSet, ScanValueType};
 
@@ -76,9 +77,10 @@ impl CheatTablePanel {
         // Rebuild the live-values list so we have fresh values to freeze with.
         let n = self.table.entries.len();
         self.live_values.resize(n, String::new());
+        let resolver = formula_resolver(process);
         for (i, entry) in self.table.entries.iter().enumerate() {
             let vt = ScanValueType::from_tag(&entry.value_type);
-            self.live_values[i] = read_entry_value(process, entry, vt);
+            self.live_values[i] = read_entry_value(process, resolver.as_ref(), entry, vt);
         }
 
         // Freeze targets are derived from the model each tick (see `tick_freeze`);
@@ -103,7 +105,7 @@ impl CheatTablePanel {
     /// reflected and no stale byte-cache can revert a change or leak a write to
     /// an old address.
     #[cfg(target_os = "linux")]
-    pub fn tick_freeze(&mut self, _process: Option<&Process>, pid: Option<Pid>) {
+    pub fn tick_freeze(&mut self, process: Option<&Process>, pid: Option<Pid>) {
         let should_apply = self
             .last_freeze
             .map(|t| t.elapsed() >= FREEZE_INTERVAL)
@@ -114,12 +116,15 @@ impl CheatTablePanel {
         self.last_freeze = Some(Instant::now());
 
         let mut freeze_set = FreezeSet::new();
+        let resolver = formula_resolver(process);
         for entry in &self.table.entries {
             if !entry.frozen {
                 continue;
             }
-            if let (Some(addr), Some(vt)) =
-                (resolve_entry_addr(entry), ScanValueType::from_tag(&entry.value_type))
+            if let (Some(addr), Some(vt)) = (
+                resolve_entry_addr(entry, resolver.as_ref()),
+                ScanValueType::from_tag(&entry.value_type),
+            )
                 && let Some(bytes) = value_text_to_bytes(vt, &entry.frozen_value)
             {
                 freeze_set.set(addr, bytes);
@@ -198,9 +203,10 @@ impl CheatTablePanel {
         // ── refresh live values ──────────────────────────────────────────────
         let n = self.table.entries.len();
         self.live_values.resize(n, String::new());
+        let resolver = formula_resolver(process);
         for (i, entry) in self.table.entries.iter().enumerate() {
             let vt = ScanValueType::from_tag(&entry.value_type);
-            self.live_values[i] = read_entry_value(process, entry, vt);
+            self.live_values[i] = read_entry_value(process, resolver.as_ref(), entry, vt);
         }
 
         // Collect deferred mutations (can't mutate inside the TableBuilder closure).
@@ -341,7 +347,7 @@ impl CheatTablePanel {
             }
         if let Some((idx, val_text)) = write_value
             && let Some(entry) = self.table.entries.get_mut(idx) {
-                let addr = resolve_entry_addr(entry);
+                let addr = resolve_entry_addr(entry, formula_resolver(process).as_ref());
                 let vt = ScanValueType::from_tag(&entry.value_type);
                 if let (Some(addr), Some(vt), Some(proc)) = (addr, vt, process)
                     && write_value_typed(proc, addr, vt, &val_text).is_ok()
@@ -386,17 +392,39 @@ fn parse_addr_text(s: &str) -> Option<usize> {
     usize::from_str_radix(hex, 16).ok()
 }
 
-fn resolve_entry_addr(entry: &CheatEntry) -> Option<usize> {
-    parse_addr_text(&entry.address)
+/// Resolves an entry's address, which may be a plain hex literal *or* an
+/// address formula like `[<game.exe> + 0x1000] + 0x40`.
+///
+/// The formula path is what makes a saved entry survive ASLR — the whole point
+/// of storing `address` as a string — but it needs a live process to walk the
+/// pointer chain and a module list to resolve `<name>`. Hex is tried first so an
+/// entry with a literal address still resolves with no process attached.
+fn resolve_entry_addr(entry: &CheatEntry, resolver: Option<&ProcessReader<'_>>) -> Option<usize> {
+    if let Some(addr) = parse_addr_text(&entry.address) {
+        return Some(addr);
+    }
+    let r = resolver?;
+    nemclass_model::resolve_formula(&entry.address, r, r).ok()
+}
+
+/// Builds the formula resolver for a frame, or `None` when nothing is attached.
+///
+/// The module list comes from `/proc/<pid>/maps`, so this is built once per
+/// draw/tick rather than per entry.
+fn formula_resolver(process: Option<&Process>) -> Option<ProcessReader<'_>> {
+    let p = process?;
+    let modules = p.modules().map(|it| it.collect()).unwrap_or_default();
+    Some(ProcessReader::new(p, modules))
 }
 
 fn read_entry_bytes(
     process: Option<&Process>,
+    resolver: Option<&ProcessReader<'_>>,
     entry: &CheatEntry,
     vt: Option<ScanValueType>,
 ) -> Option<Vec<u8>> {
     let proc = process?;
-    let addr = resolve_entry_addr(entry)?;
+    let addr = resolve_entry_addr(entry, resolver)?;
     let width = vt?.fixed_width()?;
     let mut buf = vec![0u8; width];
     let n = proc.read_buf(addr, &mut buf).ok()?;
@@ -405,10 +433,11 @@ fn read_entry_bytes(
 
 fn read_entry_value(
     process: Option<&Process>,
+    resolver: Option<&ProcessReader<'_>>,
     entry: &CheatEntry,
     vt: Option<ScanValueType>,
 ) -> String {
-    if let Some(bytes) = read_entry_bytes(process, entry, vt) {
+    if let Some(bytes) = read_entry_bytes(process, resolver, entry, vt) {
         format_value_bytes(&bytes, vt.unwrap())
     } else if !entry.frozen_value.is_empty() {
         entry.frozen_value.clone()
@@ -630,5 +659,53 @@ mod tests {
             assert!(e.frozen);
             assert!(!e.frozen_value.is_empty(), "frozen_value must be captured");
         }
+    }
+}
+
+/// Address resolution for saved entries, which may be hex or a formula.
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+    use nemclass_core::MockMemoryBackend;
+
+    const BASE: usize = 0x1_0000;
+
+    fn entry(address: &str) -> CheatEntry {
+        CheatEntry::new("e", address, "i32")
+    }
+
+    #[test]
+    fn a_hex_literal_resolves_without_a_process() {
+        assert_eq!(resolve_entry_addr(&entry("0x1234"), None), Some(0x1234));
+        assert_eq!(resolve_entry_addr(&entry("1234"), None), Some(0x1234));
+    }
+
+    #[test]
+    fn a_formula_needs_a_process_but_is_no_longer_dead() {
+        // This used to return `None` unconditionally: `resolve_entry_addr` only
+        // ever parsed hex, so every formula entry silently never resolved,
+        // never read a value and never froze.
+        let e = entry("[<game.exe> + 0x10] + 0x4");
+        assert_eq!(resolve_entry_addr(&e, None), None, "no process to walk with");
+
+        // 8 bytes at BASE+0x10 point at BASE+0x40; +4 lands on BASE+0x44.
+        let mut bytes = vec![0u8; 256];
+        bytes[0x10..0x18].copy_from_slice(&(BASE as u64 + 0x40).to_le_bytes());
+        let process =
+            Process::from_backend_for_test(1, Box::new(MockMemoryBackend::new(BASE, bytes)));
+        let modules = vec![nemclass_core::ModuleInfoWithName {
+            base: BASE,
+            size: 256,
+            name: "game.exe".to_string(),
+        }];
+        let reader = ProcessReader::new(&process, modules);
+
+        assert_eq!(resolve_entry_addr(&e, Some(&reader)), Some(BASE + 0x44));
+    }
+
+    #[test]
+    fn nonsense_addresses_stay_unresolved() {
+        assert_eq!(resolve_entry_addr(&entry("not an address"), None), None);
+        assert_eq!(resolve_entry_addr(&entry(""), None), None);
     }
 }

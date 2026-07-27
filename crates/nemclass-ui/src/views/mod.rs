@@ -1613,9 +1613,10 @@ impl eframe::App for NemclassApp {
             }
         }
 
-        // Drive scanner freeze write-back and debugger event polling.
+        // Drain background scans and drive debugger event polling. Freeze
+        // write-back lives entirely in the cheat-table panel below — the scanner
+        // routes its Freeze button there rather than keeping a second set.
         self.scanner_panel.poll();
-        self.scanner_panel.tick_freeze();
         #[cfg(target_os = "linux")]
         self.pointer_scan_panel.poll();
         #[cfg(target_os = "linux")]
@@ -2369,6 +2370,7 @@ impl NemclassApp {
         let mut add_to_class_addr: Option<usize> = None;
         let mut add_to_table: Option<(usize, String)> = None;
         let mut ptr_scan_addr: Option<usize> = None;
+        let mut freeze_addr: Option<(usize, String, String)> = None;
 
         self.scanner_panel.set_live_interval(self.snapshot_interval);
         self.scanner_panel.show(
@@ -2379,6 +2381,7 @@ impl NemclassApp {
             |addr| { add_to_class_addr = Some(addr); },
             |addr, tag| { add_to_table = Some((addr, tag.to_owned())); },
             |addr| { ptr_scan_addr = Some(addr); },
+            |addr, tag, value| { freeze_addr = Some((addr, tag.to_owned(), value)); },
         );
 
         // Apply deferred callbacks (all need self borrows unavailable inside the closure).
@@ -2407,6 +2410,28 @@ impl NemclassApp {
                 frozen_value: String::new(),
                 group: String::new(),
             });
+        }
+        if let Some((addr, tag, value)) = freeze_addr {
+            // Freezing from a scan result *is* adding a frozen row to the
+            // address list — that panel owns freezing, so there is one write-back
+            // loop rather than two that can disagree. Toggles an existing row
+            // rather than stacking duplicates.
+            let key = format!("0x{addr:X}");
+            let table = self.cheat_table_panel.table_mut();
+            match table.entries.iter_mut().find(|e| e.address == key) {
+                Some(existing) => {
+                    existing.frozen = !existing.frozen;
+                    existing.frozen_value = if existing.frozen { value } else { String::new() };
+                }
+                None => table.push(nemclass_model::CheatEntry {
+                    description: key.clone(),
+                    address: key,
+                    value_type: tag,
+                    frozen: true,
+                    frozen_value: value,
+                    group: String::new(),
+                }),
+            }
         }
         if let Some(addr) = ptr_scan_addr {
             self.pointer_scan_panel.set_goal(addr);

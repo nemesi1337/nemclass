@@ -9,8 +9,6 @@
 //! │  ┌─ Address ────────┬─ Value ──┬─ Previous ┬─ Actions ──────────┐   │
 //! │  │  0x00007fff…     │  1337    │  1200     │ [Freeze] [Add…]    │   │
 //! │  └──────────────────┴──────────┴───────────┴────────────────────┘   │
-//! │  ── Freeze list ──────────────────────────────────────────────────  │
-//! │  0x00007fff… = 1337   [Unfreeze]                                    │
 //! └──────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -27,7 +25,9 @@
 //! indistinguishable from a value that simply is not moving. **Previous** is the
 //! value as of the scan generation before the current one.
 //!
-//! `FreezeSet::apply` is called each frame on a throttled timer.
+//! Freezing is delegated to the address-list (cheat-table) panel rather than
+//! kept here: that panel re-derives its write-back from the model every tick, so
+//! there is one freeze loop instead of two that can disagree.
 
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use nemclass_scan::{
-    FilterState, FreezeSet, Needle, Region, RegionFilter, ScanCompareType, ScanValueType, Scanner,
+    FilterState, Needle, Region, RegionFilter, ScanCompareType, ScanValueType, Scanner,
     SectionFilter,
 };
 
@@ -56,9 +56,6 @@ type ScanOutcome = Result<(Scanner<ProcessTarget>, Result<Vec<ResultRow>, String
 /// How many results to display at most (the full set can be millions of
 /// addresses; capping keeps the table from stalling the frame).
 const MAX_DISPLAY: usize = 1_000;
-
-/// Interval between `FreezeSet::apply` calls (write-back for frozen values).
-const FREEZE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Fallback live-refresh cadence, used until the app supplies
 /// `settings.live_interval_ms`.
@@ -93,13 +90,6 @@ pub(crate) struct ResultRow {
     address: usize,
     current: Vec<u8>,
     previous: Vec<u8>,
-}
-
-/// A single entry in the freeze list sub-panel.
-struct FreezeEntry {
-    address: usize,
-    /// The captured value bytes, also the display string.
-    display: String,
 }
 
 /// All mutable state owned by the scanner panel.
@@ -173,11 +163,6 @@ pub struct ScannerPanel {
     /// Live-refresh cadence, mirroring the class view's snapshot interval.
     live_interval: Duration,
 
-    // ── freeze list ────────────────────────────────────────────────────
-    freeze_set:     FreezeSet,
-    freeze_entries: Vec<FreezeEntry>,
-    last_freeze:    Option<Instant>,
-
     // ── error / status ─────────────────────────────────────────────────
     pub status_msg: Option<String>,
 }
@@ -215,9 +200,6 @@ impl ScannerPanel {
             last_live_refresh: None,
             visible_rows: 0..0,
             live_interval: DEFAULT_LIVE_INTERVAL,
-            freeze_set:   FreezeSet::new(),
-            freeze_entries: Vec::new(),
-            last_freeze:  None,
             status_msg:   None,
         }
     }
@@ -237,33 +219,6 @@ impl ScannerPanel {
     }
 
     // ── called each frame from the parent's `logic()` ──────────────────
-
-    /// Drive the freeze write-back on a throttled interval. Call from the
-    /// parent's `logic()` hook (runs even when the tab is not visible).
-    #[cfg(target_os = "linux")]
-    pub fn tick_freeze(&mut self) {
-        if self.freeze_set.is_empty() {
-            return;
-        }
-        let should_apply = self
-            .last_freeze
-            .map(|t| t.elapsed() >= FREEZE_INTERVAL)
-            .unwrap_or(true);
-        if !should_apply {
-            return;
-        }
-        // Built from the shared handle rather than borrowed from the `Scanner`:
-        // the scanner is moved into the worker for the duration of a scan, and
-        // frozen values must keep being written back while one runs.
-        if let Some(process) = &self.process {
-            let target = ProcessTarget::from_shared(process.clone());
-            let _ = self.freeze_set.apply(&target);
-        }
-        self.last_freeze = Some(Instant::now());
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn tick_freeze(&mut self) {}
 
     /// Drain a completed background scan, moving the `Scanner` and its results
     /// back onto the panel. Call each frame from the parent's `logic()` (runs even
@@ -373,8 +328,6 @@ impl ScannerPanel {
         self.selected_modules.clear();
         self.result_snapshot.clear();
         self.invalidate_live_cache();
-        self.freeze_set = FreezeSet::new();
-        self.freeze_entries.clear();
         self.status_msg = None;
     }
 
@@ -397,6 +350,7 @@ impl ScannerPanel {
         mut add_to_class_cb: impl FnMut(usize),
         mut add_to_table_cb: impl FnMut(usize, &str),
         mut ptr_scan_cb: impl FnMut(usize),
+        mut freeze_cb: impl FnMut(usize, &str, String),
     ) {
         self.process = process.cloned();
         let attached = process.is_some();
@@ -414,12 +368,15 @@ impl ScannerPanel {
 
         // Results table (always drawn, but empty when idle). Values update live
         // from the attached process each frame, like Cheat Engine.
-        self.show_results(ui, &mut add_to_class_cb, &mut add_to_table_cb, &mut ptr_scan_cb);
+        self.show_results(
+            ui,
+            &mut add_to_class_cb,
+            &mut add_to_table_cb,
+            &mut ptr_scan_cb,
+            &mut freeze_cb,
+        );
 
         ui.separator();
-
-        // Freeze list sub-panel.
-        self.show_freeze_list(ui);
 
         // Status / error line.
         if let Some(msg) = &self.status_msg {
@@ -1031,6 +988,7 @@ impl ScannerPanel {
         add_to_class_cb: &mut dyn FnMut(usize),
         add_to_table_cb: &mut dyn FnMut(usize, &str),
         ptr_scan_cb: &mut dyn FnMut(usize),
+        freeze_cb: &mut dyn FnMut(usize, &str, String),
     ) {
         let row_count = self.result_snapshot.len().min(MAX_DISPLAY);
         if row_count == 0 {
@@ -1049,8 +1007,6 @@ impl ScannerPanel {
         // here rather than cloning a thousand rows every frame to dodge it.
         let snapshot = &self.result_snapshot;
         let live_cache = &self.live_cache;
-        let freeze_set  = &mut self.freeze_set;
-        let freeze_entries = &mut self.freeze_entries;
         let mut drawn: Option<(usize, usize)> = None;
 
         TableBuilder::new(ui)
@@ -1090,7 +1046,30 @@ impl ScannerPanel {
                     };
 
                     row.col(|ui| {
-                        ui.monospace(format!("0x{addr:016X}"));
+                        // Double-click sends the hit to the address list, as in
+                        // Cheat Engine. The buttons stay for discoverability.
+                        let r = ui.add(
+                            egui::Label::new(egui::RichText::new(format!("0x{addr:016X}")).monospace())
+                                .sense(egui::Sense::click()),
+                        );
+                        if r.double_clicked() {
+                            add_to_table_cb(addr, value_type.as_tag());
+                        }
+                        r.on_hover_text("Double-click to add to the address list")
+                            .context_menu(|ui| {
+                                if ui.button("Add to address list").clicked() {
+                                    add_to_table_cb(addr, value_type.as_tag());
+                                    ui.close();
+                                }
+                                if ui.button("Add to class").clicked() {
+                                    add_to_class_cb(addr);
+                                    ui.close();
+                                }
+                                if ui.button("Pointer-scan this address").clicked() {
+                                    ptr_scan_cb(addr);
+                                    ui.close();
+                                }
+                            });
                     });
                     row.col(|ui| {
                         match live {
@@ -1128,21 +1107,23 @@ impl ScannerPanel {
                     });
                     row.col(|ui| {
                         ui.horizontal(|ui| {
+                            // Freezing means "add to the address list, frozen":
+                            // the address list owns freezing, and it re-derives
+                            // its write-back from the model every tick, so an
+                            // edit there can never be reverted by a stale cache
+                            // the scanner kept on the side.
                             if ui.small_button("Freeze").clicked() {
-                                // Freeze what is actually there now, falling back
-                                // to the scan-time bytes only when there is no
-                                // live read to use.
+                                // Pin what is actually there now, falling back to
+                                // the scan-time bytes when there is no live read.
                                 let bytes = match live {
-                                    LiveValue::Read(b) => b.to_vec(),
-                                    _ => entry.current.clone(),
+                                    LiveValue::Read(b) => b,
+                                    _ => entry.current.as_slice(),
                                 };
-                                let display = format_value_bytes(&bytes, value_type);
-                                freeze_set.set(addr, bytes);
-                                freeze_entries.retain(|e| e.address != addr);
-                                freeze_entries.push(FreezeEntry {
-                                    address: addr,
-                                    display,
-                                });
+                                freeze_cb(
+                                    addr,
+                                    value_type.as_tag(),
+                                    format_value_bytes(bytes, value_type),
+                                );
                             }
                             if ui.small_button("Add to class").clicked() {
                                 add_to_class_cb(addr);
@@ -1196,34 +1177,6 @@ impl ScannerPanel {
                 read_live_bytes(Some(&process), entry.address, self.value_type),
             );
         }
-    }
-
-    // ── freeze list sub-panel ──────────────────────────────────────────
-
-    fn show_freeze_list(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("Freeze list", |ui| {
-            if self.freeze_entries.is_empty() {
-                ui.label("No frozen values.");
-                return;
-            }
-
-            let mut to_remove: Option<usize> = None;
-            for (i, entry) in self.freeze_entries.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.monospace(format!("0x{:016X}", entry.address));
-                    ui.label("=");
-                    ui.label(&entry.display);
-                    if ui.small_button("Unfreeze").clicked() {
-                        to_remove = Some(i);
-                    }
-                });
-            }
-            if let Some(idx) = to_remove {
-                let addr = self.freeze_entries[idx].address;
-                self.freeze_set.remove(addr);
-                self.freeze_entries.remove(idx);
-            }
-        });
     }
 }
 
