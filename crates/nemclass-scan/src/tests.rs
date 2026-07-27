@@ -41,7 +41,7 @@ fn first_scan_exact_i32_finds_address() {
     let addrs: Vec<usize> = results.iter().map(|r| r.address).collect();
     assert_eq!(addrs, vec![BASE + 8, BASE + 20]);
     // The captured previous bytes are the value we searched for.
-    assert_eq!(results.iter().next().unwrap().previous_value_bytes, 1337i32.to_le_bytes());
+    assert_eq!(results.iter().next().unwrap().current, 1337i32.to_le_bytes());
 }
 
 #[test]
@@ -989,4 +989,86 @@ fn an_uncapped_scan_is_not_reported_as_truncated() {
     let mut scanner = Scanner::new(MockTarget::new(BASE, vec![0u8; 64]), ScanValueType::I32);
     scanner.first_scan(ScanCompareType::Unknown, None).unwrap();
     assert!(!scanner.results_truncated());
+}
+
+// ── the Current / Previous pair ────────────────────────────────────────────
+
+#[test]
+fn first_scan_previous_equals_current() {
+    let mut scanner = Scanner::new(
+        MockTarget::new(BASE, buf_with_i32(4, 42)),
+        ScanValueType::I32,
+    );
+    let r = scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "42")))
+        .unwrap();
+    let row = r.get(0).unwrap();
+    assert_eq!(row.current, 42i32.to_le_bytes());
+    assert_eq!(
+        row.previous, 42i32.to_le_bytes(),
+        "nothing preceded a first scan, so Previous shows the same value"
+    );
+}
+
+#[test]
+fn next_scan_previous_is_the_prior_generations_current() {
+    // 500 -> 400 -> 300: after the second next scan, Previous must be 400, not
+    // 500 and not 300.
+    let target = CellTarget::new(BASE, buf_with_i32(4, 500));
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "500")))
+        .unwrap();
+
+    scanner.target().poke(BASE + 4, &400i32.to_le_bytes());
+    scanner.next_scan(ScanCompareType::Decreased, None).unwrap();
+    let row = scanner.results().get(0).unwrap();
+    assert_eq!(row.current, 400i32.to_le_bytes());
+    assert_eq!(row.previous, 500i32.to_le_bytes());
+
+    scanner.target().poke(BASE + 4, &300i32.to_le_bytes());
+    scanner.next_scan(ScanCompareType::Decreased, None).unwrap();
+    let row = scanner.results().get(0).unwrap();
+    assert_eq!(row.current, 300i32.to_le_bytes());
+    assert_eq!(
+        row.previous, 400i32.to_le_bytes(),
+        "Previous is the generation before this one, not the original"
+    );
+}
+
+#[test]
+fn undo_restores_both_columns() {
+    let target = CellTarget::new(BASE, buf_with_i32(4, 500));
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "500")))
+        .unwrap();
+
+    scanner.target().poke(BASE + 4, &400i32.to_le_bytes());
+    scanner.next_scan(ScanCompareType::Decreased, None).unwrap();
+    assert!(scanner.undo());
+
+    let row = scanner.results().get(0).unwrap();
+    assert_eq!(row.current, 500i32.to_le_bytes());
+    assert_eq!(row.previous, 500i32.to_le_bytes());
+}
+
+#[test]
+fn results_stride_round_trips_for_a_bytes_scan() {
+    // A variable-width type carries the needle's length as the generation
+    // stride, so the column store still slices correctly.
+    let mut buf = vec![0u8; 32];
+    buf[5..10].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]);
+    let mut scanner = Scanner::new(MockTarget::new(BASE, buf), ScanValueType::Bytes);
+
+    let r = scanner
+        .first_scan(
+            ScanCompareType::Exact,
+            Some(needle(ScanValueType::Bytes, "11 22 33 44 55")),
+        )
+        .unwrap();
+    assert_eq!(r.stride(), 5);
+    let row = r.get(0).unwrap();
+    assert_eq!(row.address, BASE + 5);
+    assert_eq!(row.current, [0x11, 0x22, 0x33, 0x44, 0x55]);
 }

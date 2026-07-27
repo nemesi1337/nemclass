@@ -3,19 +3,30 @@
 //! ## Layout
 //! ```text
 //! ┌─ Scanner ────────────────────────────────────────────────────────────┐
-//! │  Type: [I32 ▼]   Compare: [Exact ▼]   Value: [_________]           │
+//! │  Type: [I32 ▼]  Compare: [Exact ▼]  Value: [____]  [x] Fast scan    │
 //! │  [First Scan]  [Next Scan]  [Undo]  [New Scan]                      │
 //! │  Results: 42 / 100 shown  (capped at MAX_DISPLAY)                   │
-//! │  ┌─ Address ──────────────┬─ Value ────┬─ Actions ──────────────┐   │
-//! │  │  0x00007fff…           │  1337      │ [Freeze] [Add to class]│   │
-//! │  └────────────────────────┴────────────┴────────────────────────┘   │
+//! │  ┌─ Address ────────┬─ Value ──┬─ Previous ┬─ Actions ──────────┐   │
+//! │  │  0x00007fff…     │  1337    │  1200     │ [Freeze] [Add…]    │   │
+//! │  └──────────────────┴──────────┴───────────┴────────────────────┘   │
 //! │  ── Freeze list ──────────────────────────────────────────────────  │
 //! │  0x00007fff… = 1337   [Unfreeze]                                    │
 //! └──────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! The scanner is disabled (greyed out) when no process is attached.
-//! A `ProcessTarget` is built from the attached `Process` when First Scan fires.
+//!
+//! The panel holds the app's `Arc<Process>` rather than opening its own, so the
+//! scan engine, the live Value column and the freeze write-back all go through
+//! the backend the user actually attached with.
+//!
+//! **Value** is re-read from the target on a throttle
+//! ([`ScannerPanel::set_live_interval`]) for the rows the table actually drew,
+//! and is tinted when it differs from what the scan matched. An address that
+//! cannot be read shows `??` — never the stale scan-time bytes, which would be
+//! indistinguishable from a value that simply is not moving. **Previous** is the
+//! value as of the scan generation before the current one.
+//!
 //! `FreezeSet::apply` is called each frame on a throttled timer.
 
 use std::time::{Duration, Instant};
@@ -31,7 +42,7 @@ use nemclass_scan::{
 #[cfg(target_os = "linux")]
 use nemclass_scan::ProcessTarget;
 
-use nemclass_core::{ModuleInfoWithName, Pid, Process};
+use nemclass_core::{ModuleInfoWithName, Process};
 
 use super::tasks::{BackgroundJob, Poll as JobPoll};
 
@@ -40,8 +51,7 @@ use super::tasks::{BackgroundJob, Poll as JobPoll};
 /// `Scanner` plus the inner scan result — so even a failed scan returns the
 /// session handle, and a Next Scan never loses the user's result set.
 #[cfg(target_os = "linux")]
-type ScanOutcome =
-    Result<(Scanner<ProcessTarget>, Result<Vec<(usize, Vec<u8>)>, String>), String>;
+type ScanOutcome = Result<(Scanner<ProcessTarget>, Result<Vec<ResultRow>, String>), String>;
 
 /// How many results to display at most (the full set can be millions of
 /// addresses; capping keeps the table from stalling the frame).
@@ -49,6 +59,41 @@ const MAX_DISPLAY: usize = 1_000;
 
 /// Interval between `FreezeSet::apply` calls (write-back for frozen values).
 const FREEZE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Fallback live-refresh cadence, used until the app supplies
+/// `settings.live_interval_ms`.
+const DEFAULT_LIVE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How many rows to read on the first refresh after a scan, before the table has
+/// reported which rows the viewport actually drew. A generous screenful.
+const LIVE_SEED_ROWS: usize = 64;
+
+/// Live value differing from the scan-time value (Cheat Engine's red).
+const CHANGED_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 110, 90);
+
+/// An address that could not be read back.
+const UNREADABLE_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 80, 80);
+
+/// What the live column knows about one address this frame.
+enum LiveValue<'a> {
+    /// Read succeeded this refresh.
+    Read(&'a [u8]),
+    /// Read was attempted and failed — the address is gone.
+    Failed,
+    /// Not read yet (off-screen last frame, or no process attached).
+    Pending,
+}
+
+/// One row of the results table, as captured when the scan completed.
+///
+/// `current` is the value the scan matched on; `previous` is what the same
+/// address held in the generation before, which is Cheat Engine's "Previous"
+/// column. On a first scan the two are equal.
+pub(crate) struct ResultRow {
+    address: usize,
+    current: Vec<u8>,
+    previous: Vec<u8>,
+}
 
 /// A single entry in the freeze list sub-panel.
 struct FreezeEntry {
@@ -106,7 +151,27 @@ pub struct ScannerPanel {
     last_job_was_first_scan: bool,
     /// Mirror the result set as a snapshot for the display, so the borrow
     /// checker can let us iterate while also drawing "add to class" buttons.
-    result_snapshot: Vec<(usize, Vec<u8>)>,
+    result_snapshot: Vec<ResultRow>,
+
+    /// The attached process, refreshed each frame by [`Self::show`].
+    ///
+    /// Held rather than only passed in so the per-frame `logic()` hooks
+    /// (freeze write-back) keep working when the Scanner tab is not the one
+    /// being drawn, and while a scan job has moved the `Scanner` off-panel.
+    process: Option<std::sync::Arc<Process>>,
+
+    // ── live value column ──────────────────────────────────────────────
+    /// Last read of each on-screen address. `None` means the read was *tried*
+    /// and failed, which the table renders as `??` — distinct from an address
+    /// simply not refreshed yet.
+    live_cache: std::collections::HashMap<usize, Option<Vec<u8>>>,
+    /// When [`Self::refresh_live_values`] last ran.
+    last_live_refresh: Option<Instant>,
+    /// Row range the table drew last frame, so the refresh only reads what is
+    /// actually on screen.
+    visible_rows: std::ops::Range<usize>,
+    /// Live-refresh cadence, mirroring the class view's snapshot interval.
+    live_interval: Duration,
 
     // ── freeze list ────────────────────────────────────────────────────
     freeze_set:     FreezeSet,
@@ -145,11 +210,30 @@ impl ScannerPanel {
             #[cfg(target_os = "linux")]
             last_job_was_first_scan: false,
             result_snapshot: Vec::new(),
+            process:      None,
+            live_cache:   std::collections::HashMap::new(),
+            last_live_refresh: None,
+            visible_rows: 0..0,
+            live_interval: DEFAULT_LIVE_INTERVAL,
             freeze_set:   FreezeSet::new(),
             freeze_entries: Vec::new(),
             last_freeze:  None,
             status_msg:   None,
         }
+    }
+
+    /// Sets the live-value refresh cadence, so the scanner follows the same
+    /// `live_interval_ms` setting as the class view.
+    pub fn set_live_interval(&mut self, interval: Duration) {
+        self.live_interval = interval;
+    }
+
+    /// Drops every cached live read, so the next refresh re-reads from scratch.
+    /// Called whenever the addresses on screen stop meaning what they did.
+    fn invalidate_live_cache(&mut self) {
+        self.live_cache.clear();
+        self.last_live_refresh = None;
+        self.visible_rows = 0..0;
     }
 
     // ── called each frame from the parent's `logic()` ──────────────────
@@ -168,8 +252,12 @@ impl ScannerPanel {
         if !should_apply {
             return;
         }
-        if let Some(scanner) = &self.scanner {
-            let _ = self.freeze_set.apply(scanner.target());
+        // Built from the shared handle rather than borrowed from the `Scanner`:
+        // the scanner is moved into the worker for the duration of a scan, and
+        // frozen values must keep being written back while one runs.
+        if let Some(process) = &self.process {
+            let target = ProcessTarget::from_shared(process.clone());
+            let _ = self.freeze_set.apply(&target);
         }
         self.last_freeze = Some(Instant::now());
     }
@@ -196,6 +284,7 @@ impl ScannerPanel {
                     match scan_result {
                         Ok(snapshot) => {
                             self.result_snapshot = snapshot;
+                            self.invalidate_live_cache();
                             // A scope that excluded every region yields an empty
                             // result set indistinguishable from "value not
                             // found". Say so explicitly rather than let the user
@@ -268,8 +357,10 @@ impl ScannerPanel {
         }
         // Module names belong to the process we just left. The address window
         // and filter toggles are user preferences and deliberately persist.
+        self.process = None;
         self.selected_modules.clear();
         self.result_snapshot.clear();
+        self.invalidate_live_cache();
         self.freeze_set = FreezeSet::new();
         self.freeze_entries.clear();
         self.status_msg = None;
@@ -278,20 +369,24 @@ impl ScannerPanel {
     // ── main UI draw ───────────────────────────────────────────────────
 
     /// Draw the full scanner panel. `process` is the currently-attached handle
-    /// (or `None`); `pid` is its OS pid on Linux. `add_to_class_cb` is called
-    /// when "Add to class" is clicked for a result address.
+    /// (or `None`). `add_to_class_cb` is called when "Add to class" is clicked
+    /// for a result address.
+    ///
+    /// The handle is shared rather than borrowed so the scan engine, the live
+    /// value column and the freeze write-back all read through the same backend
+    /// the user attached with.
     #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        process: Option<&Process>,
-        pid: Option<Pid>,
+        process: Option<&std::sync::Arc<Process>>,
         modules: &[ModuleInfoWithName],
         rt: &tokio::runtime::Handle,
         mut add_to_class_cb: impl FnMut(usize),
         mut add_to_table_cb: impl FnMut(usize, &str),
         mut ptr_scan_cb: impl FnMut(usize),
     ) {
+        self.process = process.cloned();
         let attached = process.is_some();
 
         if !attached {
@@ -300,14 +395,14 @@ impl ScannerPanel {
         }
 
         ui.add_enabled_ui(attached, |ui| {
-            self.show_controls(ui, pid, modules, rt);
+            self.show_controls(ui, modules, rt);
         });
 
         ui.separator();
 
         // Results table (always drawn, but empty when idle). Values update live
         // from the attached process each frame, like Cheat Engine.
-        self.show_results(ui, process, &mut add_to_class_cb, &mut add_to_table_cb, &mut ptr_scan_cb);
+        self.show_results(ui, &mut add_to_class_cb, &mut add_to_table_cb, &mut ptr_scan_cb);
 
         ui.separator();
 
@@ -326,7 +421,6 @@ impl ScannerPanel {
     fn show_controls(
         &mut self,
         ui: &mut egui::Ui,
-        pid: Option<Pid>,
         modules: &[ModuleInfoWithName],
         rt: &tokio::runtime::Handle,
     ) {
@@ -416,7 +510,7 @@ impl ScannerPanel {
             // First Scan.
             #[cfg(target_os = "linux")]
             if ui.add_enabled(!scanning, egui::Button::new("First Scan")).clicked() {
-                self.do_first_scan(pid, modules, rt, ui.ctx().clone());
+                self.do_first_scan(modules, rt, ui.ctx().clone());
             }
             #[cfg(not(target_os = "linux"))]
             if ui.button("First Scan").clicked() {
@@ -741,18 +835,16 @@ impl ScannerPanel {
     // ── scan actions ───────────────────────────────────────────────────
 
     /// Launches a first scan on the background pool. Scanning the whole address
-    /// space can take seconds, so it must not run on the UI thread. The
-    /// `ProcessTarget` is (re)attached inside the worker; the `Scanner` and its
-    /// results are moved back in [`Self::poll`].
+    /// space can take seconds, so it must not run on the UI thread. The `Scanner`
+    /// and its results are moved back in [`Self::poll`].
     #[cfg(target_os = "linux")]
     fn do_first_scan(
         &mut self,
-        pid: Option<Pid>,
         modules: &[ModuleInfoWithName],
         rt: &tokio::runtime::Handle,
         ctx: egui::Context,
     ) {
-        let Some(pid) = pid else {
+        let Some(process) = self.process.clone() else {
             self.status_msg = Some("No process attached.".into());
             return;
         };
@@ -765,9 +857,8 @@ impl ScannerPanel {
             // Error already set by parse_needle.
             return;
         }
-        // Resolved here, on the UI thread: the worker re-attaches its own
-        // `ProcessTarget` and can't see the module list. Both filters are owned,
-        // so they move into the closure cleanly.
+        // Resolved here, on the UI thread: the worker can't see the module list.
+        // Both filters are owned, so they move into the closure cleanly.
         let Some((region_filter, section_filter)) = self.build_filters(modules) else {
             // Error already set by build_filters.
             return;
@@ -780,9 +871,11 @@ impl ScannerPanel {
         self.last_job_was_first_scan = true;
         self.status_msg = Some("Scanning…".into());
         self.scan_job.spawn(rt, ctx, move || {
-            let target = ProcessTarget::attach(pid)
-                .map_err(|e| format!("ProcessTarget: {e}"))?
-                .with_section_filter(section_filter);
+            // Shares the app's handle rather than opening a second one, so the
+            // scan reads through whichever backend the user attached with — the
+            // same one the live value column reads through.
+            let target =
+                ProcessTarget::from_shared(process).with_section_filter(section_filter);
             let mut scanner = Scanner::new(target, value_type)
                 .with_region_filter(region_filter)
                 .with_alignment(alignment);
@@ -827,11 +920,8 @@ impl ScannerPanel {
         if let Some(scanner) = &mut self.scanner
             && scanner.undo()
         {
-            self.result_snapshot = scanner
-                .results()
-                .iter()
-                .map(|r| (r.address, r.previous_value_bytes.clone()))
-                .collect();
+            self.result_snapshot = snapshot_results(scanner.results());
+            self.invalidate_live_cache();
             self.status_msg = None;
         }
     }
@@ -842,6 +932,7 @@ impl ScannerPanel {
             self.scanner = None;
         }
         self.result_snapshot.clear();
+        self.invalidate_live_cache();
         // Back to a first-scan session: a change-relative compare has nothing to
         // compare against any more.
         self.compare = snap_compare(self.compare, false);
@@ -901,72 +992,120 @@ impl ScannerPanel {
     fn show_results(
         &mut self,
         ui: &mut egui::Ui,
-        process: Option<&Process>,
         add_to_class_cb: &mut dyn FnMut(usize),
         add_to_table_cb: &mut dyn FnMut(usize, &str),
         ptr_scan_cb: &mut dyn FnMut(usize),
     ) {
-        // (address, captured-bytes) for the displayed (capped) result set.
-        let visible: Vec<(usize, Vec<u8>)> = self
-            .result_snapshot
-            .iter()
-            .take(MAX_DISPLAY)
-            .map(|(addr, bytes)| (*addr, bytes.clone()))
-            .collect();
-
-        if visible.is_empty() {
+        let row_count = self.result_snapshot.len().min(MAX_DISPLAY);
+        if row_count == 0 {
             ui.label("No results.");
             return;
         }
+
+        self.refresh_live_values();
 
         let text_height = ui.text_style_height(&egui::TextStyle::Body);
         let row_height  = text_height + 4.0;
 
         let value_type = self.value_type;
+        // Disjoint field borrows: the table body needs `&self.result_snapshot`
+        // and `&self.live_cache` while mutating the freeze state, so split them
+        // here rather than cloning a thousand rows every frame to dodge it.
+        let snapshot = &self.result_snapshot;
+        let live_cache = &self.live_cache;
         let freeze_set  = &mut self.freeze_set;
         let freeze_entries = &mut self.freeze_entries;
+        let mut drawn: Option<(usize, usize)> = None;
 
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .column(Column::initial(160.0).at_least(100.0))  // Address
             .column(Column::initial(100.0).at_least(60.0))   // Value (live)
+            .column(Column::initial(100.0).at_least(60.0))   // Previous
             .column(Column::remainder().at_least(160.0))     // Actions
             .header(row_height + 2.0, |mut h| {
                 h.col(|ui| { ui.strong("Address"); });
                 h.col(|ui| { ui.strong("Value"); });
+                h.col(|ui| { ui.strong("Previous"); });
                 h.col(|ui| { ui.strong("Actions"); });
             })
             .body(|body| {
-                body.rows(row_height, visible.len(), |mut row| {
+                body.rows(row_height, row_count, |mut row| {
                     let idx = row.index();
-                    let Some((addr, captured)) = visible.get(idx) else { return; };
-                    let addr = *addr;
+                    let Some(entry) = snapshot.get(idx) else { return; };
+                    let addr = entry.address;
+                    // Track what the viewport actually drew, so the next refresh
+                    // reads only these addresses instead of all 1000.
+                    drawn = Some(match drawn {
+                        Some((lo, hi)) => (lo.min(idx), hi.max(idx)),
+                        None => (idx, idx),
+                    });
 
-                    // Live value: re-read the address from the target each frame
-                    // (only visible rows are drawn). Fall back to the captured
-                    // scan-time bytes if the read fails or the type is variable.
-                    let live = read_live_value(process, addr, value_type)
-                        .unwrap_or_else(|| format_value_bytes(captured, value_type));
+                    // Three distinct states, deliberately not collapsed: a fresh
+                    // read, a read that *failed*, and no read yet. Falling back
+                    // to the scan-time bytes on failure (as this used to) makes a
+                    // freed address look like a live value that simply isn't
+                    // moving — the exact confusion this column exists to avoid.
+                    let live = match live_cache.get(&addr) {
+                        Some(Some(bytes)) => LiveValue::Read(bytes),
+                        Some(None) => LiveValue::Failed,
+                        None => LiveValue::Pending,
+                    };
 
                     row.col(|ui| {
                         ui.monospace(format!("0x{addr:016X}"));
                     });
                     row.col(|ui| {
-                        ui.monospace(&live);
+                        match live {
+                            LiveValue::Read(bytes) => {
+                                let text = format_value_bytes(bytes, value_type);
+                                // Tint when the live value has moved away from
+                                // what the scan matched: the clearest possible
+                                // signal that this column really is live.
+                                if bytes == entry.current.as_slice() {
+                                    ui.monospace(text);
+                                } else {
+                                    ui.monospace(
+                                        egui::RichText::new(text).color(CHANGED_COLOR),
+                                    );
+                                }
+                            }
+                            LiveValue::Failed => {
+                                ui.monospace(
+                                    egui::RichText::new("??").color(UNREADABLE_COLOR),
+                                )
+                                .on_hover_text(
+                                    "This address could not be read — it may have been freed.",
+                                );
+                            }
+                            LiveValue::Pending => {
+                                ui.weak("…");
+                            }
+                        };
+                    });
+                    row.col(|ui| {
+                        ui.monospace(
+                            egui::RichText::new(format_value_bytes(&entry.previous, value_type))
+                                .weak(),
+                        );
                     });
                     row.col(|ui| {
                         ui.horizontal(|ui| {
                             if ui.small_button("Freeze").clicked() {
-                                // Freeze the current live value (falling back to
-                                // the captured scan-time bytes if unreadable).
-                                let bytes = read_live_bytes(process, addr, value_type)
-                                    .unwrap_or_else(|| captured.clone());
+                                // Freeze what is actually there now, falling back
+                                // to the scan-time bytes only when there is no
+                                // live read to use.
+                                let bytes = match live {
+                                    LiveValue::Read(b) => b.to_vec(),
+                                    _ => entry.current.clone(),
+                                };
+                                let display = format_value_bytes(&bytes, value_type);
                                 freeze_set.set(addr, bytes);
                                 freeze_entries.retain(|e| e.address != addr);
                                 freeze_entries.push(FreezeEntry {
                                     address: addr,
-                                    display: live.clone(),
+                                    display,
                                 });
                             }
                             if ui.small_button("Add to class").clicked() {
@@ -983,6 +1122,44 @@ impl ScannerPanel {
                     });
                 });
             });
+
+        self.visible_rows = drawn.map_or(0..0, |(lo, hi)| lo..hi + 1);
+    }
+
+    /// Re-read the addresses the table drew last frame, on a throttle.
+    ///
+    /// Reading every drawn row every frame is one syscall per row per frame for
+    /// no visible benefit; the class view already settles for
+    /// `settings.live_interval_ms` (100 ms by default) and one frame of lag at
+    /// that cadence is imperceptible. Only the rows the viewport actually
+    /// scrolled to are read, so the cost is bounded by screen height rather than
+    /// by `MAX_DISPLAY`.
+    fn refresh_live_values(&mut self) {
+        let due = self
+            .last_live_refresh
+            .is_none_or(|t| t.elapsed() >= self.live_interval);
+        if !due {
+            return;
+        }
+        self.last_live_refresh = Some(Instant::now());
+        self.live_cache.clear();
+
+        let Some(process) = self.process.clone() else { return };
+        let range = self.visible_rows.clone();
+        // First paint after a scan has no viewport yet; seed with a screenful so
+        // the column is populated immediately rather than a beat later.
+        let range = if range.is_empty() {
+            0..LIVE_SEED_ROWS.min(self.result_snapshot.len())
+        } else {
+            range.start..range.end.min(self.result_snapshot.len())
+        };
+
+        for entry in &self.result_snapshot[range] {
+            self.live_cache.insert(
+                entry.address,
+                read_live_bytes(Some(&process), entry.address, self.value_type),
+            );
+        }
     }
 
     // ── freeze list sub-panel ──────────────────────────────────────────
@@ -1056,14 +1233,18 @@ fn parse_opt_hex(text: &str) -> Result<Option<usize>, ()> {
     super::parse_hex_addr(text).map(Some).ok_or(())
 }
 
-/// Collapse a scan's [`ScanResults`] into the `(address, captured-bytes)` display
-/// snapshot the panel renders. Owned output, so it outlives the borrow of the
-/// `Scanner` and can travel back from the worker.
+/// Collapse a scan's [`ScanResults`] into the display snapshot the panel renders.
+/// Owned output, so it outlives the borrow of the `Scanner` and can travel back
+/// from the worker.
 #[cfg(target_os = "linux")]
-fn snapshot_results(results: &nemclass_scan::ScanResults) -> Vec<(usize, Vec<u8>)> {
+fn snapshot_results(results: &nemclass_scan::ScanResults) -> Vec<ResultRow> {
     results
         .iter()
-        .map(|r| (r.address, r.previous_value_bytes.clone()))
+        .map(|r| ResultRow {
+            address: r.address,
+            current: r.current.to_vec(),
+            previous: r.previous.to_vec(),
+        })
         .collect()
 }
 
@@ -1076,11 +1257,6 @@ fn read_live_bytes(process: Option<&Process>, addr: usize, vt: ScanValueType) ->
     let mut buf = vec![0u8; width];
     let n = process.read_buf(addr, &mut buf).ok()?;
     (n >= width).then_some(buf)
-}
-
-/// Reads and formats a value live from the target (see [`read_live_bytes`]).
-fn read_live_value(process: Option<&Process>, addr: usize, vt: ScanValueType) -> Option<String> {
-    read_live_bytes(process, addr, vt).map(|b| format_value_bytes(&b, vt))
 }
 
 fn format_value_bytes(bytes: &[u8], vt: ScanValueType) -> String {
@@ -1496,4 +1672,132 @@ mod compare_tests {
         ScanCompareType::Changed,
         ScanCompareType::Unchanged,
     ];
+}
+
+/// Live-value column behaviour, driven through a mock memory backend so it runs
+/// without a live target.
+#[cfg(test)]
+mod live_value_tests {
+    use super::*;
+    use nemclass_core::MockMemoryBackend;
+    use std::sync::Arc;
+
+    const BASE: usize = 0x1000;
+
+    /// A process serving 256 bytes at [`BASE`], with an `i32` at `BASE + 0`.
+    fn mock_process(value: i32) -> Arc<Process> {
+        let mut bytes = vec![0u8; 256];
+        bytes[0..4].copy_from_slice(&value.to_le_bytes());
+        Arc::new(Process::from_backend_for_test(
+            1,
+            Box::new(MockMemoryBackend::new(BASE, bytes)),
+        ))
+    }
+
+    fn row(address: usize, current: i32) -> ResultRow {
+        ResultRow {
+            address,
+            current: current.to_le_bytes().to_vec(),
+            previous: current.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_failed_read_is_recorded_as_unknown_not_as_stale_bytes() {
+        let mut panel = ScannerPanel::new();
+        panel.process = Some(mock_process(1337));
+        // One readable address, one well outside the mapped range.
+        panel.result_snapshot = vec![row(BASE, 1337), row(0xDEAD_0000, 1337)];
+
+        panel.refresh_live_values();
+
+        assert_eq!(
+            panel.live_cache.get(&BASE),
+            Some(&Some(1337i32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            panel.live_cache.get(&0xDEAD_0000),
+            Some(&None),
+            "an unreadable address must be recorded as a failure, so the table can \
+             show ?? instead of the stale scan-time value"
+        );
+    }
+
+    #[test]
+    fn refresh_only_reads_the_rows_the_table_drew() {
+        let mut panel = ScannerPanel::new();
+        panel.process = Some(mock_process(1));
+        panel.result_snapshot = (0..5000).map(|i| row(BASE + i * 4, 1)).collect();
+        panel.visible_rows = 10..40;
+
+        panel.refresh_live_values();
+
+        assert_eq!(panel.live_cache.len(), 30);
+        assert!(panel.live_cache.contains_key(&(BASE + 10 * 4)));
+        assert!(!panel.live_cache.contains_key(&BASE));
+    }
+
+    #[test]
+    fn the_first_refresh_after_a_scan_seeds_a_screenful() {
+        // No viewport reported yet, so the column would otherwise stay blank for
+        // a frame.
+        let mut panel = ScannerPanel::new();
+        panel.process = Some(mock_process(1));
+        panel.result_snapshot = (0..10).map(|i| row(BASE + i * 4, 1)).collect();
+        panel.visible_rows = 0..0;
+
+        panel.refresh_live_values();
+        assert_eq!(panel.live_cache.len(), 10);
+    }
+
+    #[test]
+    fn the_refresh_is_throttled() {
+        let mut panel = ScannerPanel::new();
+        panel.process = Some(mock_process(1));
+        panel.result_snapshot = vec![row(BASE, 1)];
+
+        panel.refresh_live_values();
+        let first = panel.last_live_refresh;
+        panel.refresh_live_values();
+        assert_eq!(
+            panel.last_live_refresh, first,
+            "a second call inside the interval must not re-read"
+        );
+    }
+
+    #[test]
+    fn the_cache_is_dropped_when_the_results_change() {
+        let mut panel = ScannerPanel::new();
+        panel.process = Some(mock_process(1));
+        panel.result_snapshot = vec![row(BASE, 1)];
+        panel.refresh_live_values();
+        assert!(!panel.live_cache.is_empty());
+
+        panel.new_scan();
+        assert!(panel.live_cache.is_empty());
+        assert!(panel.last_live_refresh.is_none());
+    }
+
+    #[test]
+    fn detaching_drops_the_shared_handle_and_the_cache() {
+        let mut panel = ScannerPanel::new();
+        panel.process = Some(mock_process(1));
+        panel.result_snapshot = vec![row(BASE, 1)];
+        panel.refresh_live_values();
+
+        panel.on_detach();
+        assert!(panel.process.is_none());
+        assert!(panel.live_cache.is_empty());
+    }
+
+    #[test]
+    fn with_no_process_every_row_stays_pending() {
+        let mut panel = ScannerPanel::new();
+        panel.result_snapshot = vec![row(BASE, 1)];
+        panel.refresh_live_values();
+        assert!(
+            panel.live_cache.is_empty(),
+            "no attached process is Pending, not a failed read"
+        );
+    }
 }

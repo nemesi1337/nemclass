@@ -2350,13 +2350,6 @@ impl NemclassApp {
     }
 
     fn show_scanner_tab(&mut self, ui: &mut egui::Ui) {
-        // Derive the pid from the attached process on Linux; scanner accepts
-        // Pid (u32 alias in nemclass-core) but ProcessTarget::attach takes Pid.
-        #[cfg(target_os = "linux")]
-        let pid: Option<nemclass_core::Pid> = self.process.as_ref().map(|p| p.pid());
-        #[cfg(not(target_os = "linux"))]
-        let pid: Option<nemclass_core::Pid> = None;
-
         // Owned snapshot: `process_ref` below holds an immutable borrow of
         // `self.process` across the `&mut self.scanner_panel` call, so a
         // borrowing iterator wouldn't compile.
@@ -2367,7 +2360,9 @@ impl NemclassApp {
             .map(|it| it.collect())
             .unwrap_or_default();
 
-        let process_ref = self.process.as_deref();
+        // The shared handle, not a fresh attach: the scanner reads through the
+        // backend the user actually attached with.
+        let process_ref = self.process.as_ref();
         // Owned handle (cloned) so it doesn't borrow `self` across the panel call.
         let rt = self.runtime.as_ref().expect("bg runtime").handle();
 
@@ -2375,10 +2370,10 @@ impl NemclassApp {
         let mut add_to_table: Option<(usize, String)> = None;
         let mut ptr_scan_addr: Option<usize> = None;
 
+        self.scanner_panel.set_live_interval(self.snapshot_interval);
         self.scanner_panel.show(
             ui,
             process_ref,
-            pid,
             &modules,
             &rt,
             |addr| { add_to_class_addr = Some(addr); },

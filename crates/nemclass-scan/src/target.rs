@@ -333,6 +333,8 @@ impl WriteTarget for MockTarget {
 // `Process::write`. Linux-only; the scan engine above is platform-neutral.
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::sync::Arc;
+
     use super::{Region, ScanTarget, SectionFilter, WriteTarget};
     use nemclass_core::{Process, ProviderRegistry, Result};
 
@@ -343,8 +345,15 @@ mod linux {
     /// policy a value scan wants (Cheat Engine's default). Reads go through
     /// [`Process::read_buf`] (one `process_vm_readv`), writes through
     /// [`Process::write`].
+    ///
+    /// The handle is an `Arc` so a caller that already has one — the UI holds
+    /// `Arc<Process>` precisely so background workers can share it — can pass it
+    /// in rather than opening a second one. That matters beyond saving a syscall:
+    /// [`Self::attach`] always opens the *native* provider, so a scanner built
+    /// that way reads through a different backend than an app attached via the
+    /// kernel module, and the two can disagree about what is at an address.
     pub struct ProcessTarget {
-        process: Process,
+        process: Arc<Process>,
         pid: nemclass_core::Pid,
         filter: SectionFilter,
     }
@@ -352,8 +361,15 @@ mod linux {
     impl ProcessTarget {
         /// Attaches to `pid` via the default native (`"linux-native"`) provider.
         pub fn attach(pid: nemclass_core::Pid) -> Result<Self> {
-            let process = Process::attach(pid)?;
-            Ok(Self { process, pid, filter: SectionFilter::default() })
+            Ok(Self::from_shared(Arc::new(Process::attach(pid)?)))
+        }
+
+        /// Wraps an already-opened process handle, sharing whichever backend it
+        /// was opened with. Preferred over [`Self::attach`] whenever the caller
+        /// has one.
+        pub fn from_shared(process: Arc<Process>) -> Self {
+            let pid = process.pid();
+            Self { process, pid, filter: SectionFilter::default() }
         }
 
         /// Opens `pid` through a named provider in `registry` (e.g.
@@ -366,8 +382,7 @@ mod linux {
             let provider = registry
                 .get(provider)
                 .ok_or(nemclass_core::Error::ProcessNotFound)?;
-            let process = provider.open(pid)?;
-            Ok(Self { process, pid, filter: SectionFilter::default() })
+            Ok(Self::from_shared(Arc::new(provider.open(pid)?)))
         }
 
         /// Restricts which sections [`ScanTarget::regions`] offers.

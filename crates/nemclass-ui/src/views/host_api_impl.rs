@@ -1453,7 +1453,9 @@ mod inner {
         }
 
         /// `scan.resultsWithValues(max?)` — like `scan.results` but returns
-        /// `{address, value}` pairs, reading the current value at each hit.
+        /// `{address, value, previous}` triples: `value` is read live from the
+        /// target right now, `previous` is what the address held as of the scan
+        /// generation before the current one.
         fn scan_session_values(&self, args: &Value) -> Result<Value, String> {
             #[cfg(target_os = "linux")]
             {
@@ -1486,7 +1488,11 @@ mod inner {
                         } else {
                             Value::Null
                         };
-                        json!({ "address": r.address as f64, "value": value })
+                        json!({
+                            "address": r.address as f64,
+                            "value": value,
+                            "previous": bytes_to_json_num(vt, r.previous),
+                        })
                     })
                     .collect();
                 Ok(json!(out))

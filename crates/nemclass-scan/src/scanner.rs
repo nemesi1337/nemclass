@@ -8,7 +8,7 @@
 //! deterministic for tests; a caller can shard regions across threads later.
 
 use crate::compare::ScanCompareType;
-use crate::results::{ScanResult, ScanResults};
+use crate::results::ScanResults;
 use crate::target::{Region, RegionFilter, ScanTarget};
 use crate::value_type::{Needle, ScanValueType};
 
@@ -346,7 +346,7 @@ impl<T: ScanTarget> Scanner<T> {
 
         let regions = self.region_filter.apply(&self.target.regions()?);
         self.scanned_regions = regions.len();
-        let mut results = ScanResults::new();
+        let mut results = ScanResults::with_stride(stride);
         let mut buf = vec![0u8; CHUNK_SIZE.max(stride)];
         let mut scanned = 0usize;
         self.truncated = false;
@@ -413,7 +413,8 @@ impl<T: ScanTarget> Scanner<T> {
         }
 
         let previous = self.results().clone();
-        let mut results = ScanResults::new();
+        let mut results = ScanResults::with_stride(stride);
+        results.reserve(previous.len());
         let mut buf = vec![0u8; stride];
         let mut unreadable = 0usize;
         let mut last_err = None;
@@ -437,13 +438,16 @@ impl<T: ScanTarget> Scanner<T> {
                 }
             }
             let matched = match &needle {
-                Some(n) => n.compare_next(&buf, 0, compare, &prev.previous_value_bytes),
+                Some(n) => n.compare_next(&buf, 0, compare, prev.current),
                 None => self
                     .value_type
-                    .compare_change(compare, &buf[..stride], &prev.previous_value_bytes),
+                    .compare_change(compare, &buf[..stride], prev.current),
             };
             if matched {
-                results.push(ScanResult::new(prev.address, buf[..stride].to_vec()));
+                // This generation's `previous` is the *previous* generation's
+                // current — the value the user last saw, which is what a Cheat
+                // Engine "Previous" column shows.
+                results.push(prev.address, &buf[..stride], prev.current);
             }
         }
 
@@ -516,8 +520,11 @@ impl<T: ScanTarget> Scanner<T> {
                     None => matches!(compare, ScanCompareType::Unknown),
                 };
                 if matched {
-                    let value = buf[off..off + stride].to_vec();
-                    out.push(ScanResult::new(addr + off, value));
+                    // Nothing came before a first scan, so the value is its own
+                    // previous — Cheat Engine shows it in both columns rather
+                    // than leaving Previous blank.
+                    let value = &buf[off..off + stride];
+                    out.push(addr + off, value, value);
                     if out.len() >= self.result_limit {
                         return Ok(scanned);
                     }
