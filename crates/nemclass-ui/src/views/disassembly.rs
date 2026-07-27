@@ -414,12 +414,24 @@ impl DisassemblyPanel {
         };
         match result {
             Ok(addr) => {
-                self.address_error = None;
-                // Typing a raw address opens it as a single function.
+                // In linear mode, Go navigates *within* the listing (keeping the
+                // surrounding disassembly) rather than collapsing to a single
+                // function — but only for addresses inside a selected code region.
                 #[cfg(target_os = "linux")]
-                {
-                    self.mode = DisasmMode::Function;
+                if self.mode == DisasmMode::Linear {
+                    if self.region_of(addr as u64).is_some() {
+                        self.address_error = None;
+                        self.navigate(addr);
+                    } else {
+                        self.address_error = Some(format!(
+                            "Address {addr:#x} is not in a selected module's code region"
+                        ));
+                    }
+                    return;
                 }
+                // Function mode (the default before any module is selected):
+                // decode the single function at `addr`.
+                self.address_error = None;
                 self.navigate(addr);
             }
             Err(e) => self.address_error = Some(format!("Bad address: {e}")),
