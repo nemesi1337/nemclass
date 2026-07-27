@@ -66,6 +66,10 @@ pub struct ScannerPanel {
     needle_text: String,
     /// Upper-bound text field, shown only when `compare == Between`.
     upper_text: String,
+    /// Cheat Engine's "Fast Scan": only test addresses aligned to the value's
+    /// width. On by default — compilers align scalars, so the misses are rare
+    /// and it cuts both scan time and result count by the type width.
+    fast_scan: bool,
 
     // ── scan scope (first scan only) ───────────────────────────────────
     /// Master toggle for the whole "Scan range" section.
@@ -120,6 +124,7 @@ impl ScannerPanel {
             compare:      ScanCompareType::Exact,
             needle_text:  String::new(),
             upper_text:   String::new(),
+            fast_scan:    true,
             scan_range_enabled: false,
             range_start_text: String::new(),
             range_end_text:   String::new(),
@@ -212,7 +217,22 @@ impl ScannerPanel {
                                     .as_ref()
                                     .map_or(0, |s| s.last_scan_stats().unreadable)
                             };
-                            self.status_msg = if scope_matched_nothing {
+                            // The cap exists so an `Unknown` baseline over a live
+                            // working set cannot OOM the process. Say the set is
+                            // a prefix — otherwise a later narrowing that never
+                            // finds the value looks inexplicable.
+                            let truncated = self.last_job_was_first_scan
+                                && self
+                                    .scanner
+                                    .as_ref()
+                                    .is_some_and(|s| s.results_truncated());
+                            self.status_msg = if truncated {
+                                Some(format!(
+                                    "Stopped at {} results — this is only part of the matches. \
+                                     Narrow the scan range or scan for a known value.",
+                                    self.result_snapshot.len()
+                                ))
+                            } else if scope_matched_nothing {
                                 Some(
                                     "Scan range matched no memory — the address window, selected \
                                      modules and memory-type filters don't overlap any region. \
@@ -365,6 +385,16 @@ impl ScannerPanel {
                     );
                 }
             }
+
+            // Applies to a first scan only, so it follows the same lock as the
+            // value type: the existing results are already on one lattice.
+            ui.add_enabled_ui(!has_scan, |ui| {
+                ui.checkbox(&mut self.fast_scan, "Fast scan")
+                    .on_hover_text(
+                        "Only test addresses aligned to the value's width. Much faster and \
+                         far fewer results; untick to find deliberately misaligned values.",
+                    );
+            });
         });
 
         ui.add_space(2.0);
@@ -745,13 +775,17 @@ impl ScannerPanel {
 
         let compare = self.compare;
         let value_type = self.value_type;
+        // 0 means "use the type's own width" (Fast Scan); 1 tests every byte.
+        let alignment = if self.fast_scan { 0 } else { 1 };
         self.last_job_was_first_scan = true;
         self.status_msg = Some("Scanning…".into());
         self.scan_job.spawn(rt, ctx, move || {
             let target = ProcessTarget::attach(pid)
                 .map_err(|e| format!("ProcessTarget: {e}"))?
                 .with_section_filter(section_filter);
-            let mut scanner = Scanner::new(target, value_type).with_region_filter(region_filter);
+            let mut scanner = Scanner::new(target, value_type)
+                .with_region_filter(region_filter)
+                .with_alignment(alignment);
             let scan_result = scanner
                 .first_scan(compare, needle)
                 .map(snapshot_results)

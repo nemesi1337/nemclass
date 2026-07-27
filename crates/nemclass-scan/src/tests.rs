@@ -143,14 +143,13 @@ fn unknown_first_scan_then_decreased() {
     let mut scanner = Scanner::new(MockTarget::new(BASE, buf), ScanValueType::I32);
 
     let first = scanner.first_scan(ScanCompareType::Unknown, None).unwrap();
-    // 16 bytes, stride 4, positions 0..=12 -> 13 candidates.
-    assert_eq!(first.len(), 13);
+    // 16 bytes, stride 4, Fast Scan alignment 4 -> offsets 0/4/8/12.
+    assert_eq!(first.len(), 4);
 
     // Decrease only the value at offset 0 (500 -> 400); everything else stays.
     scanner_target_mut(&mut scanner).buf_mut()[0..4].copy_from_slice(&400i32.to_le_bytes());
     let r = scanner.next_scan(ScanCompareType::Decreased, None).unwrap();
-    // Only overlapping windows touching offset 0 that decreased. Offset 0 is the
-    // clean match; verify it is present.
+    // Offset 0 is the only slot that decreased.
     assert!(r.iter().any(|x| x.address == BASE));
     // The untouched offset-8 value (10) did not decrease, so it is gone.
     assert!(!r.iter().any(|x| x.address == BASE + 8));
@@ -222,7 +221,10 @@ fn stride_at_region_boundary_does_not_read_past() {
 
     let regions = vec![Region::new(BASE, 10)];
     let target = MockTarget::with_regions(BASE, buf, regions);
-    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    // Alignment 1 so both offsets are candidates and the assertion below is
+    // about the region edge rather than about the Fast Scan lattice (offset 2
+    // is not 4-aligned).
+    let mut scanner = Scanner::new(target, ScanValueType::I32).with_alignment(1);
 
     let n = needle(ScanValueType::I32, "0x11223344");
     let r = scanner.first_scan(ScanCompareType::Exact, Some(n)).unwrap();
@@ -899,4 +901,92 @@ fn set_value_type_accepts_same_width_reinterpretation() {
     assert_eq!(scanner.value_type(), ScanValueType::F32);
     assert!(scanner.set_value_type(ScanValueType::U32));
     assert_eq!(scanner.value_type(), ScanValueType::U32);
+}
+
+// ── first-scan alignment and the result cap ────────────────────────────────
+
+#[test]
+fn alignment_defaults_to_the_type_width() {
+    // 1337 written at offset 6, which is not 4-aligned: Fast Scan skips it.
+    let mut buf = vec![0u8; 32];
+    buf[6..10].copy_from_slice(&1337i32.to_le_bytes());
+    let mut scanner = Scanner::new(MockTarget::new(BASE, buf), ScanValueType::I32);
+
+    let r = scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "1337")))
+        .unwrap();
+    assert!(r.is_empty(), "a misaligned i32 is not a Fast Scan candidate");
+}
+
+#[test]
+fn alignment_1_still_finds_unaligned_values() {
+    let mut buf = vec![0u8; 32];
+    buf[6..10].copy_from_slice(&1337i32.to_le_bytes());
+    let mut scanner =
+        Scanner::new(MockTarget::new(BASE, buf), ScanValueType::I32).with_alignment(1);
+
+    let addrs: Vec<usize> = scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "1337")))
+        .unwrap()
+        .iter()
+        .map(|r| r.address)
+        .collect();
+    assert_eq!(addrs, vec![BASE + 6]);
+}
+
+#[test]
+fn variable_width_types_stay_byte_granular() {
+    // An AOB or an embedded string has no natural alignment, so the default
+    // must not step by the needle's length.
+    let mut buf = vec![0u8; 32];
+    buf[7..10].copy_from_slice(&[0xDE, 0xAD, 0xBE]);
+    let mut scanner = Scanner::new(MockTarget::new(BASE, buf), ScanValueType::Bytes);
+
+    let addrs: Vec<usize> = scanner
+        .first_scan(
+            ScanCompareType::Exact,
+            Some(needle(ScanValueType::Bytes, "DE AD BE")),
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.address)
+        .collect();
+    assert_eq!(addrs, vec![BASE + 7]);
+}
+
+#[test]
+fn unknown_baseline_lands_on_the_alignment_lattice() {
+    let scanner_results = |align: usize| {
+        let mut s =
+            Scanner::new(MockTarget::new(BASE, vec![0u8; 64]), ScanValueType::I32)
+                .with_alignment(align);
+        s.first_scan(ScanCompareType::Unknown, None)
+            .unwrap()
+            .iter()
+            .map(|r| r.address)
+            .collect::<Vec<_>>()
+    };
+
+    // 64 bytes, stride 4: aligned candidates are 0,4,…,60.
+    assert_eq!(scanner_results(4).len(), 16);
+    assert!(scanner_results(4).iter().all(|a| (a - BASE).is_multiple_of(4)));
+    // Byte-granular: 0..=60 inclusive.
+    assert_eq!(scanner_results(1).len(), 61);
+}
+
+#[test]
+fn result_limit_truncates_and_reports() {
+    let mut scanner = Scanner::new(MockTarget::new(BASE, vec![0u8; 256]), ScanValueType::I32)
+        .with_result_limit(10);
+
+    let r = scanner.first_scan(ScanCompareType::Unknown, None).unwrap();
+    assert_eq!(r.len(), 10);
+    assert!(scanner.results_truncated());
+}
+
+#[test]
+fn an_uncapped_scan_is_not_reported_as_truncated() {
+    let mut scanner = Scanner::new(MockTarget::new(BASE, vec![0u8; 64]), ScanValueType::I32);
+    scanner.first_scan(ScanCompareType::Unknown, None).unwrap();
+    assert!(!scanner.results_truncated());
 }

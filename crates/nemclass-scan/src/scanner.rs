@@ -119,6 +119,14 @@ const CHUNK_SIZE: usize = 64 * 1024;
 /// `CircularBuffer<ScanResultStore>(3)`).
 const HISTORY_DEPTH: usize = 3;
 
+/// Default cap on first-scan matches.
+///
+/// An `Unknown` baseline matches every candidate position, so its result count
+/// is the scanned span divided by the alignment — hundreds of millions over a
+/// real working set. The cap turns "the UI wedges and then the process is OOM
+/// killed" into "narrow your scan range", which is a message a user can act on.
+const DEFAULT_RESULT_LIMIT: usize = 5_000_000;
+
 /// Progress of an in-progress or completed scan pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanProgress {
@@ -149,6 +157,13 @@ pub struct Scanner<T: ScanTarget> {
     /// filtering. Zero means the filter excluded everything — a caller should
     /// report that differently from "scanned everything, found nothing".
     scanned_regions: usize,
+    /// Candidate step for a first scan, in bytes. `None` means "the scan
+    /// stride", i.e. Cheat Engine's default Fast Scan.
+    alignment: Option<usize>,
+    /// Cap on how many matches a first scan will collect.
+    result_limit: usize,
+    /// Whether the last first scan stopped early on [`Self::result_limit`].
+    truncated: bool,
     /// Result generations, oldest first; the last is the current one. Bounded to
     /// [`HISTORY_DEPTH`].
     history: Vec<ScanResults>,
@@ -166,6 +181,9 @@ impl<T: ScanTarget> Scanner<T> {
             value_type,
             region_filter: RegionFilter::default(),
             scanned_regions: 0,
+            alignment: None,
+            result_limit: DEFAULT_RESULT_LIMIT,
+            truncated: false,
             history: Vec::new(),
             has_scanned: false,
             last_stats: ScanStats::default(),
@@ -187,6 +205,45 @@ impl<T: ScanTarget> Scanner<T> {
     /// The active region filter.
     pub fn region_filter(&self) -> &RegionFilter {
         &self.region_filter
+    }
+
+    /// Sets the first-scan candidate step in bytes.
+    ///
+    /// The default is Cheat Engine's "Fast Scan": the value type's own width,
+    /// which assumes a value of width *n* is *n*-aligned. Pass `1` to test every
+    /// byte offset, which finds deliberately misaligned values at 4× the results
+    /// and 4× the memory for an `i32`.
+    ///
+    /// Variable-width types ([`ScanValueType::Bytes`] and the string types)
+    /// default to 1 instead: a byte pattern or an embedded string has no natural
+    /// alignment, and stepping by the needle's length would skip most of them.
+    pub fn with_alignment(mut self, alignment: usize) -> Self {
+        self.alignment = (alignment > 0).then_some(alignment);
+        self
+    }
+
+    /// Replaces the first-scan alignment in place. See [`Self::with_alignment`].
+    pub fn set_alignment(&mut self, alignment: usize) {
+        self.alignment = (alignment > 0).then_some(alignment);
+    }
+
+    /// The first-scan candidate step, honouring [`Self::with_alignment`].
+    fn alignment(&self) -> usize {
+        self.alignment
+            .unwrap_or_else(|| self.value_type.fixed_width().unwrap_or(1))
+            .max(1)
+    }
+
+    /// Caps how many matches a first scan collects. See [`DEFAULT_RESULT_LIMIT`].
+    pub fn with_result_limit(mut self, limit: usize) -> Self {
+        self.result_limit = limit;
+        self
+    }
+
+    /// Whether the last first scan stopped early on the result limit, so the
+    /// result set is a prefix of the real matches rather than all of them.
+    pub fn results_truncated(&self) -> bool {
+        self.truncated
     }
 
     /// How many regions the last first scan walked after filtering.
@@ -264,7 +321,10 @@ impl<T: ScanTarget> Scanner<T> {
     /// change-relative first-scan baseline ([`ScanCompareType::Unknown`]) pass
     /// `None` (a `None` needle with any needle-requiring compare is rejected).
     /// Every readable [`Region`] that survives the [`RegionFilter`] is walked in
-    /// [`CHUNK_SIZE`] windows and every stride-aligned position is compared.
+    /// [`CHUNK_SIZE`] windows, comparing each position on the alignment lattice
+    /// (see [`Scanner::with_alignment`]; the stride by default). Stops early once
+    /// [`Scanner::with_result_limit`] matches are collected, which
+    /// [`Scanner::results_truncated`] then reports.
     pub fn first_scan(
         &mut self,
         compare: ScanCompareType,
@@ -289,6 +349,7 @@ impl<T: ScanTarget> Scanner<T> {
         let mut results = ScanResults::new();
         let mut buf = vec![0u8; CHUNK_SIZE.max(stride)];
         let mut scanned = 0usize;
+        self.truncated = false;
 
         for region in &regions {
             scanned += self.scan_region_first(
@@ -299,6 +360,10 @@ impl<T: ScanTarget> Scanner<T> {
                 &mut buf,
                 &mut results,
             )?;
+            if results.len() >= self.result_limit {
+                self.truncated = true;
+                break;
+            }
         }
 
         self.last_stats = ScanStats {
@@ -422,7 +487,10 @@ impl<T: ScanTarget> Scanner<T> {
         buf: &mut [u8],
         out: &mut ScanResults,
     ) -> Result<usize> {
-        let mut addr = region.base;
+        let align = self.alignment();
+        // Start on an aligned address so every candidate in this region sits on
+        // the same lattice, independent of where the region happens to begin.
+        let mut addr = region.base.next_multiple_of(align);
         let region_end = region.end();
         let mut scanned = 0usize;
 
@@ -439,7 +507,9 @@ impl<T: ScanTarget> Scanner<T> {
 
             // The last position where a full stride still fits in what we read.
             let last = read - stride;
-            for off in 0..=last {
+            // `addr` is aligned, so offset 0 is a candidate and every `align`
+            // bytes after it is too.
+            for off in (0..=last).step_by(align) {
                 scanned += 1;
                 let matched = match needle {
                     Some(n) => n.compare_first(&buf[..read], off, compare),
@@ -448,15 +518,19 @@ impl<T: ScanTarget> Scanner<T> {
                 if matched {
                     let value = buf[off..off + stride].to_vec();
                     out.push(ScanResult::new(addr + off, value));
+                    if out.len() >= self.result_limit {
+                        return Ok(scanned);
+                    }
                 }
             }
 
             // Advance so the next window overlaps by `stride - 1`, guaranteeing a
-            // value straddling the previous chunk boundary is still tested.
-            // Advance by at least 1 to make progress even in the degenerate
+            // value straddling the previous chunk boundary is still tested, then
+            // round back up to the alignment lattice so candidates stay on it.
+            // Advance by at least `align` to make progress even in the degenerate
             // `read == stride` case.
             let step = (read - (stride - 1)).max(1);
-            addr += step;
+            addr = (addr + step).next_multiple_of(align).max(addr + align);
         }
         Ok(scanned)
     }
@@ -512,6 +586,9 @@ impl<T: ScanTarget + Clone> Scanner<T> {
             value_type: self.value_type,
             region_filter: self.region_filter.clone(),
             scanned_regions: self.scanned_regions,
+            alignment: self.alignment,
+            result_limit: self.result_limit,
+            truncated: self.truncated,
             history: self.history.clone(),
             has_scanned: self.has_scanned,
             last_stats: self.last_stats,
