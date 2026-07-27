@@ -10,15 +10,20 @@ works equally against an in-memory `MockTarget`.
 - **`ScanValueType`** — searchable kinds: `I8..I64`, `U8..U64`, `F32`/`F64`,
   `Bytes` (AOB with `??` wildcards), and UTF-8/UTF-16 strings. Each knows its
   stride and `parse_needle`.
-- **`ScanCompareType`** — `Exact`/`NotEqual`/`GreaterThan`/`LessThan`/`Between`
-  plus the change-relative kinds (`Unknown`, `Increased`, `IncreasedBy`,
-  `Decreased`, `DecreasedBy`, `Changed`, `Unchanged`).
+- **`ScanCompareType`** — `Exact`/`NotEqual`/`GreaterThan`/`LessThan`/`Between`,
+  the change-relative kinds (`Increased`, `IncreasedBy`, `Decreased`,
+  `DecreasedBy`, `Changed`, `Unchanged`), and `Unknown` — a first-scan baseline
+  only, since it accepts every candidate.
 - **`Needle`** — a parsed search value; `with_upper_bound` supplies the second
   operand for `Between`.
 - **`ScanTarget` / `WriteTarget`** — the read/write seams. `MockTarget`
   (in-memory) and (Linux) `ProcessTarget`.
-- **`Scanner<T>`** — `first_scan` (chunked region walk) and `next_scan`
-  (re-reads only previous matches), with a bounded `undo` history.
+- **`Scanner<T>`** — `first_scan` (chunked region walk, alignment-stepped and
+  result-capped) and `next_scan` (re-reads only previous matches, dropping any
+  that became unreadable), with a bounded `undo` history. The `*_with` variants
+  take a `ScanObserver` for progress and cancellation.
+- **`ScanResults`** — a column store of `(address, current, previous)`.
+- **`ScanError` / `ScanStats`** — typed failure reasons and per-pass counters.
 - **`FreezeSet`** — periodically re-writes pinned values through a `WriteTarget`.
 - **`BytePattern` / `PatternByte`** — the AOB matcher.
 

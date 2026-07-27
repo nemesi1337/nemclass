@@ -13,13 +13,22 @@
 //! - [`ScanValueType`] — the searchable value kinds (`I8`..`U64`, `F32`/`F64`,
 //!   [`ScanValueType::Bytes`] AOB with `??` wildcards, and UTF-8/UTF-16
 //!   strings). Each knows its stride and how to [`ScanValueType::parse_needle`].
-//! - [`ScanCompareType`] — `Exact`/`NotEqual`/`GreaterThan`/`LessThan`/`Between`
-//!   plus the change-relative kinds (`Unknown`, `Increased`, `IncreasedBy`,
-//!   `Decreased`, `DecreasedBy`, `Changed`, `Unchanged`).
+//! - [`ScanCompareType`] — `Exact`/`NotEqual`/`GreaterThan`/`LessThan`/`Between`,
+//!   the change-relative kinds (`Increased`, `IncreasedBy`, `Decreased`,
+//!   `DecreasedBy`, `Changed`, `Unchanged`), and `Unknown` — a **first-scan
+//!   baseline only**, since it accepts every candidate.
 //! - [`Scanner`] — generic over [`ScanTarget`]:
-//!   [`Scanner::first_scan`] walks regions in chunks; [`Scanner::next_scan`]
-//!   re-reads only the previous match addresses; a bounded undo history backs
-//!   [`Scanner::undo`].
+//!   [`Scanner::first_scan`] walks regions in chunks, testing addresses on the
+//!   value type's alignment lattice (Cheat Engine's Fast Scan; see
+//!   [`Scanner::with_alignment`]) and capped by [`Scanner::with_result_limit`];
+//!   [`Scanner::next_scan`] re-reads only the previous match addresses, dropping
+//!   any that have become unreadable ([`Scanner::last_scan_stats`]); a bounded
+//!   undo history backs [`Scanner::undo`]. The `*_with` variants take a
+//!   [`ScanObserver`] for progress and cooperative cancellation.
+//! - [`ScanResults`] — a column store of `(address, current, previous)`, where
+//!   `previous` is the value as of the generation before this one.
+//! - [`ScanError`] — why a scan could not run, with a `Display` fit for a status
+//!   line.
 //! - [`FreezeSet`] — periodically re-writes pinned values through a
 //!   [`WriteTarget`].
 //!

@@ -11,7 +11,7 @@ MyProject/
 ├── package.json         # scaffolded — scripting API type info
 ├── tsconfig.json        # scaffolded — TypeScript config for src/
 ├── src/                 # user scripts (JS/TS)
-└── tables/              # cheat tables (reserved for future use)
+└── tables/              # saved address lists (cheat tables), one TOML each
 ```
 
 ## `project.nemclass` (TOML)

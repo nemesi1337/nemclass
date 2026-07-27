@@ -153,6 +153,12 @@ case-insensitive: `exact`/`eq`, `notEqual`/`ne`, `greater`/`gt`, `less`/`lt`,
 `between`, `unknown`, `increased`/`inc`, `increasedBy`, `decreased`/`dec`,
 `decreasedBy`, `changed`, `unchanged`.
 
+`unknown` is a **first-scan baseline only** — it accepts every candidate, so
+`scan.next("unknown")` is an error rather than a silent no-op. Narrow with
+`changed`/`increased`/`decreased` or an exact value instead. A `scan.next` also
+silently drops any result whose address is no longer readable; it only fails
+when *every* address has gone.
+
 ```ts
 // 1. You know your health is 100 right now.
 let n = nemclass.scan.first("i32", 100);        // exact scan, e.g. 5000 hits
@@ -180,7 +186,10 @@ nemclass.scan.next("unchanged");                  // ...then held steady
 const addrs = nemclass.scan.results(50);          // up to 50 addresses
 ```
 `scan.results(max?)` returns up to `max` addresses (default 1000, hard cap
-100000). The session is dropped automatically on detach or project change.
+100000). `scan.resultsWithValues(max?)` returns `{address, value, previous}`
+instead — `value` read live from the target right now, `previous` the value as of
+the scan generation before the current one. The session is dropped automatically
+on detach or project change.
 
 ### Global hotkeys (`hotkeys.*` + `OnHotkey`)
 Register a combo like `"Ctrl+Shift+H"`, `"F6"`, or `"Alt+K"`. `register` returns
