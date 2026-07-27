@@ -60,6 +60,18 @@ impl ScanCompareType {
         )
     }
 
+    /// Whether this is the "unknown initial value" baseline, which is only
+    /// meaningful on a *first* scan.
+    ///
+    /// A next scan re-reads the addresses a first scan already accepted, so
+    /// "accept everything" there is either a no-op or — depending on whether a
+    /// needle happens to be present — a silent wipe. [`crate::Scanner::next_scan`]
+    /// rejects it outright, matching Cheat Engine, which offers no such compare
+    /// once a scan is under way.
+    pub const fn is_baseline(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
     /// Parses a compare tag (case-insensitive) into a [`ScanCompareType`].
     ///
     /// Accepts the JS-API vocabulary used by `scan.first`/`scan.next` plus short

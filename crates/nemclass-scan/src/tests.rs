@@ -338,7 +338,10 @@ fn clone_scanner_after_first(scanner: &Scanner<MockTarget>) -> Scanner<MockTarge
     scanner.clone_for_test()
 }
 
-/// An interior-mutable write target for the freeze test.
+/// An interior-mutable target for the freeze test and for the change-relative
+/// next-scan tests, which need to mutate the buffer *between* two scans through
+/// the shared reference the `Scanner` holds.
+#[derive(Clone)]
 struct CellTarget {
     base: usize,
     buf: std::cell::RefCell<Vec<u8>>,
@@ -360,6 +363,20 @@ impl CellTarget {
     fn poke(&self, addr: usize, bytes: &[u8]) {
         let off = addr - self.base;
         self.buf.borrow_mut()[off..off + bytes.len()].copy_from_slice(bytes);
+    }
+}
+
+impl crate::ScanTarget for CellTarget {
+    fn regions(&self) -> crate::Result<Vec<Region>> {
+        Ok(vec![Region::new(self.base, self.buf.borrow().len())])
+    }
+
+    fn read(&self, addr: usize, buf: &mut [u8]) -> crate::Result<usize> {
+        let off = addr - self.base;
+        let b = self.buf.borrow();
+        let n = buf.len().min(b.len().saturating_sub(off));
+        buf[..n].copy_from_slice(&b[off..off + n]);
+        Ok(n)
     }
 }
 
@@ -648,4 +665,238 @@ fn section_filter_protection_tri_states_apply_independently() {
     };
     assert!(any.keep(&section(SectionType::Mapped, Protection::empty())));
     assert!(!any.keep(&section(SectionType::Unknown, Protection::RW)));
+}
+
+// ── next scan: the compares that used to be silently wrong ─────────────────
+
+/// Writes a little-endian `f32` at `offset` in a 32-byte buffer.
+fn buf_with_f32(offset: usize, value: f32) -> Vec<u8> {
+    let mut buf = vec![0u8; 32];
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    buf
+}
+
+#[test]
+fn next_scan_unknown_is_rejected_and_keeps_results() {
+    let mut scanner = Scanner::new(
+        MockTarget::new(BASE, buf_with_i32(4, 7)),
+        ScanValueType::I32,
+    );
+    let found = scanner.first_scan(ScanCompareType::Unknown, None).unwrap().len();
+    assert!(found > 0);
+
+    // `Unknown` is a first-scan baseline. On a next scan it used to fall through
+    // to a catch-all `false` and silently drop every result.
+    let err = scanner.next_scan(ScanCompareType::Unknown, None).unwrap_err();
+    assert!(matches!(err, crate::ScanError::CompareIsFirstScanOnly(_)));
+    assert_eq!(
+        scanner.results().len(),
+        found,
+        "a rejected next scan must not touch the result set"
+    );
+    assert!(!scanner.can_undo(), "no generation should have been pushed");
+}
+
+#[test]
+fn next_scan_signed_increase_across_zero() {
+    // -1 -> 1 is an increase for an i32, but 0xFFFFFFFF > 0x00000001 as an
+    // unsigned magnitude, so the old byte-magnitude path dropped it.
+    let target = CellTarget::new(BASE, buf_with_i32(4, -1));
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "-1")))
+        .unwrap();
+    assert_eq!(scanner.results().len(), 1);
+
+    scanner.target().poke(BASE + 4, &1i32.to_le_bytes());
+    let r = scanner.next_scan(ScanCompareType::Increased, None).unwrap();
+    assert_eq!(r.len(), 1, "-1 -> 1 must count as Increased for a signed type");
+}
+
+#[test]
+fn next_scan_signed_decrease_across_zero() {
+    let target = CellTarget::new(BASE, buf_with_i32(4, 1));
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "1")))
+        .unwrap();
+
+    scanner.target().poke(BASE + 4, &(-1i32).to_le_bytes());
+    let r = scanner.next_scan(ScanCompareType::Decreased, None).unwrap();
+    assert_eq!(r.len(), 1, "1 -> -1 must count as Decreased for a signed type");
+}
+
+#[test]
+fn next_scan_unsigned_still_uses_unsigned_order() {
+    // The same bytes under U32: 0xFFFFFFFF -> 1 is a *decrease*.
+    let target = CellTarget::new(BASE, buf_with_i32(4, -1));
+    let mut scanner = Scanner::new(target, ScanValueType::U32);
+    scanner
+        .first_scan(
+            ScanCompareType::Exact,
+            Some(needle(ScanValueType::U32, "4294967295")),
+        )
+        .unwrap();
+    assert_eq!(scanner.results().len(), 1);
+
+    scanner.target().poke(BASE + 4, &1u32.to_le_bytes());
+    assert_eq!(
+        scanner
+            .clone_for_test()
+            .next_scan(ScanCompareType::Increased, None)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        scanner.next_scan(ScanCompareType::Decreased, None).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn next_scan_float_order_is_not_bitwise() {
+    // -1.5 -> -0.5 is an increase, but 0xBFC00000 -> 0xBF000000 is a decrease
+    // as a raw magnitude.
+    let target = CellTarget::new(BASE, buf_with_f32(8, -1.5));
+    let mut scanner = Scanner::new(target, ScanValueType::F32);
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::F32, "-1.5")))
+        .unwrap();
+    assert_eq!(scanner.results().len(), 1);
+
+    scanner.target().poke(BASE + 8, &(-0.5f32).to_le_bytes());
+    let r = scanner.next_scan(ScanCompareType::Increased, None).unwrap();
+    assert_eq!(r.len(), 1, "-1.5 -> -0.5 must count as Increased for a float");
+}
+
+#[test]
+fn next_scan_float_unchanged_tolerates_ulp() {
+    // A 1-ULP wobble is not a change: the needle-less path now uses the same
+    // tolerance the needle-ful one always did, instead of byte equality.
+    let start = 3.25f32;
+    let target = CellTarget::new(BASE, buf_with_f32(0, start));
+    let mut scanner = Scanner::new(target, ScanValueType::F32);
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::F32, "3.25")))
+        .unwrap();
+
+    let nudged = f32::from_bits(start.to_bits() + 1);
+    assert_ne!(nudged.to_le_bytes(), start.to_le_bytes());
+    scanner.target().poke(BASE, &nudged.to_le_bytes());
+
+    assert_eq!(
+        scanner
+            .clone_for_test()
+            .next_scan(ScanCompareType::Changed, None)
+            .unwrap()
+            .len(),
+        0,
+        "a 1-ULP wobble is not a Changed match"
+    );
+    assert_eq!(
+        scanner.next_scan(ScanCompareType::Unchanged, None).unwrap().len(),
+        1
+    );
+}
+
+// ── next scan: unreadable addresses ────────────────────────────────────────
+
+/// A target whose `read` fails for a chosen set of addresses, modelling memory
+/// freed between two scans. `MockTarget` cannot express this — it returns
+/// `Ok(0)` out of range rather than an error.
+#[derive(Clone)]
+struct FailingTarget {
+    base: usize,
+    buf: Vec<u8>,
+    poisoned: Vec<usize>,
+}
+
+impl crate::ScanTarget for FailingTarget {
+    fn regions(&self) -> nemclass_core::Result<Vec<Region>> {
+        Ok(vec![Region::new(self.base, self.buf.len())])
+    }
+
+    fn read(&self, addr: usize, buf: &mut [u8]) -> nemclass_core::Result<usize> {
+        if self.poisoned.contains(&addr) {
+            return Err(nemclass_core::Error::ProcessNotFound);
+        }
+        let off = addr - self.base;
+        let n = buf.len().min(self.buf.len().saturating_sub(off));
+        buf[..n].copy_from_slice(&self.buf[off..off + n]);
+        Ok(n)
+    }
+}
+
+#[test]
+fn next_scan_skips_unreadable_addresses() {
+    // Two matches; the first address is unmapped by the time the next scan runs.
+    let mut buf = buf_with_i32(4, 55);
+    buf[12..16].copy_from_slice(&55i32.to_le_bytes());
+    let target = FailingTarget {
+        base: BASE,
+        buf,
+        poisoned: vec![],
+    };
+
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "55")))
+        .unwrap();
+    assert_eq!(scanner.results().len(), 2);
+
+    scanner.target_mut().poisoned = vec![BASE + 4];
+    let r = scanner
+        .next_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "55")))
+        .unwrap();
+
+    assert_eq!(r.len(), 1, "one dead address must not take the survivor with it");
+    assert_eq!(r.iter().next().unwrap().address, BASE + 12);
+    assert_eq!(scanner.last_scan_stats().unreadable, 1);
+    assert_eq!(scanner.last_scan_stats().scanned, 2);
+}
+
+#[test]
+fn next_scan_all_unreadable_is_an_error_not_an_empty_result() {
+    let target = FailingTarget {
+        base: BASE,
+        buf: buf_with_i32(4, 55),
+        poisoned: vec![],
+    };
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "55")))
+        .unwrap();
+    let before = scanner.results().len();
+
+    scanner.target_mut().poisoned = vec![BASE + 4];
+    let err = scanner
+        .next_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "55")))
+        .unwrap_err();
+
+    assert!(matches!(err, crate::ScanError::TargetUnreadable(_)));
+    assert_eq!(
+        scanner.results().len(),
+        before,
+        "a dead target must not look like a narrowing to zero"
+    );
+}
+
+// ── value type changes mid-session ─────────────────────────────────────────
+
+#[test]
+fn set_value_type_rejects_a_width_change() {
+    let mut scanner = Scanner::new(MockTarget::new(BASE, vec![0u8; 16]), ScanValueType::I32);
+    assert!(!scanner.set_value_type(ScanValueType::I64));
+    assert!(!scanner.set_value_type(ScanValueType::Bytes));
+    assert_eq!(scanner.value_type(), ScanValueType::I32);
+}
+
+#[test]
+fn set_value_type_accepts_same_width_reinterpretation() {
+    let mut scanner = Scanner::new(MockTarget::new(BASE, vec![0u8; 16]), ScanValueType::I32);
+    assert!(scanner.set_value_type(ScanValueType::F32));
+    assert_eq!(scanner.value_type(), ScanValueType::F32);
+    assert!(scanner.set_value_type(ScanValueType::U32));
+    assert_eq!(scanner.value_type(), ScanValueType::U32);
 }

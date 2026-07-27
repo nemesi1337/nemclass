@@ -72,6 +72,51 @@ impl ScanValueType {
         matches!(self, Self::StringUtf8 | Self::StringUtf16)
     }
 
+    /// Compares `cur` against `prev` for a change-relative next scan that has no
+    /// needle (`Increased`/`Decreased`/`Changed`/`Unchanged`).
+    ///
+    /// Interprets both spans *as this type* rather than as a raw magnitude, so
+    /// `Increased` is true for an `i32` going `-1 → 1` and for an `f32` going
+    /// `-1.5 → -0.5`; a bytewise or unsigned comparison gets both of those
+    /// backwards. Routes through the same [`compare_int`]/[`compare_float`] the
+    /// needle-ful path uses, with a zero needle the change-relative arms ignore.
+    ///
+    /// Variable-width types have no numeric ordering: `Changed`/`Unchanged` fall
+    /// back to byte (in)equality and `Increased`/`Decreased` never match. Any
+    /// needle-requiring compare returns `false` — the [`crate::Scanner`] rejects
+    /// those before they reach here.
+    pub fn compare_change(&self, compare: ScanCompareType, cur: &[u8], prev: &[u8]) -> bool {
+        let Some(width) = self.fixed_width() else {
+            return match compare {
+                ScanCompareType::Changed => cur != prev,
+                ScanCompareType::Unchanged => cur == prev,
+                _ => false,
+            };
+        };
+        if cur.len() < width || prev.len() < width {
+            return false;
+        }
+        match self {
+            Self::F32 | Self::F64 => {
+                let (Some(c), Some(p)) = (read_float(cur, 0, width), read_float(prev, 0, width))
+                else {
+                    return false;
+                };
+                compare_float(compare, c, 0.0, None, Some(p), DEFAULT_FLOAT_TOLERANCE)
+            }
+            _ => {
+                let signed = is_signed(*self);
+                let (Some(c), Some(p)) = (
+                    read_int(cur, 0, width, signed),
+                    read_int(prev, 0, width, signed),
+                ) else {
+                    return false;
+                };
+                compare_int(compare, c, 0, None, Some(p))
+            }
+        }
+    }
+
     /// The canonical lowercase tag for this type — the stable string used by the
     /// JS `scan.value` API and by [`crate::pointerscan`]/cheat-table persistence.
     pub const fn as_tag(&self) -> &'static str {

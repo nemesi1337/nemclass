@@ -183,6 +183,11 @@ impl ScannerPanel {
                 Err(msg) => self.status_msg = Some(msg),
                 Ok((scanner, scan_result)) => {
                     self.scanner = Some(scanner);
+                    // A session is now active, so the compare list has switched
+                    // to the next-scan vocabulary. Snap the selection into it
+                    // here rather than in the draw code, so the combo never shows
+                    // a value absent from its own list.
+                    self.compare = snap_compare(self.compare, true);
                     match scan_result {
                         Ok(snapshot) => {
                             self.result_snapshot = snapshot;
@@ -197,12 +202,30 @@ impl ScannerPanel {
                                     .scanner
                                     .as_ref()
                                     .is_some_and(|s| s.scanned_region_count() == 0);
-                            self.status_msg = scope_matched_nothing.then(|| {
-                                "Scan range matched no memory — the address window, selected \
-                                 modules and memory-type filters don't overlap any region. \
-                                 Widen the range or untick \"Restrict scan range\"."
-                                    .to_string()
-                            });
+                            // A next scan silently drops results whose address is
+                            // no longer mapped. Say how many, so a result count
+                            // that fell further than expected is explained.
+                            let dropped = if self.last_job_was_first_scan {
+                                0
+                            } else {
+                                self.scanner
+                                    .as_ref()
+                                    .map_or(0, |s| s.last_scan_stats().unreadable)
+                            };
+                            self.status_msg = if scope_matched_nothing {
+                                Some(
+                                    "Scan range matched no memory — the address window, selected \
+                                     modules and memory-type filters don't overlap any region. \
+                                     Widen the range or untick \"Restrict scan range\"."
+                                        .to_string(),
+                                )
+                            } else if dropped > 0 {
+                                Some(format!(
+                                    "{dropped} address(es) are no longer readable and were dropped."
+                                ))
+                            } else {
+                                None
+                            };
                         }
                         Err(msg) => self.status_msg = Some(msg),
                     }
@@ -287,22 +310,40 @@ impl ScannerPanel {
         modules: &[ModuleInfoWithName],
         rt: &tokio::runtime::Handle,
     ) {
+        // A scan session is active: the results hold spans of the session's value
+        // type, so the type is locked and the compare list switches to the
+        // next-scan vocabulary.
+        let has_scan = {
+            #[cfg(target_os = "linux")]
+            { self.scanner.is_some() }
+            #[cfg(not(target_os = "linux"))]
+            { false }
+        };
+
         ui.horizontal(|ui| {
-            // Value type selector.
-            egui::ComboBox::from_id_salt("scan_vtype")
-                .selected_text(value_type_label(self.value_type))
-                .show_ui(ui, |ui| {
-                    for &vt in ALL_VALUE_TYPES {
-                        let label = value_type_label(vt);
-                        ui.selectable_value(&mut self.value_type, vt, label);
-                    }
-                });
+            // Value type selector. Locked while a session is active: the stored
+            // previous values are this type's width, so switching would compare
+            // truncated or over-long spans.
+            ui.add_enabled_ui(!has_scan, |ui| {
+                egui::ComboBox::from_id_salt("scan_vtype")
+                    .selected_text(value_type_label(self.value_type))
+                    .show_ui(ui, |ui| {
+                        for &vt in ALL_VALUE_TYPES {
+                            let label = value_type_label(vt);
+                            ui.selectable_value(&mut self.value_type, vt, label);
+                        }
+                    })
+                    .response
+                    .on_disabled_hover_text(
+                        "Value type is fixed for this scan session — press New Scan to change it.",
+                    );
+            });
 
             // Compare type selector.
             egui::ComboBox::from_id_salt("scan_compare")
                 .selected_text(compare_label(self.compare))
                 .show_ui(ui, |ui| {
-                    for &ct in ALL_COMPARE_TYPES {
+                    for &ct in available_compares(has_scan) {
                         ui.selectable_value(&mut self.compare, ct, compare_label(ct));
                     }
                 });
@@ -353,12 +394,6 @@ impl ScannerPanel {
             }
 
             // Next Scan.
-            let has_scan = {
-                #[cfg(target_os = "linux")]
-                { self.scanner.is_some() }
-                #[cfg(not(target_os = "linux"))]
-                { false }
-            };
             ui.add_enabled_ui(has_scan && !scanning, |ui| {
                 #[cfg(target_os = "linux")]
                 if ui.button("Next Scan").clicked() {
@@ -773,6 +808,9 @@ impl ScannerPanel {
             self.scanner = None;
         }
         self.result_snapshot.clear();
+        // Back to a first-scan session: a change-relative compare has nothing to
+        // compare against any more.
+        self.compare = snap_compare(self.compare, false);
         self.status_msg = None;
     }
 
@@ -784,7 +822,18 @@ impl ScannerPanel {
     /// A missing or empty upper-bound field is treated as a parse error so the
     /// user always gets a meaningful two-sided range, never a silent `> value`.
     fn parse_needle(&mut self) -> Option<Needle> {
-        if !self.compare.needs_needle() || self.needle_text.trim().is_empty() {
+        // Two very different situations used to collapse into a silent `None`:
+        // a compare that legitimately takes no needle, and a compare that needs
+        // one from an empty field. The second must say so — otherwise the scan
+        // button simply does nothing.
+        if !self.compare.needs_needle() {
+            return None;
+        }
+        if self.needle_text.trim().is_empty() {
+            self.status_msg = Some(format!(
+                "{} needs a value — the field is empty.",
+                compare_label(self.compare)
+            ));
             return None;
         }
         let needle = match self.value_type.parse_needle(&self.needle_text) {
@@ -1076,13 +1125,28 @@ const ALL_VALUE_TYPES: &[ScanValueType] = &[
     ScanValueType::StringUtf16,
 ];
 
-const ALL_COMPARE_TYPES: &[ScanCompareType] = &[
+/// Compares offered before any scan: the absolute kinds plus the "unknown
+/// initial value" baseline. The change-relative kinds are absent because there
+/// is nothing to compare against yet.
+const FIRST_SCAN_COMPARES: &[ScanCompareType] = &[
     ScanCompareType::Exact,
     ScanCompareType::NotEqual,
     ScanCompareType::GreaterThan,
     ScanCompareType::LessThan,
     ScanCompareType::Between,
     ScanCompareType::Unknown,
+];
+
+/// Compares offered once a session is under way: the absolute kinds stay
+/// available (re-narrowing by value is normal), the change-relative kinds
+/// appear, and `Unknown` disappears — it accepts everything, so on a next scan
+/// it is either a no-op or a wipe. Cheat Engine hides it the same way.
+const NEXT_SCAN_COMPARES: &[ScanCompareType] = &[
+    ScanCompareType::Exact,
+    ScanCompareType::NotEqual,
+    ScanCompareType::GreaterThan,
+    ScanCompareType::LessThan,
+    ScanCompareType::Between,
     ScanCompareType::Increased,
     ScanCompareType::IncreasedBy,
     ScanCompareType::Decreased,
@@ -1090,6 +1154,36 @@ const ALL_COMPARE_TYPES: &[ScanCompareType] = &[
     ScanCompareType::Changed,
     ScanCompareType::Unchanged,
 ];
+
+/// The compares the combo offers, given whether a scan session is active.
+///
+/// Split out of the draw code so the invariant that matters — the selected
+/// compare is always present in the list being drawn — is unit-testable without
+/// an `egui::Ui`.
+fn available_compares(has_scan: bool) -> &'static [ScanCompareType] {
+    if has_scan {
+        NEXT_SCAN_COMPARES
+    } else {
+        FIRST_SCAN_COMPARES
+    }
+}
+
+/// Keeps `compare` inside [`available_compares`] when a session starts or ends.
+///
+/// Without this the combo can display a value absent from its own list: after a
+/// first scan `Unknown` has no next-scan meaning (Cheat Engine's own post-unknown
+/// default is `Changed`), and after `New Scan` a change-relative kind has nothing
+/// to compare against.
+fn snap_compare(compare: ScanCompareType, has_scan: bool) -> ScanCompareType {
+    if available_compares(has_scan).contains(&compare) {
+        return compare;
+    }
+    if has_scan {
+        ScanCompareType::Changed
+    } else {
+        ScanCompareType::Exact
+    }
+}
 
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1281,4 +1375,91 @@ mod tests {
         assert_eq!(parse_opt_hex("20"), Ok(Some(0x20)));
         assert_eq!(parse_opt_hex("nope"), Err(()));
     }
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_is_first_scan_only() {
+        assert!(available_compares(false).contains(&ScanCompareType::Unknown));
+        assert!(
+            !available_compares(true).contains(&ScanCompareType::Unknown),
+            "Unknown on a next scan accepts everything — it must not be offered"
+        );
+    }
+
+    #[test]
+    fn change_relative_compares_need_a_session() {
+        for ct in [
+            ScanCompareType::Increased,
+            ScanCompareType::Decreased,
+            ScanCompareType::Changed,
+            ScanCompareType::Unchanged,
+            ScanCompareType::IncreasedBy,
+            ScanCompareType::DecreasedBy,
+        ] {
+            assert!(!available_compares(false).contains(&ct), "{ct:?}");
+            assert!(available_compares(true).contains(&ct), "{ct:?}");
+        }
+    }
+
+    #[test]
+    fn every_offered_compare_is_selectable_in_its_own_list() {
+        // The invariant the combo depends on: whatever `snap_compare` returns is
+        // present in the list drawn for that session state.
+        for &has_scan in &[false, true] {
+            for &ct in ALL_COMPARE_TYPES_FOR_TEST {
+                let snapped = snap_compare(ct, has_scan);
+                assert!(
+                    available_compares(has_scan).contains(&snapped),
+                    "{ct:?} snapped to {snapped:?}, absent from the has_scan={has_scan} list"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapping_leaves_a_valid_compare_alone() {
+        assert_eq!(
+            snap_compare(ScanCompareType::Exact, true),
+            ScanCompareType::Exact
+        );
+        assert_eq!(
+            snap_compare(ScanCompareType::Between, false),
+            ScanCompareType::Between
+        );
+    }
+
+    #[test]
+    fn unknown_snaps_to_changed_after_a_first_scan() {
+        assert_eq!(
+            snap_compare(ScanCompareType::Unknown, true),
+            ScanCompareType::Changed
+        );
+    }
+
+    #[test]
+    fn change_relative_snaps_back_to_exact_on_new_scan() {
+        assert_eq!(
+            snap_compare(ScanCompareType::Increased, false),
+            ScanCompareType::Exact
+        );
+    }
+
+    const ALL_COMPARE_TYPES_FOR_TEST: &[ScanCompareType] = &[
+        ScanCompareType::Exact,
+        ScanCompareType::NotEqual,
+        ScanCompareType::GreaterThan,
+        ScanCompareType::LessThan,
+        ScanCompareType::Between,
+        ScanCompareType::Unknown,
+        ScanCompareType::Increased,
+        ScanCompareType::IncreasedBy,
+        ScanCompareType::Decreased,
+        ScanCompareType::DecreasedBy,
+        ScanCompareType::Changed,
+        ScanCompareType::Unchanged,
+    ];
 }

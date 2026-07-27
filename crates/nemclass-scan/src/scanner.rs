@@ -7,12 +7,108 @@
 //! ported — a single-threaded chunked walk keeps the engine dependency-free and
 //! deterministic for tests; a caller can shard regions across threads later.
 
-use nemclass_core::Result;
-
 use crate::compare::ScanCompareType;
 use crate::results::{ScanResult, ScanResults};
 use crate::target::{Region, RegionFilter, ScanTarget};
 use crate::value_type::{Needle, ScanValueType};
+
+/// The result type of a scan pass.
+pub type Result<T> = core::result::Result<T, ScanError>;
+
+/// Why a scan could not run, or could not run to completion.
+///
+/// Every variant used to be a single opaque `Error::InvalidString`, which left
+/// the UI showing "invalid string" for six unrelated mistakes. Callers format
+/// this with `Display`, so the message reaches the status line as-is.
+/// `nemclass_core::Error` is neither `Clone` nor `Eq`, so neither is this; tests
+/// match on it with `matches!` rather than `assert_eq!`.
+#[derive(Debug)]
+pub enum ScanError {
+    /// A next scan was requested before any first scan.
+    NeedsFirstScan,
+    /// A change-relative compare was used on a first scan, where there is no
+    /// previous value to compare against.
+    CompareNeedsPrevious(ScanCompareType),
+    /// [`ScanCompareType::Unknown`] was used on a next scan; it is a first-scan
+    /// baseline only.
+    CompareIsFirstScanOnly(ScanCompareType),
+    /// A compare that requires a needle was given none.
+    MissingNeedle(ScanCompareType),
+    /// The needle's type does not match the scanner's.
+    NeedleTypeMismatch {
+        /// The type the needle was parsed as.
+        needle: ScanValueType,
+        /// The type this scan session searches for.
+        scanner: ScanValueType,
+    },
+    /// A needle-less scan on a variable-width type, which has no stride to
+    /// step by.
+    NoStride(ScanValueType),
+    /// Every address in the previous generation failed to read — the process is
+    /// almost certainly gone. Distinguished from "narrowed to zero results" so a
+    /// dead target never looks like a successful scan.
+    TargetUnreadable(nemclass_core::Error),
+    /// Enumerating the target's regions failed.
+    Target(nemclass_core::Error),
+}
+
+impl core::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NeedsFirstScan => write!(f, "no scan session yet — run a first scan"),
+            Self::CompareNeedsPrevious(c) => write!(
+                f,
+                "{c:?} compares against the previous scan's value, so it needs a next scan"
+            ),
+            Self::CompareIsFirstScanOnly(c) => write!(
+                f,
+                "{c:?} is a first-scan baseline only — narrow with Changed/Increased/Decreased \
+                 or an exact value instead"
+            ),
+            Self::MissingNeedle(c) => write!(f, "{c:?} needs a value"),
+            Self::NeedleTypeMismatch { needle, scanner } => write!(
+                f,
+                "value is a {} but this scan session searches for {} — press New Scan to \
+                 change the type",
+                needle.as_tag(),
+                scanner.as_tag()
+            ),
+            Self::NoStride(ty) => write!(
+                f,
+                "{} has no fixed width, so it needs an explicit value to scan for",
+                ty.as_tag()
+            ),
+            Self::TargetUnreadable(e) => {
+                write!(f, "no result address could be read ({e}) — has the process exited?")
+            }
+            Self::Target(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
+
+impl From<nemclass_core::Error> for ScanError {
+    fn from(e: nemclass_core::Error) -> Self {
+        Self::Target(e)
+    }
+}
+
+/// Per-pass counters from the last completed scan.
+///
+/// `unreadable` is the interesting one: a next scan re-reads addresses that a
+/// previous generation matched, and any of them may have been freed or unmapped
+/// since. Those results are dropped individually, and this is how a caller can
+/// tell the user that happened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    /// Candidate positions (first scan) or previous results (next scan) examined.
+    pub scanned: usize,
+    /// How many matched.
+    pub matched: usize,
+    /// How many previous results could not be read back and were dropped.
+    pub unreadable: usize,
+}
 
 /// The read buffer size for the first-scan chunked region walk (a handful of
 /// pages). Regions larger than this are read in overlapping windows so a value
@@ -58,6 +154,8 @@ pub struct Scanner<T: ScanTarget> {
     history: Vec<ScanResults>,
     /// Whether a first scan has run yet (a next scan before one is an error).
     has_scanned: bool,
+    /// Counters from the last completed pass.
+    last_stats: ScanStats,
 }
 
 impl<T: ScanTarget> Scanner<T> {
@@ -70,6 +168,7 @@ impl<T: ScanTarget> Scanner<T> {
             scanned_regions: 0,
             history: Vec::new(),
             has_scanned: false,
+            last_stats: ScanStats::default(),
         }
     }
 
@@ -101,6 +200,26 @@ impl<T: ScanTarget> Scanner<T> {
     /// The value type this scanner searches for.
     pub fn value_type(&self) -> ScanValueType {
         self.value_type
+    }
+
+    /// Reinterprets the existing results as a different value type of the *same*
+    /// width (e.g. `i32` ↔ `u32` ↔ `f32`), returning `false` and changing
+    /// nothing otherwise.
+    ///
+    /// A width change is refused because the captured spans in the history are
+    /// the old width, so every stored previous value would be truncated or read
+    /// past — the caller must start a new scan instead.
+    pub fn set_value_type(&mut self, value_type: ScanValueType) -> bool {
+        if value_type.fixed_width() != self.value_type.fixed_width() {
+            return false;
+        }
+        self.value_type = value_type;
+        true
+    }
+
+    /// Counters from the last completed scan pass.
+    pub fn last_scan_stats(&self) -> ScanStats {
+        self.last_stats
     }
 
     /// The current result generation, or an empty set before any scan.
@@ -154,7 +273,7 @@ impl<T: ScanTarget> Scanner<T> {
         // A first scan cannot use a change-relative compare (there is no previous
         // value yet) — except `Unknown`, which is *defined* as the baseline.
         if compare.needs_previous() {
-            return Err(needle_error());
+            return Err(ScanError::CompareNeedsPrevious(compare));
         }
         self.validate_needle(compare, needle.as_ref())?;
 
@@ -162,18 +281,31 @@ impl<T: ScanTarget> Scanner<T> {
         if stride == 0 {
             // No fixed width and no needle (e.g. `Unknown` on a string/`Bytes`
             // type): nothing sensible to step by.
-            return Err(needle_error());
+            return Err(ScanError::NoStride(self.value_type));
         }
 
         let regions = self.region_filter.apply(&self.target.regions()?);
         self.scanned_regions = regions.len();
         let mut results = ScanResults::new();
         let mut buf = vec![0u8; CHUNK_SIZE.max(stride)];
+        let mut scanned = 0usize;
 
         for region in &regions {
-            self.scan_region_first(region, compare, needle.as_ref(), stride, &mut buf, &mut results)?;
+            scanned += self.scan_region_first(
+                region,
+                compare,
+                needle.as_ref(),
+                stride,
+                &mut buf,
+                &mut results,
+            )?;
         }
 
+        self.last_stats = ScanStats {
+            scanned,
+            matched: results.len(),
+            unreadable: 0,
+        };
         self.push_generation(results);
         self.has_scanned = true;
         Ok(self.results())
@@ -183,43 +315,87 @@ impl<T: ScanTarget> Scanner<T> {
     /// addresses and re-comparing (a next scan).
     ///
     /// Change-relative comparisons here see each result's captured
-    /// `previous_value_bytes` as the previous value. Must follow a
-    /// [`Scanner::first_scan`]; returns an error otherwise.
+    /// `previous_value_bytes` as the previous value, interpreted *as the
+    /// scanner's value type* — so `Increased` respects signedness and float
+    /// ordering rather than raw byte magnitude.
+    ///
+    /// Must follow a [`Scanner::first_scan`]; returns an error otherwise, as it
+    /// does for [`ScanCompareType::Unknown`], which is a first-scan baseline
+    /// only. An address that can no longer be read drops that one result; the
+    /// count is reported in [`Scanner::last_scan_stats`]. If *every* address
+    /// fails the pass errors with [`ScanError::TargetUnreadable`] and leaves the
+    /// current generation untouched.
     pub fn next_scan(
         &mut self,
         compare: ScanCompareType,
         needle: Option<Needle>,
     ) -> Result<&ScanResults> {
         if !self.has_scanned {
-            return Err(needle_error());
+            return Err(ScanError::NeedsFirstScan);
+        }
+        // "Unknown initial value" accepts every candidate, which is meaningful
+        // only as a first-scan baseline. Reject it here — *before* pushing a
+        // generation — so the user's result set survives the mistake instead of
+        // being silently emptied.
+        if compare.is_baseline() {
+            return Err(ScanError::CompareIsFirstScanOnly(compare));
         }
         self.validate_needle(compare, needle.as_ref())?;
 
         let stride = self.stride(compare, needle.as_ref());
         if stride == 0 {
-            return Err(needle_error());
+            return Err(ScanError::NoStride(self.value_type));
         }
 
         let previous = self.results().clone();
         let mut results = ScanResults::new();
         let mut buf = vec![0u8; stride];
+        let mut unreadable = 0usize;
+        let mut last_err = None;
 
         for prev in previous.iter() {
             // Re-read exactly this result's span and re-compare against its
-            // captured previous bytes.
-            let read = self.target.read(prev.address, &mut buf)?;
-            if read < stride {
-                continue;
+            // captured previous bytes. An address that has since been freed or
+            // unmapped drops just that result: a long-running target recycles
+            // memory constantly, and aborting the whole pass would make every
+            // scan session die the first time one candidate went away.
+            match self.target.read(prev.address, &mut buf) {
+                Ok(read) if read >= stride => {}
+                Ok(_) => {
+                    unreadable += 1;
+                    continue;
+                }
+                Err(e) => {
+                    unreadable += 1;
+                    last_err = Some(e);
+                    continue;
+                }
             }
             let matched = match &needle {
                 Some(n) => n.compare_next(&buf, 0, compare, &prev.previous_value_bytes),
-                None => compare_needleless_next(compare, &buf, &prev.previous_value_bytes, stride),
+                None => self
+                    .value_type
+                    .compare_change(compare, &buf[..stride], &prev.previous_value_bytes),
             };
             if matched {
                 results.push(ScanResult::new(prev.address, buf[..stride].to_vec()));
             }
         }
 
+        // Everything gone is not a narrowing — it is a dead target. Report it
+        // and leave the current generation intact rather than handing back an
+        // empty result set that reads as "your value isn't there any more".
+        if unreadable == previous.len() && !previous.is_empty() {
+            return Err(ScanError::TargetUnreadable(
+                last_err.unwrap_or(nemclass_core::Error::ProcessNotFound),
+            ));
+        }
+
+        self.last_stats = ScanStats {
+            scanned: previous.len(),
+            matched: results.len(),
+            unreadable,
+        };
         self.push_generation(results);
         Ok(self.results())
     }
@@ -236,6 +412,7 @@ impl<T: ScanTarget> Scanner<T> {
 
     /// Walks one region in overlapping [`CHUNK_SIZE`] windows, comparing every
     /// stride-aligned position, and appends matches (ascending address).
+    /// Returns how many candidate positions were examined.
     fn scan_region_first(
         &self,
         region: &Region,
@@ -244,9 +421,10 @@ impl<T: ScanTarget> Scanner<T> {
         stride: usize,
         buf: &mut [u8],
         out: &mut ScanResults,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let mut addr = region.base;
         let region_end = region.end();
+        let mut scanned = 0usize;
 
         while addr < region_end {
             // Never read past the region: cap the request to what remains.
@@ -262,6 +440,7 @@ impl<T: ScanTarget> Scanner<T> {
             // The last position where a full stride still fits in what we read.
             let last = read - stride;
             for off in 0..=last {
+                scanned += 1;
                 let matched = match needle {
                     Some(n) => n.compare_first(&buf[..read], off, compare),
                     None => matches!(compare, ScanCompareType::Unknown),
@@ -279,7 +458,7 @@ impl<T: ScanTarget> Scanner<T> {
             let step = (read - (stride - 1)).max(1);
             addr += step;
         }
-        Ok(())
+        Ok(scanned)
     }
 
     /// The scan stride: the needle's width when present, else the type's fixed
@@ -298,12 +477,15 @@ impl<T: ScanTarget> Scanner<T> {
         match needle {
             Some(n) => {
                 if n.value_type() != self.value_type {
-                    return Err(needle_error());
+                    return Err(ScanError::NeedleTypeMismatch {
+                        needle: n.value_type(),
+                        scanner: self.value_type,
+                    });
                 }
             }
             None => {
                 if compare.needs_needle() {
-                    return Err(needle_error());
+                    return Err(ScanError::MissingNeedle(compare));
                 }
             }
         }
@@ -332,6 +514,7 @@ impl<T: ScanTarget + Clone> Scanner<T> {
             scanned_regions: self.scanned_regions,
             history: self.history.clone(),
             has_scanned: self.has_scanned,
+            last_stats: self.last_stats,
         }
     }
 }
@@ -339,45 +522,3 @@ impl<T: ScanTarget + Clone> Scanner<T> {
 /// A shared empty result set for [`Scanner::results`] before the first scan.
 static EMPTY_RESULTS: ScanResults = ScanResults::new_const();
 
-/// Compares a needle-less change-relative next scan by reinterpreting both the
-/// current and previous bytes for the scanner's fixed width. Used when the
-/// caller passed no needle (pure `Increased`/`Decreased`/`Changed`/`Unchanged`).
-fn compare_needleless_next(
-    compare: ScanCompareType,
-    cur: &[u8],
-    prev: &[u8],
-    stride: usize,
-) -> bool {
-    if cur.len() < stride || prev.len() < stride {
-        return false;
-    }
-    // Byte-wise change comparisons don't need a type: `Changed`/`Unchanged` are
-    // pure byte inequality/equality. `Increased`/`Decreased` need a numeric
-    // interpretation, so they compare the little-endian magnitude.
-    match compare {
-        ScanCompareType::Changed => cur[..stride] != prev[..stride],
-        ScanCompareType::Unchanged => cur[..stride] == prev[..stride],
-        ScanCompareType::Increased => le_magnitude(&cur[..stride]) > le_magnitude(&prev[..stride]),
-        ScanCompareType::Decreased => le_magnitude(&cur[..stride]) < le_magnitude(&prev[..stride]),
-        // Anything else here is a needle-requiring compare and is rejected before
-        // reaching this point.
-        _ => false,
-    }
-}
-
-/// The unsigned little-endian magnitude of up to 16 bytes (used for a needle-less
-/// `Increased`/`Decreased`, where no signedness is known).
-fn le_magnitude(bytes: &[u8]) -> u128 {
-    let mut acc = 0u128;
-    for (i, &b) in bytes.iter().take(16).enumerate() {
-        acc |= (b as u128) << (8 * i);
-    }
-    acc
-}
-
-/// The generic error a scanner returns for a misuse (missing/mismatched needle,
-/// next scan before a first scan, no stride). Reuses the core error vocabulary
-/// so callers keep a single `Result` type.
-fn needle_error() -> nemclass_core::Error {
-    nemclass_core::Error::InvalidString
-}

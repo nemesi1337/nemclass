@@ -1396,6 +1396,14 @@ mod inner {
                 let tag = as_str(arg(args, 0)?)?;
                 let compare = ScanCompareType::from_tag(&tag)
                     .ok_or_else(|| format!("scan.next: unknown compare {tag:?}"))?;
+                // The engine rejects this too, but naming the API here makes the
+                // script error actionable rather than generic.
+                if compare.is_baseline() {
+                    return Err(format!(
+                        "scan.next: {tag:?} is a first-scan baseline — pass it to scan.first, \
+                         then narrow with \"changed\"/\"increased\"/\"decreased\" or a value"
+                    ));
+                }
                 let scanner = self
                     .script_scanner
                     .as_mut()
