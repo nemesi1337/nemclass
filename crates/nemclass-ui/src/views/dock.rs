@@ -28,6 +28,8 @@ pub enum TabKind {
     ClassView,
     /// Navigator: strings / functions / calls discovered by a dissect.
     Navigator,
+    /// Modules: checkbox list picking which modules the disassembler shows.
+    Modules,
     /// Raw hex dump viewer.
     Memory,
     /// Disassembler.
@@ -50,6 +52,7 @@ impl TabKind {
         match self {
             TabKind::ClassView => "Classes",
             TabKind::Navigator => "Navigator",
+            TabKind::Modules => "Modules",
             TabKind::Memory => "Memory",
             TabKind::Disassembly => "Disassembly",
             TabKind::Scanner => "Scanner",
@@ -61,9 +64,10 @@ impl TabKind {
     }
 
     /// Every tab kind, for building the "View" menu that re-opens closed panels.
-    pub const ALL: [TabKind; 9] = [
+    pub const ALL: [TabKind; 10] = [
         TabKind::ClassView,
         TabKind::Navigator,
+        TabKind::Modules,
         TabKind::Memory,
         TabKind::Disassembly,
         TabKind::Scanner,
@@ -79,7 +83,7 @@ impl TabKind {
 /// debugger / scripts share a panel below the right split. Users rearrange it
 /// freely; this is only the first-run / "Reset layout" arrangement.
 pub fn default_layout() -> DockState<TabKind> {
-    let mut state = DockState::new(vec![TabKind::ClassView, TabKind::Navigator]);
+    let mut state = DockState::new(vec![TabKind::ClassView, TabKind::Navigator, TabKind::Modules]);
     let surface = state.main_surface_mut();
 
     // Right ~55%: the Cheat-Engine-style "Memory View" — hex dump on top,
@@ -114,6 +118,7 @@ impl TabViewer for DockViewer<'_> {
         match tab {
             TabKind::ClassView => self.app.show_class_view(ui),
             TabKind::Navigator => self.app.show_navigator_tab(ui),
+            TabKind::Modules => self.app.show_modules_tab(ui),
             TabKind::Memory => self.app.show_memory_viewer(ui),
             TabKind::Disassembly => self.app.show_disassembly_tab(ui),
             TabKind::Scanner => self.app.show_scanner_tab(ui),

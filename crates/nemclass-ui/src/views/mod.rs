@@ -21,6 +21,7 @@ mod memory_viewer;
 mod disassembly;
 mod dock;
 mod navigator;
+mod modules_panel;
 mod settings;
 mod key_file;
 mod script_host;
@@ -407,6 +408,9 @@ pub struct NemclassApp {
     // Navigator side panel (strings / functions / calls)
     navigator_panel: navigator::NavigatorPanel,
 
+    // Modules panel (multi-select modules → disassembler linear view)
+    modules_panel: modules_panel::ModulesPanel,
+
     // Persistent user settings (~/.local/share/nemclass/settings.json).
     settings: settings::Settings,
     /// Set when a persisted setting changed; drives a debounced save in `logic`.
@@ -585,6 +589,7 @@ impl NemclassApp {
             pending_pointer_scan_action: None,
             cheat_table_panel: CheatTablePanel::new(),
             navigator_panel: navigator::NavigatorPanel::new(),
+            modules_panel: modules_panel::ModulesPanel::new(),
             settings,
             settings_dirty: false,
             // Start the heartbeat clock now so dock-layout drags get persisted on
@@ -764,6 +769,7 @@ impl NemclassApp {
             self.clear_memory_state();
             self.memory_viewer.on_detach();
             self.disassembly_panel.on_detach();
+            self.modules_panel.on_detach();
         }
 
         let Some(provider) = self.registry.get_arc(&self.selected_backend) else {
@@ -799,6 +805,8 @@ impl NemclassApp {
                 });
                 self.memory_viewer.on_attach(&proc);
                 self.disassembly_panel.on_attach(&proc);
+                #[cfg(target_os = "linux")]
+                self.modules_panel.on_attach(&Self::sorted_modules(&proc));
                 self.process = Some(proc);
                 self.last_error = None;
                 self.last_snapshot = None;
@@ -836,6 +844,8 @@ impl NemclassApp {
 
         self.memory_viewer.on_attach(&proc);
         self.disassembly_panel.on_attach(&proc);
+        #[cfg(target_os = "linux")]
+        self.modules_panel.on_attach(&Self::sorted_modules(&proc));
         self.attached_name = Some(format!("pid:{pid}"));
         self.process = Some(Arc::new(proc));
         self.last_error = None;
@@ -901,6 +911,7 @@ impl NemclassApp {
             self.debugger_panel.on_detach();
             self.memory_viewer.on_detach();
             self.disassembly_panel.on_detach();
+            self.modules_panel.on_detach();
             self.pointer_scan_panel.on_detach();
             self.cheat_table_panel.on_detach();
             // The script scan session is bound to the detached process; drop it.
@@ -2529,6 +2540,40 @@ impl NemclassApp {
                 }
             }
             None => {}
+        }
+    }
+
+    /// The target's loaded modules, base-sorted — the canonical ordering shared by
+    /// the disassembler and the Modules panel so their indices stay aligned.
+    #[cfg(target_os = "linux")]
+    fn sorted_modules(proc: &Process) -> Vec<ModuleInfoWithName> {
+        let mut v: Vec<ModuleInfoWithName> = proc.modules().map(|it| it.collect()).unwrap_or_default();
+        v.sort_by_key(|m| m.base);
+        v
+    }
+
+    /// The Modules panel: a checkbox list picking which modules the disassembler
+    /// unions into its concatenated linear view.
+    fn show_modules_tab(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_os = "linux")]
+        {
+            let modules = self
+                .process
+                .as_ref()
+                .map(|p| Self::sorted_modules(p))
+                .unwrap_or_default();
+            if let Some(sel) = self.modules_panel.show(ui, &modules)
+                && let Some(proc) = self.process.clone()
+            {
+                self.disassembly_panel.set_selected_modules(&sel, &proc);
+                self.pending_focus = Some(TabKind::Disassembly);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ui.centered_and_justified(|ui| {
+                ui.label("Modules are Linux-only for now.");
+            });
         }
     }
 

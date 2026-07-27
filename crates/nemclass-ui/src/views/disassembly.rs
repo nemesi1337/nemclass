@@ -97,8 +97,10 @@ pub struct DisassemblyPanel {
     // ── module / linear mode ──────────────────────────────────────────────
     #[cfg(target_os = "linux")]
     modules: Vec<ModuleInfoWithName>,
+    /// Modules whose executable regions are unioned into the linear view, as
+    /// ascending indices into `modules`. Driven by the Modules panel.
     #[cfg(target_os = "linux")]
-    selected_module: Option<usize>,
+    selected_modules: Vec<usize>,
     #[cfg(target_os = "linux")]
     mode: DisasmMode,
     /// Executable `(start, end)` regions of the module being browsed, sorted.
@@ -115,14 +117,16 @@ pub struct DisassemblyPanel {
     linear_next: Option<u64>,
 
     // ── dissect (cross-references) ────────────────────────────────────────
+    /// Aggregate cross-references across all selected modules (merged when more
+    /// than one module is dissected).
     #[cfg(target_os = "linux")]
-    dissect: Option<(usize, DissectResult)>,
+    dissect: Option<DissectResult>,
     #[cfg(target_os = "linux")]
     dissect_status: Option<String>,
-    /// In-flight dissect running on the background pool (scanning a whole module's
-    /// code can take seconds). Payload: `(module_index, result)`.
+    /// In-flight dissect running on the background pool (scanning a module's code
+    /// can take seconds; several modules are scanned and merged off-thread).
     #[cfg(target_os = "linux")]
-    dissect_job: BackgroundJob<(usize, Result<DissectResult, String>)>,
+    dissect_job: BackgroundJob<Result<DissectResult, String>>,
     /// Set by the "Dissect" button during the draw; the spawn (which needs the
     /// `Arc<Process>` + runtime) happens after the top bar returns.
     #[cfg(target_os = "linux")]
@@ -173,7 +177,7 @@ impl DisassemblyPanel {
             #[cfg(target_os = "linux")]
             modules: Vec::new(),
             #[cfg(target_os = "linux")]
-            selected_module: None,
+            selected_modules: Vec::new(),
             #[cfg(target_os = "linux")]
             mode: DisasmMode::Function,
             #[cfg(target_os = "linux")]
@@ -216,7 +220,7 @@ impl DisassemblyPanel {
     /// module has been dissected. Consumed by the Navigator side panel.
     #[cfg(target_os = "linux")]
     pub fn dissect_result(&self) -> Option<&DissectResult> {
-        self.dissect.as_ref().map(|(_, d)| d)
+        self.dissect.as_ref()
     }
 
     /// Monotonic counter bumped on each successful dissect (lets the Navigator
@@ -230,8 +234,8 @@ impl DisassemblyPanel {
     /// `logic()` so results land even when the Disassembly tab is not visible.
     #[cfg(target_os = "linux")]
     pub fn poll(&mut self) {
-        if let JobPoll::Done((idx, result)) = self.dissect_job.poll() {
-            self.apply_dissect(idx, result);
+        if let JobPoll::Done(result) = self.dissect_job.poll() {
+            self.apply_dissect(result);
         }
     }
 
@@ -261,7 +265,7 @@ impl DisassemblyPanel {
                 None => self.modules.iter().position(|m| m.size > 0x2000),
             };
             if let Some(idx) = idx {
-                self.enter_linear_mode(idx, process);
+                self.set_selected_modules(&[idx], process);
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -299,7 +303,7 @@ impl DisassemblyPanel {
 
     #[cfg(target_os = "linux")]
     fn reset_state(&mut self) {
-        self.selected_module = None;
+        self.selected_modules.clear();
         self.mode = DisasmMode::Function;
         self.linear_regions.clear();
         self.linear_insns.clear();
@@ -426,35 +430,48 @@ impl DisassemblyPanel {
     // Linear-mode engine (Linux-only)
     // -----------------------------------------------------------------------
 
-    /// Enter linear mode over `modules[idx]`: compute its executable regions and
-    /// start decoding at the first one (real `.text`, never the ELF header).
+    /// Enter linear mode over `indices` (into `modules`): union every selected
+    /// module's executable regions into one address-sorted list and start decoding
+    /// at the first one (real `.text`, never an ELF header). The Modules panel
+    /// calls this whenever its checkbox selection changes.
     #[cfg(target_os = "linux")]
-    fn enter_linear_mode(&mut self, idx: usize, process: &Process) {
-        let Some(m) = self.modules.get(idx) else {
-            return;
-        };
-        let (base, size) = (m.base, m.size);
+    pub fn set_selected_modules(&mut self, indices: &[usize], process: &Process) {
+        self.selected_modules = indices.to_vec();
+        self.selected_modules.sort_unstable();
+        self.selected_modules.dedup();
 
-        self.selected_module = Some(idx);
-        self.mode = DisasmMode::Linear;
-        self.linear_regions = module_exec_regions(process.pid(), base, size).unwrap_or_default();
+        // Dissect results are tied to the selection; drop them when it changes.
+        self.dissect = None;
+        self.dissect_status = None;
 
-        // Dissect results are per-module; drop when switching modules.
-        if self.dissect.as_ref().map(|(mi, _)| *mi) != Some(idx) {
-            self.dissect = None;
-            self.dissect_status = None;
+        // Union the executable regions of every selected module, sorted by start.
+        let pid = process.pid();
+        let mut regions: Vec<(u64, u64)> = Vec::new();
+        for &idx in &self.selected_modules {
+            if let Some(m) = self.modules.get(idx) {
+                regions.extend(module_exec_regions(pid, m.base, m.size).unwrap_or_default());
+            }
         }
+        regions.sort_unstable_by_key(|r| r.0);
+        self.linear_regions = regions;
+
+        // No modules selected → clear the view and leave a hint.
+        if self.linear_regions.is_empty() {
+            self.mode = DisasmMode::Linear;
+            self.linear_insns.clear();
+            self.linear_next = None;
+            self.selected_row = None;
+            return;
+        }
+
+        self.mode = DisasmMode::Linear;
 
         if self.address != 0 {
             self.push_back(self.address);
         }
         self.forward.clear();
 
-        let start = self
-            .linear_regions
-            .first()
-            .map(|r| r.0)
-            .unwrap_or(base as u64);
+        let start = self.linear_regions[0].0;
         self.address = start as usize;
         self.address_input = format!("{start:#018x}");
         self.address_error = None;
@@ -573,18 +590,23 @@ impl DisassemblyPanel {
         if self.dissect_job.is_running() {
             return;
         }
-        let Some(idx) = self.selected_module else {
-            self.dissect_status = Some("Select a module first.".to_owned());
+        let targets = self.dissect_targets();
+        if targets.is_empty() {
+            self.dissect_status = Some("Select modules in the Modules panel first.".to_owned());
             return;
-        };
-        let Some(m) = self.modules.get(idx) else {
-            return;
-        };
-        let (base, size) = (m.base, m.size);
+        }
         self.dissect_status = Some("Dissecting…".to_owned());
-        self.dissect_job.spawn(rt, ctx, move || {
-            (idx, compute_dissect(&process, base, size))
-        });
+        self.dissect_job
+            .spawn(rt, ctx, move || compute_dissect_many(&process, &targets));
+    }
+
+    /// `(base, size)` of every currently-selected module, for a dissect scan.
+    #[cfg(target_os = "linux")]
+    fn dissect_targets(&self) -> Vec<(usize, usize)> {
+        self.selected_modules
+            .iter()
+            .filter_map(|&i| self.modules.get(i).map(|m| (m.base, m.size)))
+            .collect()
     }
 
     /// Synchronous dissect of the selected module (blocks the caller). Only for
@@ -592,22 +614,19 @@ impl DisassemblyPanel {
     /// the same frame; interactive dissects go through [`Self::do_dissect`].
     #[cfg(target_os = "linux")]
     pub fn dissect_selected_blocking(&mut self, process: &Process) {
-        let Some(idx) = self.selected_module else {
-            self.dissect_status = Some("Select a module first.".to_owned());
+        let targets = self.dissect_targets();
+        if targets.is_empty() {
+            self.dissect_status = Some("Select modules in the Modules panel first.".to_owned());
             return;
-        };
-        let Some(m) = self.modules.get(idx) else {
-            return;
-        };
-        let (base, size) = (m.base, m.size);
-        let result = compute_dissect(process, base, size);
-        self.apply_dissect(idx, result);
+        }
+        let result = compute_dissect_many(process, &targets);
+        self.apply_dissect(result);
     }
 
     /// Merge a completed dissect (from the worker or the sync debug path) into
     /// panel state, bumping the epoch so the Navigator rebuilds its lists.
     #[cfg(target_os = "linux")]
-    fn apply_dissect(&mut self, idx: usize, result: Result<DissectResult, String>) {
+    fn apply_dissect(&mut self, result: Result<DissectResult, String>) {
         match result {
             Ok(result) => {
                 self.dissect_status = Some(format!(
@@ -616,7 +635,7 @@ impl DisassemblyPanel {
                     result.jumps.len(),
                     result.strings.len(),
                 ));
-                self.dissect = Some((idx, result));
+                self.dissect = Some(result);
                 self.dissect_epoch = self.dissect_epoch.wrapping_add(1);
             }
             Err(e) => {
@@ -802,37 +821,25 @@ impl DisassemblyPanel {
 
     #[cfg(target_os = "linux")]
     fn show_top_bar(&mut self, ui: &mut egui::Ui, process: &Process) {
-        let mut picked_module: Option<usize> = None;
+        let _ = process;
         let mut dissect_clicked = false;
 
         ui.horizontal(|ui| {
-            ui.label("Module:");
-            let selected_text = self
-                .selected_module
-                .and_then(|i| self.modules.get(i))
-                .map(module_label)
-                .unwrap_or_else(|| "Select module…".to_owned());
+            let n_sel = self.selected_modules.len();
+            ui.label(match n_sel {
+                0 => "No modules selected".to_owned(),
+                1 => "1 module".to_owned(),
+                n => format!("{n} modules"),
+            });
+            ui.weak("— pick modules in the Modules panel");
 
-            egui::ComboBox::from_id_salt("disasm_module_combo")
-                .selected_text(selected_text)
-                .width(320.0)
-                .show_ui(ui, |ui| {
-                    if self.modules.is_empty() {
-                        ui.weak("(no modules — attach to a process)");
-                    }
-                    for (i, m) in self.modules.iter().enumerate() {
-                        let selected = self.selected_module == Some(i);
-                        if ui.selectable_label(selected, module_label(m)).clicked() {
-                            picked_module = Some(i);
-                        }
-                    }
-                });
-
-            let can_dissect = self.mode == DisasmMode::Linear && self.selected_module.is_some();
+            let can_dissect = self.mode == DisasmMode::Linear && !self.selected_modules.is_empty();
             if ui
                 .add_enabled(can_dissect, egui::Button::new("Dissect"))
-                .on_hover_text("Scan the module's code for call/jump/string cross-references")
-                .on_disabled_hover_text("Pick a module first")
+                .on_hover_text(
+                    "Scan the selected modules' code for call/jump/string cross-references",
+                )
+                .on_disabled_hover_text("Select modules in the Modules panel first")
                 .clicked()
             {
                 dissect_clicked = true;
@@ -888,9 +895,6 @@ impl DisassemblyPanel {
             }
         });
 
-        if let Some(i) = picked_module {
-            self.enter_linear_mode(i, process);
-        }
         if dissect_clicked {
             // Defer: the actual spawn needs the `Arc<Process>` + runtime, which
             // `show_linux` has. Applied right after the top bar returns.
@@ -928,11 +932,8 @@ impl DisassemblyPanel {
                     .map(|c| c.instructions.as_slice())
                     .unwrap_or(&[]),
             };
-            let dissect = self
-                .dissect
-                .as_ref()
-                .filter(|(mi, _)| Some(*mi) == self.selected_module)
-                .map(|(_, d)| d);
+            let dissect = self.dissect.as_ref();
+            let modules: &[ModuleInfoWithName] = &self.modules;
             let selected_row = self.selected_row;
             let scroll_to = self.scroll_to_row.take();
 
@@ -940,7 +941,7 @@ impl DisassemblyPanel {
                 if is_linear {
                     ui.weak("Decoding…");
                 } else if self.address == 0 {
-                    ui.label("Pick a module, or enter an address, to disassemble.");
+                    ui.label("Select modules in the Modules panel, or enter an address, to disassemble.");
                 } else {
                     ui.label("No instructions decoded.");
                 }
@@ -954,6 +955,7 @@ impl DisassemblyPanel {
                     .resizable(true)
                     .sense(egui::Sense::click())
                     .column(Column::initial(180.0).at_least(120.0)) // Address
+                    .column(Column::initial(120.0).at_least(70.0)) // Module
                     .column(Column::initial(150.0).at_least(80.0)) // Bytes
                     .column(Column::initial(230.0).at_least(140.0)) // Instruction
                     .column(Column::remainder().at_least(120.0)); // Comment
@@ -964,6 +966,9 @@ impl DisassemblyPanel {
                     .header(row_height + 2.0, |mut h| {
                         h.col(|ui| {
                             ui.strong("Address");
+                        });
+                        h.col(|ui| {
+                            ui.strong("Module");
                         });
                         h.col(|ui| {
                             ui.strong("Bytes");
@@ -1056,6 +1061,20 @@ impl DisassemblyPanel {
                                         );
                                     }
                                 });
+                            });
+                            // Module (basename of the module owning this address).
+                            row.col(|ui| {
+                                if let Some(name) = module_name_at(modules, addr) {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(name)
+                                                .monospace()
+                                                .color(Color32::from_rgb(150, 160, 180)),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(name);
+                                }
                             });
                             // Bytes.
                             row.col(|ui| {
@@ -1235,8 +1254,6 @@ impl DisassemblyPanel {
     }
 }
 
-/// Combo/label text for a module: `name (0xbase, NN KiB)`.
-#[cfg(target_os = "linux")]
 /// Scan a module's executable regions for call/jump/string cross-references.
 /// Runs off the UI thread (from `do_dissect`'s worker) or inline (debug path).
 #[cfg(target_os = "linux")]
@@ -1246,8 +1263,56 @@ fn compute_dissect(process: &Process, base: usize, size: usize) -> Result<Dissec
         .map_err(|e| e.to_string())
 }
 
-fn module_label(m: &ModuleInfoWithName) -> String {
-    format!("{} (0x{:x}, {} KiB)", m.name, m.base, m.size / 1024)
+/// Dissect every `(base, size)` target and merge the results into one aggregate,
+/// so cross-references resolve across all selected modules (e.g. a call from one
+/// module into another).
+#[cfg(target_os = "linux")]
+fn compute_dissect_many(
+    process: &Process,
+    targets: &[(usize, usize)],
+) -> Result<DissectResult, String> {
+    let mut merged = DissectResult::default();
+    for &(base, size) in targets {
+        merge_dissect(&mut merged, compute_dissect(process, base, size)?);
+    }
+    // Restore the per-map "sorted + de-duplicated referrers" invariant that
+    // callers (the Navigator, xref badges) rely on.
+    for v in merged
+        .calls
+        .values_mut()
+        .chain(merged.jumps.values_mut())
+        .chain(merged.strings.values_mut())
+    {
+        v.sort_unstable();
+        v.dedup();
+    }
+    Ok(merged)
+}
+
+/// Fold `from`'s cross-reference maps into `into` (referrer lists concatenated;
+/// re-sorting is done once by the caller after all modules are merged).
+#[cfg(target_os = "linux")]
+fn merge_dissect(into: &mut DissectResult, from: DissectResult) {
+    for (k, mut v) in from.calls {
+        into.calls.entry(k).or_default().append(&mut v);
+    }
+    for (k, mut v) in from.jumps {
+        into.jumps.entry(k).or_default().append(&mut v);
+    }
+    for (k, mut v) in from.strings {
+        into.strings.entry(k).or_default().append(&mut v);
+    }
+    into.string_previews.extend(from.string_previews);
+}
+
+/// Basename of the module containing `addr`, if any. Binary-searches the
+/// base-sorted `modules` slice so the Module table column is cheap per row.
+#[cfg(target_os = "linux")]
+fn module_name_at(modules: &[ModuleInfoWithName], addr: u64) -> Option<&str> {
+    let addr = addr as usize;
+    let i = modules.partition_point(|m| m.base <= addr);
+    let m = modules.get(i.checked_sub(1)?)?;
+    (addr < m.base + m.size).then_some(m.name.as_str())
 }
 
 /// Distinct colour per control-flow class.
