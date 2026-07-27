@@ -218,3 +218,32 @@ mod tests {
         assert_eq!(s.last_project, Some(std::path::PathBuf::from("/a")));
     }
 }
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// A settings file written before the standalone "Cheat table" tab was
+    /// retired names a `TabKind` variant that no longer exists.
+    ///
+    /// `dock_state` must degrade to `None` so the app falls back to the default
+    /// layout, rather than the unknown variant taking the whole settings file
+    /// down with it.
+    #[test]
+    fn a_layout_naming_a_removed_tab_falls_back_to_the_default() {
+        let json = r#"{
+            "schema": 1,
+            "dock": {"surfaces": [{"Main": {"tree": [{"Leaf": {"tabs": ["CheatTable"]}}]}}]}
+        }"#;
+
+        let settings: Settings = serde_json::from_str(json).expect("settings still parse");
+        assert!(
+            settings.dock.is_some(),
+            "the raw JSON is kept so the rest of the file is unaffected"
+        );
+        assert!(
+            settings.dock_state().is_none(),
+            "a layout naming a removed tab must not decode"
+        );
+    }
+}

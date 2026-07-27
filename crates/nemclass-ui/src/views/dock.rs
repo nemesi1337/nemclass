@@ -42,8 +42,6 @@ pub enum TabKind {
     Scripts,
     /// Pointer-chain scanner (ASLR-stable path finder).
     PointerScan,
-    /// Cheat-Engine-style saved address list with freeze.
-    CheatTable,
 }
 
 impl TabKind {
@@ -59,12 +57,11 @@ impl TabKind {
             TabKind::Debugger => "Debugger",
             TabKind::Scripts => "Scripts",
             TabKind::PointerScan => "Pointer scan",
-            TabKind::CheatTable => "Cheat table",
         }
     }
 
     /// Every tab kind, for building the "View" menu that re-opens closed panels.
-    pub const ALL: [TabKind; 10] = [
+    pub const ALL: [TabKind; 9] = [
         TabKind::ClassView,
         TabKind::Navigator,
         TabKind::Modules,
@@ -74,7 +71,6 @@ impl TabKind {
         TabKind::Debugger,
         TabKind::Scripts,
         TabKind::PointerScan,
-        TabKind::CheatTable,
     ];
 }
 
@@ -91,11 +87,13 @@ pub fn default_layout() -> DockState<TabKind> {
     let [_left, right_top] = surface.split_right(NodeIndex::root(), 0.45, vec![TabKind::Memory]);
     let [_mem, disasm] = surface.split_below(right_top, 0.5, vec![TabKind::Disassembly]);
 
-    // Below the disassembler: scanner + pointer scan + cheat table + debugger + scripts share a tab group.
+    // Below the disassembler: scanner + pointer scan + debugger + scripts share a
+    // tab group. The saved address list has no tab of its own — it docks beneath
+    // the scan results inside the Scanner tab, as in Cheat Engine.
     surface.split_below(
         disasm,
         0.6,
-        vec![TabKind::Scanner, TabKind::PointerScan, TabKind::CheatTable, TabKind::Debugger, TabKind::Scripts],
+        vec![TabKind::Scanner, TabKind::PointerScan, TabKind::Debugger, TabKind::Scripts],
     );
 
     state
@@ -125,7 +123,6 @@ impl TabViewer for DockViewer<'_> {
             TabKind::Debugger => self.app.show_debugger_tab(ui),
             TabKind::Scripts => self.app.show_scripts_tab(ui),
             TabKind::PointerScan => self.app.show_pointer_scan_tab(ui),
-            TabKind::CheatTable => self.app.show_cheat_table_tab(ui),
         }
     }
 

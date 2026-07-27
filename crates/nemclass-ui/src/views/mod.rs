@@ -48,6 +48,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// How long the scanner's module list stays valid before `/proc/<pid>/maps` is
+/// re-parsed. Modules load and unload rarely; a per-frame walk was pure waste.
+const MODULE_CACHE_TTL: Duration = Duration::from_secs(1);
+
 use tasks::{BackgroundJob, Poll as JobPoll, Runtime as BgRuntime};
 
 use eframe::egui;
@@ -390,6 +394,14 @@ pub struct NemclassApp {
     /// Cross-panel navigation request: bring this tab to the front of its dock
     /// group after the frame draws (e.g. "Disassemble here" → focus Disassembly).
     pending_focus: Option<TabKind>,
+    /// Whether the saved address list is docked beneath the scan results, the
+    /// Cheat Engine layout. It has no tab of its own, so this is the only way to
+    /// reach it — hence on by default.
+    show_address_list: bool,
+    /// Module list for the scanner's scope picker, refreshed at most once per
+    /// [`MODULE_CACHE_TTL`] (see [`NemclassApp::scanner_modules`]).
+    module_cache: Vec<nemclass_core::ModuleInfoWithName>,
+    module_cache_at: Option<Instant>,
 
     // Scanner panel
     scanner_panel: ScannerPanel,
@@ -592,6 +604,9 @@ impl NemclassApp {
                 .or_else(|| Some("Demo project loaded. Use File > New or Open to load a project.".into())),
             dock_state: Some(settings.dock_state().unwrap_or_else(dock::default_layout)),
             pending_focus: None,
+            show_address_list: true,
+            module_cache: Vec::new(),
+            module_cache_at: None,
             scanner_panel: ScannerPanel::new(),
             debugger_panel: DebuggerPanel::with_key(kernel_key),
             memory_viewer: MemoryViewer::new(),
@@ -2351,15 +2366,50 @@ impl NemclassApp {
     }
 
     fn show_scanner_tab(&mut self, ui: &mut egui::Ui) {
+        // Cheat Engine's layout: scan results on top, the saved address list
+        // docked directly beneath, in one window. Declared before the results so
+        // the bottom panel reserves its height first.
+        if self.show_address_list {
+            egui::Panel::bottom("scanner_address_list")
+                .resizable(true)
+                .default_size(220.0)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.show_cheat_table_tab(ui);
+                    });
+                });
+        }
+        egui::CentralPanel::default().show(ui, |ui| self.show_scanner_body(ui));
+    }
+
+    /// The attached process's module list for the scanner's scope picker, cached
+    /// for [`MODULE_CACHE_TTL`].
+    ///
+    /// This re-parsed `/proc/<pid>/maps` on every frame — 60 times a second, to
+    /// fill a combo box that is only read when the collapsed "Scan range" section
+    /// is expanded. Modules load and unload rarely enough that a second-old list
+    /// is indistinguishable from a fresh one.
+    fn scanner_modules(&mut self) -> Vec<nemclass_core::ModuleInfoWithName> {
+        let fresh = self
+            .module_cache_at
+            .is_some_and(|t| t.elapsed() < MODULE_CACHE_TTL);
+        if !fresh {
+            self.module_cache = self
+                .process
+                .as_ref()
+                .and_then(|p| p.modules().ok())
+                .map(|it| it.collect())
+                .unwrap_or_default();
+            self.module_cache_at = Some(Instant::now());
+        }
+        self.module_cache.clone()
+    }
+
+    fn show_scanner_body(&mut self, ui: &mut egui::Ui) {
         // Owned snapshot: `process_ref` below holds an immutable borrow of
         // `self.process` across the `&mut self.scanner_panel` call, so a
         // borrowing iterator wouldn't compile.
-        let modules: Vec<nemclass_core::ModuleInfoWithName> = self
-            .process
-            .as_ref()
-            .and_then(|p| p.modules().ok())
-            .map(|it| it.collect())
-            .unwrap_or_default();
+        let modules = self.scanner_modules();
 
         // The shared handle, not a fresh attach: the scanner reads through the
         // backend the user actually attached with.
@@ -2371,6 +2421,11 @@ impl NemclassApp {
         let mut add_to_table: Option<(usize, String)> = None;
         let mut ptr_scan_addr: Option<usize> = None;
         let mut freeze_addr: Option<(usize, String, String)> = None;
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.show_address_list, "Address list")
+                .on_hover_text("Show the saved address list docked below the results.");
+        });
 
         self.scanner_panel.set_live_interval(self.snapshot_interval);
         self.scanner_panel.show(
