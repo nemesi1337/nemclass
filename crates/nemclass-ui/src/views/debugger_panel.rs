@@ -393,11 +393,12 @@ mod linux {
         }
 
         fn do_set_breakpoint(&mut self) {
-            let addr_str = self.bp_addr_text.trim().trim_start_matches("0x").trim_start_matches("0X");
-            let addr = match u64::from_str_radix(addr_str, 16) {
-                Ok(a) => a,
-                Err(_) => {
-                    self.bp_err = Some(format!("Invalid hex address: '{}'", self.bp_addr_text));
+            // Shared with every other address box in the app — see
+            // `crate::views::parse_address`.
+            let addr = match crate::views::parse_address(&self.bp_addr_text) {
+                Ok(a) => a as u64,
+                Err(e) => {
+                    self.bp_err = Some(e);
                     return;
                 }
             };

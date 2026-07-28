@@ -416,19 +416,17 @@ impl MemoryViewer {
     }
 
     fn try_parse_address(&mut self) {
-        let s = self.address_input.trim();
-        let result = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            usize::from_str_radix(hex, 16)
-        } else {
-            s.parse::<usize>()
-        };
-        match result {
+        // Shared with every other address box in the app — see
+        // `super::parse_address`. This used to treat bare digits as decimal,
+        // so `7fff0000` was rejected and `140000000` jumped somewhere else
+        // entirely.
+        match super::parse_address(&self.address_input) {
             Ok(addr) => {
                 self.address_error = None;
                 self.navigate_to(addr);
             }
-            Err(_) => {
-                self.address_error = Some(format!("Invalid address: '{s}'"));
+            Err(e) => {
+                self.address_error = Some(e);
             }
         }
     }

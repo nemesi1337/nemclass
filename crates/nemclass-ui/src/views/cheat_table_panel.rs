@@ -384,12 +384,9 @@ impl Default for CheatTablePanel {
 // ── helpers ────────────────────────────────────────────────────────────────
 
 fn parse_addr_text(s: &str) -> Option<usize> {
-    let t = s.trim();
-    let hex = t
-        .strip_prefix("0x")
-        .or_else(|| t.strip_prefix("0X"))
-        .unwrap_or(t);
-    usize::from_str_radix(hex, 16).ok()
+    // Shared with every other address box in the app — see
+    // `super::parse_address`. This one additionally accepted no `_` separator.
+    super::parse_hex_addr(s)
 }
 
 /// Resolves an entry's address, which may be a plain hex literal *or* an

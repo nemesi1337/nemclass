@@ -293,6 +293,14 @@ type AttachOutcome = (u64, libc::pid_t, String, Result<Process, String>);
 /// left interacting with a dead process.
 const LIVENESS_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// Whether a text field currently has keyboard focus.
+///
+/// Global shortcuts must not fire while the user is typing: the keystroke
+/// belongs to the widget, not to the app.
+fn typing_in_a_text_field(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.focused().is_some())
+}
+
 /// Whether `pid` is gone.
 ///
 /// `kill(pid, 0)` performs the existence/permission check without delivering a
@@ -1360,11 +1368,20 @@ impl NemclassApp {
             .map(|c| nemclass_model::class_size(c, &self.project))
             .unwrap_or(0);
 
-        let buf = if let (Some(addr), true) = (base, total_size > 0) {
+        let (buf, readable) = if let (Some(addr), true) = (base, total_size > 0) {
             read_process_buf(proc, addr, total_size)
         } else {
-            vec![0u8; total_size]
+            (vec![0u8; total_size], 0)
         };
+        // Surface an unreadable base rather than rendering zeros that look like
+        // real values. `readable == 0` with a resolved base means the address is
+        // not mapped (or the target is gone).
+        if base.is_some() && total_size > 0 && readable == 0 {
+            self.last_error = Some(format!(
+                "Address {:#x} is not readable — the class shows zeros, not data.",
+                base.unwrap_or(0)
+            ));
+        }
         self.mem_buf = buf;
 
         self.rebuild_snapshots_from_buf(uuid);
@@ -1451,7 +1468,7 @@ impl NemclassApp {
                     .unwrap_or(0);
 
                 let dbuf = if target_size > 0 {
-                    read_process_buf(proc, deref_addr, target_size)
+                    read_process_buf(proc, deref_addr, target_size).0
                 } else {
                     Vec::new()
                 };
@@ -1484,7 +1501,7 @@ impl NemclassApp {
                     snap.rendered.value = "0x0 → (null)".to_string();
                     continue;
                 }
-                let bytes = read_process_buf(proc, target, STR_PTR_MAX);
+                let (bytes, _) = read_process_buf(proc, target, STR_PTR_MAX);
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 let s = String::from_utf8_lossy(&bytes[..end]);
                 snap.rendered.value = format!("0x{target:X} → \"{s}\"");
@@ -1844,7 +1861,12 @@ impl eframe::App for NemclassApp {
             // Poll script-registered global hotkeys. For each match this frame,
             // dispatch `OnHotkey { id }` into the engine. Collect ids first so we
             // don't hold the `ctx.input` closure while borrowing `script_host`.
-            if !self.script_hotkeys.is_empty() && self.script_host.is_active() {
+            // Same focus guard as Ctrl+F below: a script-registered hotkey must
+            // not fire because the user typed its letter into a text box.
+            if !self.script_hotkeys.is_empty()
+                && self.script_host.is_active()
+                && !typing_in_a_text_field(ctx)
+            {
                 let fired: Vec<u32> = ctx.input(|i| {
                     self.script_hotkeys
                         .iter()
@@ -1918,9 +1940,23 @@ impl eframe::App for NemclassApp {
         }
 
         // ── Ctrl+F: toggle freeze on all cheat-table entries ─────────────
-        let freeze_hotkey = ctx.input(|i| {
-            i.key_pressed(egui::Key::F) && i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt
-        });
+        // Only when no text field has focus. Without the guard, pressing Ctrl+F
+        // while editing an address formula, a node name, a scanner needle or a
+        // cheat-table description froze the entire cheat table — the shortcut
+        // fired straight off `ctx.input` regardless of where the keystroke was
+        // aimed. `DisassemblyPanel::handle_keyboard` already models this.
+        let freeze_hotkey = !typing_in_a_text_field(ctx)
+            && ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers {
+                        ctrl: true,
+                        shift: false,
+                        alt: false,
+                        ..Default::default()
+                    },
+                    egui::Key::F,
+                )
+            });
         if freeze_hotkey {
             let process = self.process.as_deref();
             let now_frozen = self.cheat_table_panel.toggle_freeze_all(process);
@@ -2910,18 +2946,36 @@ impl NemclassApp {
         match action {
             CheatTablePanelAction::None => {}
             CheatTablePanelAction::Save(name) => {
-                if let Some(dir) = &self.project_dir {
-                    let tables_dir = dir.join("tables");
-                    let _ = std::fs::create_dir_all(&tables_dir);
-                    let path = tables_dir.join(format!("{name}.toml"));
-                    match self.cheat_table_panel.table_mut().to_toml() {
-                        Ok(s) => { let _ = std::fs::write(&path, s); }
-                        Err(e) => {
-                            self.cheat_table_panel.status_msg =
-                                Some(format!("Save failed: {e}"));
+                // Every failure here used to be discarded: both IO errors went
+                // into `let _ =`, and with no project directory the whole block
+                // was skipped — so "Save" was a silent no-op and the user had no
+                // way to know their table was never written. (Load already said
+                // "No project directory"; Save did not.)
+                let Some(dir) = self.project_dir.clone() else {
+                    self.cheat_table_panel.status_msg =
+                        Some("No project directory — save or open a project first.".to_owned());
+                    return;
+                };
+                let tables_dir = dir.join("tables");
+                let result = std::fs::create_dir_all(&tables_dir)
+                    .map_err(|e| format!("{}: {e}", tables_dir.display()))
+                    .and_then(|()| {
+                        self.cheat_table_panel
+                            .table_mut()
+                            .to_toml()
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|s| {
+                        let path = tables_dir.join(format!("{name}.toml"));
+                        match std::fs::write(&path, s) {
+                            Ok(()) => Ok(path),
+                            Err(e) => Err(format!("{}: {e}", path.display())),
                         }
-                    }
-                }
+                    });
+                self.cheat_table_panel.status_msg = Some(match result {
+                    Ok(path) => format!("Saved {}", path.display()),
+                    Err(e) => format!("Save failed: {e}"),
+                });
             }
             CheatTablePanelAction::Load(name) => {
                 if let Some(dir) = &self.project_dir {
@@ -4835,6 +4889,26 @@ pub(crate) fn parse_hex_addr(text: &str) -> Option<usize> {
     usize::from_str_radix(&t.replace('_', ""), 16).ok()
 }
 
+/// The single address parser for the whole UI.
+///
+/// **Addresses are hexadecimal**, with or without a `0x` prefix, and `_` may be
+/// used as a digit separator.
+///
+/// There used to be five of these with three different conventions in one
+/// application: the scanner range and pointer scan treated bare digits as hex,
+/// the memory viewer and disassembler treated them as *decimal* (so typing
+/// `7fff0000` failed outright while `140000000` silently jumped to decimal
+/// 140,000,000 — an address 300 MB away from the one the user meant), and the
+/// cheat table and debugger treated them as hex but rejected `_`. Every address
+/// box now behaves identically.
+pub(crate) fn parse_address(text: &str) -> Result<usize, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err("Enter an address".to_string());
+    }
+    parse_hex_addr(t).ok_or_else(|| format!("Invalid address: '{t}' (expected hex, e.g. 7fff0000)"))
+}
+
 /// Greedy-fill: produce nodes summing to `count` bytes using Hex64/32/16/8.
 fn hex_fill(count: usize) -> Vec<Box<dyn Node>> {
     use nemclass_model::node::builtins::{Hex8Node, Hex16Node, Hex32Node, Hex64Node};
@@ -4881,46 +4955,95 @@ fn resolve_node_mut<'a>(
 // ---------------------------------------------------------------------------
 
 fn write_parsed(proc: &Process, addr: usize, type_tag: &str, text: &str) -> Result<(), String> {
-    let raw = text.trim_start_matches("0x").trim_start_matches("0X");
-
-    macro_rules! parse_write {
-        ($ty:ty) => {{
-            let v: $ty = raw.parse().map_err(|e: <$ty as std::str::FromStr>::Err| e.to_string())?;
-            proc.write::<$ty>(addr, v).map_err(|e| e.to_string())
-        }};
+    let bytes = encode_scalar(type_tag, text)?;
+    let written = proc.write_buf(addr, &bytes).map_err(|e| e.to_string())?;
+    if written != bytes.len() {
+        return Err(format!(
+            "short write: {written} of {} bytes at {addr:#x}",
+            bytes.len()
+        ));
     }
-    macro_rules! parse_write_hex {
-        ($ty:ty) => {{
-            let v = <$ty>::from_str_radix(raw, 16).map_err(|e| e.to_string())?;
-            proc.write::<$ty>(addr, v).map_err(|e| e.to_string())
-        }};
-    }
+    Ok(())
+}
 
-    match type_tag {
-        "Int8"    => parse_write!(i8),
-        "Int16"   => parse_write!(i16),
-        "Int32"   => parse_write!(i32),
-        "Int64"   => parse_write!(i64),
-        "UInt8"   => parse_write!(u8),
-        "UInt16"  => parse_write!(u16),
-        "UInt32"  => parse_write!(u32),
-        "UInt64"  => parse_write!(u64),
-        "Hex8"    => parse_write_hex!(u8),
-        "Hex16"   => parse_write_hex!(u16),
-        "Hex32"   => parse_write_hex!(u32),
-        "Hex64"   => parse_write_hex!(u64),
-        "Float"   => parse_write!(f32),
-        "Double"  => parse_write!(f64),
-        "Bool"    => {
-            let v: u8 = match text.to_ascii_lowercase().as_str() {
-                "true" | "1" => 1,
-                _ => 0,
+/// Encode a user-typed value for `type_tag` into its little-endian bytes.
+///
+/// Split out from the write so the parsing is unit-testable without a live
+/// process — it is the part that was silently wrong.
+///
+/// Radix rules, matching what a user reasonably expects:
+/// - integer types (`Int*`, `UInt*`) are decimal, unless an explicit `0x`
+///   prefix says otherwise. `-0x10` is -16.
+/// - hex-presented types (`Hex*`, `Pointer`) are hex whether or not the `0x`
+///   prefix is written.
+///
+/// The old implementation stripped `0x` and then parsed the remainder as
+/// decimal for every integer type, so `0x10` typed into an `Int32` field wrote
+/// **10** to the target — a wrong value, written, with no error shown. It also
+/// stripped repeated prefixes (`0x0x10` -> 10) and could never parse `-0x10`,
+/// because after stripping, the `-` was no longer leading.
+fn encode_scalar(type_tag: &str, text: &str) -> Result<Vec<u8>, String> {
+    let text = text.trim();
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, text),
+    };
+    let has_prefix = body.len() > 2 && (body.starts_with("0x") || body.starts_with("0X"));
+    let digits = if has_prefix { &body[2..] } else { body };
+
+    /// Decimal by default; hex on an explicit prefix.
+    macro_rules! int {
+        ($ty:ty) => {{
+            let v: $ty = if has_prefix {
+                let mag = <$ty>::from_str_radix(digits, 16).map_err(|e| e.to_string())?;
+                if negative {
+                    mag.checked_neg()
+                        .ok_or_else(|| format!("{text} does not fit in {}", stringify!($ty)))?
+                } else {
+                    mag
+                }
+            } else {
+                text.parse::<$ty>().map_err(|e| e.to_string())?
             };
-            proc.write::<u8>(addr, v).map_err(|e| e.to_string())
-        }
-        "Pointer" => parse_write_hex!(u64),
-        _ => Err(format!("'{type_tag}' is not directly writable")),
+            v.to_le_bytes().to_vec()
+        }};
     }
+    /// Always hex; the `0x` prefix is optional rather than a parse error.
+    macro_rules! hex {
+        ($ty:ty) => {{
+            let v = <$ty>::from_str_radix(digits, 16).map_err(|e| e.to_string())?;
+            v.to_le_bytes().to_vec()
+        }};
+    }
+    macro_rules! float {
+        ($ty:ty) => {{
+            let v = text.parse::<$ty>().map_err(|e| e.to_string())?;
+            v.to_le_bytes().to_vec()
+        }};
+    }
+
+    Ok(match type_tag {
+        "Int8" => int!(i8),
+        "Int16" => int!(i16),
+        "Int32" => int!(i32),
+        "Int64" => int!(i64),
+        "UInt8" => int!(u8),
+        "UInt16" => int!(u16),
+        "UInt32" => int!(u32),
+        "UInt64" => int!(u64),
+        "Hex8" => hex!(u8),
+        "Hex16" => hex!(u16),
+        "Hex32" => hex!(u32),
+        "Hex64" => hex!(u64),
+        "Float" => float!(f32),
+        "Double" => float!(f64),
+        "Bool" => vec![u8::from(matches!(
+            text.to_ascii_lowercase().as_str(),
+            "true" | "1"
+        ))],
+        "Pointer" => hex!(u64),
+        _ => return Err(format!("'{type_tag}' is not directly writable")),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4965,13 +5088,25 @@ fn is_editable(type_tag: &str) -> bool {
 // Bulk memory read helper
 // ---------------------------------------------------------------------------
 
-fn read_process_buf(proc: &Process, addr: usize, size: usize) -> Vec<u8> {
+/// Read `size` bytes at `addr`, reporting how much was actually readable.
+///
+/// Returns `(buffer, readable)`. The buffer is always `size` bytes so callers
+/// can index it uniformly; `readable` is how many of them came from the target.
+///
+/// The caller must not treat a failed read as data. This used to `let _ =` the
+/// result and hand back a zero-filled buffer, so a target that had exited — or
+/// a class whose address formula resolved somewhere unmapped — rendered as a
+/// class full of real-looking zeros rather than as unreadable.
+/// `read_float_components` already went out of its way to avoid exactly this,
+/// returning no components on a short buffer "so a partial read is never
+/// mistaken for real data"; the two policies contradicted each other.
+fn read_process_buf(proc: &Process, addr: usize, size: usize) -> (Vec<u8>, usize) {
     if size == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let mut buf = vec![0u8; size];
-    let _ = proc.read_buf(addr, &mut buf);
-    buf
+    let readable = proc.read_buf(addr, &mut buf).unwrap_or(0);
+    (buf, readable)
 }
 
 // ---------------------------------------------------------------------------
@@ -5236,6 +5371,77 @@ mod tests {
         assert_eq!(after.name, "after");
         assert_eq!(after.offset, 8, "field after instance must sit at resolved_class_size(B) = 8");
         assert_eq!(after.owner_class, a_uuid);
+    }
+
+    // -----------------------------------------------------------------------
+    // Value entry and address parsing
+    // -----------------------------------------------------------------------
+
+    /// Typing `0x10` into an Int32 field wrote **10** to the target: the old
+    /// parser stripped the prefix and then parsed the remainder as decimal.
+    /// A wrong value, written to a live process, with no error shown.
+    #[test]
+    fn a_hex_prefixed_value_is_written_as_hex() {
+        use super::encode_scalar;
+        assert_eq!(encode_scalar("Int32", "0x10").unwrap(), 16i32.to_le_bytes());
+        assert_eq!(encode_scalar("Int32", "0X10").unwrap(), 16i32.to_le_bytes());
+        assert_eq!(encode_scalar("UInt64", "0xFF").unwrap(), 255u64.to_le_bytes());
+        // …and a bare decimal stays decimal.
+        assert_eq!(encode_scalar("Int32", "10").unwrap(), 10i32.to_le_bytes());
+        assert_eq!(encode_scalar("Int32", " 10 ").unwrap(), 10i32.to_le_bytes());
+    }
+
+    #[test]
+    fn a_negative_hex_value_parses() {
+        use super::encode_scalar;
+        // Previously impossible: after stripping "0x" the '-' was no longer
+        // leading, so the parse failed outright.
+        assert_eq!(encode_scalar("Int32", "-0x10").unwrap(), (-16i32).to_le_bytes());
+        assert_eq!(encode_scalar("Int32", "-16").unwrap(), (-16i32).to_le_bytes());
+    }
+
+    #[test]
+    fn a_repeated_prefix_is_rejected_not_silently_accepted() {
+        use super::encode_scalar;
+        // `trim_start_matches` stripped every leading "0x", so `0x0x10` became
+        // the decimal 10 rather than an error.
+        assert!(encode_scalar("Int32", "0x0x10").is_err());
+        assert!(encode_scalar("Int32", "banana").is_err());
+    }
+
+    #[test]
+    fn hex_typed_fields_accept_the_prefix_as_well_as_bare_digits() {
+        use super::encode_scalar;
+        assert_eq!(encode_scalar("Hex32", "ff").unwrap(), 255u32.to_le_bytes());
+        assert_eq!(encode_scalar("Hex32", "0xff").unwrap(), 255u32.to_le_bytes());
+        assert_eq!(encode_scalar("Pointer", "7fff0000").unwrap(), 0x7fff_0000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn floats_and_bools_still_parse() {
+        use super::encode_scalar;
+        assert_eq!(encode_scalar("Float", "1.5").unwrap(), 1.5f32.to_le_bytes());
+        assert_eq!(encode_scalar("Double", "-2.25").unwrap(), (-2.25f64).to_le_bytes());
+        assert_eq!(encode_scalar("Bool", "true").unwrap(), vec![1u8]);
+        assert_eq!(encode_scalar("Bool", "0").unwrap(), vec![0u8]);
+        assert!(encode_scalar("VTable", "1").is_err());
+    }
+
+    /// Five parsers with three conventions lived in one application. The memory
+    /// viewer and disassembler read bare digits as *decimal*, so `7fff0000` was
+    /// rejected outright while `140000000` silently jumped to decimal
+    /// 140,000,000 — hundreds of megabytes from the intended address.
+    #[test]
+    fn addresses_are_hex_everywhere() {
+        use super::parse_address;
+        assert_eq!(parse_address("7fff0000"), Ok(0x7fff_0000));
+        assert_eq!(parse_address("0x7fff0000"), Ok(0x7fff_0000));
+        assert_eq!(parse_address("0X7FFF0000"), Ok(0x7fff_0000));
+        assert_eq!(parse_address("  7fff_0000  "), Ok(0x7fff_0000));
+        // The case that used to land somewhere else entirely.
+        assert_eq!(parse_address("140000000"), Ok(0x1_4000_0000));
+        assert!(parse_address("").is_err());
+        assert!(parse_address("nonsense").is_err());
     }
 
     // -----------------------------------------------------------------------

@@ -403,13 +403,9 @@ impl DisassemblyPanel {
     }
 
     fn try_parse_address(&mut self) {
-        let s = self.address_input.trim();
-        let result = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            usize::from_str_radix(hex, 16).map_err(|e| e.to_string())
-        } else {
-            s.parse::<usize>().map_err(|e| e.to_string())
-        };
-        match result {
+        // Shared with every other address box in the app — see
+        // `super::parse_address`. Bare digits are hex, not decimal.
+        match super::parse_address(&self.address_input) {
             // Go navigates *within* the listing, keeping the surrounding
             // disassembly. An address outside the browsed regions is not an
             // error — the region is discovered on demand (see `ensure_region_for`).
@@ -417,7 +413,7 @@ impl DisassemblyPanel {
                 self.address_error = None;
                 self.navigate(addr);
             }
-            Err(e) => self.address_error = Some(format!("Bad address: {e}")),
+            Err(e) => self.address_error = Some(e),
         }
     }
 
