@@ -44,6 +44,8 @@ pub enum TabKind {
     PointerScan,
     /// Structure spider: find a value *inside* a known object.
     Spider,
+    /// Code generator: emit C++/C#/Rust type definitions for the project.
+    Generator,
 }
 
 impl TabKind {
@@ -60,11 +62,12 @@ impl TabKind {
             TabKind::Scripts => "Scripts",
             TabKind::PointerScan => "Pointer scan",
             TabKind::Spider => "Spider",
+            TabKind::Generator => "Generator",
         }
     }
 
     /// Every tab kind, for building the "View" menu that re-opens closed panels.
-    pub const ALL: [TabKind; 10] = [
+    pub const ALL: [TabKind; 11] = [
         TabKind::ClassView,
         TabKind::Navigator,
         TabKind::Modules,
@@ -75,6 +78,7 @@ impl TabKind {
         TabKind::Scripts,
         TabKind::PointerScan,
         TabKind::Spider,
+        TabKind::Generator,
     ];
 }
 
@@ -83,7 +87,12 @@ impl TabKind {
 /// debugger / scripts share a panel below the right split. Users rearrange it
 /// freely; this is only the first-run / "Reset layout" arrangement.
 pub fn default_layout() -> DockState<TabKind> {
-    let mut state = DockState::new(vec![TabKind::ClassView, TabKind::Navigator, TabKind::Modules]);
+    let mut state = DockState::new(vec![
+        TabKind::ClassView,
+        TabKind::Navigator,
+        TabKind::Modules,
+        TabKind::Generator,
+    ]);
     let surface = state.main_surface_mut();
 
     // Right ~55%: the Cheat-Engine-style "Memory View" — hex dump on top,
@@ -134,6 +143,7 @@ impl TabViewer for DockViewer<'_> {
             TabKind::Scripts => self.app.show_scripts_tab(ui),
             TabKind::PointerScan => self.app.show_pointer_scan_tab(ui),
             TabKind::Spider => self.app.show_spider_tab(ui),
+            TabKind::Generator => self.app.show_generator_tab(ui),
         }
     }
 

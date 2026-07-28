@@ -15,6 +15,7 @@
 //! └─────────────────┴──────────────────────────────────────────────── ┘
 //! ```
 
+mod generator_panel;
 mod scanner_panel;
 mod debugger_panel;
 mod memory_viewer;
@@ -38,6 +39,7 @@ pub use debugger_panel::DebuggerPanel;
 pub use memory_viewer::MemoryViewer;
 pub use disassembly::DisassemblyPanel;
 
+use generator_panel::GeneratorPanel;
 use script_host::ScriptHost;
 use script_log::{LogKind, ScriptLog, new_script_log};
 use scripts_panel::{ScriptsPanel, ScriptsPanelAction};
@@ -67,7 +69,10 @@ use nemclass_core::{ModuleInfoWithName, Process, ProcessEntry, ProviderRegistry}
 use nemclass_core::{KernelProvider, LINUX_KERNEL};
 #[cfg(target_os = "linux")]
 use crate::views::debugger_panel::parse_hex_key;
-use nemclass_model::{ClassNode, ModelError, Node, NodeRegistry, Project, RenderedValue, resolve_formula};
+use nemclass_model::{
+    ClassNode, FloatWidth, MATRIX_SHAPES, ModelError, Node, NodeRegistry, Project, RenderedValue,
+    VECTOR_SHAPES, matrix_shape, resolve_formula, vector_shape,
+};
 #[cfg(target_os = "linux")]
 use nemclass_model::serialize::NodeDef;
 use nemclass_script::{ClassAddressQuery, Event, EventBus};
@@ -107,6 +112,14 @@ struct NodeSnapshot {
     /// Index path within owner_class — e.g. `[0]` for first child, `[0, 2]` for
     /// third child of first child.  Used to locate the node for edits.
     local_path: Vec<usize>,
+    /// For vector/matrix nodes: the individual float components read out of the
+    /// snapshot buffer, in declaration (row-major, for matrices) order. Empty
+    /// for every other node type, and also empty when the buffer was too short
+    /// to read the whole node.
+    components: Vec<f64>,
+    /// Component width for vector/matrix nodes; `None` for everything else.
+    /// Carried so the UI can write an edited component back at the right size.
+    float_width: Option<FloatWidth>,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +166,10 @@ enum LiveEntry {
 /// Augmented view row: either an index into `node_snapshots` or a live child.
 enum ViewRow {
     Snap(usize),
+    /// One row of an expanded matrix node: `snap_idx` names the matrix snapshot,
+    /// `row` is the 0-based matrix row. Purely derived from the snapshot's
+    /// `components`, so no cache is involved.
+    MatrixRow { snap_idx: usize, row: usize },
     #[cfg(target_os = "linux")]
     VtableMethod { _parent_id: String, depth: usize, row: VtableMethodRow },
     #[cfg(target_os = "linux")]
@@ -169,8 +186,14 @@ enum ViewRow {
 enum NodeEditOp {
     ChangeType   { owner: Uuid, path: Vec<usize>, new_tag: &'static str },
     Delete       { owner: Uuid, path: Vec<usize> },
+    /// Remove `count` consecutive nodes starting at `path` (the toolbar's
+    /// "Delete N fields"). Stops early at the end of the sibling list.
+    DeleteRange  { owner: Uuid, path: Vec<usize>, count: usize },
     AddBytes     { owner: Uuid, path: Vec<usize>, count: usize },
     InsertBytes  { owner: Uuid, path: Vec<usize>, count: usize },
+    /// Append `count` bytes of Hex filler at the end of the class body. Used by
+    /// the toolbar when no row is selected, so "Add 64" works on a fresh class.
+    AppendBytes  { owner: Uuid, count: usize },
     SetName      { owner: Uuid, path: Vec<usize>, name: String },
     SetComment   { owner: Uuid, path: Vec<usize>, comment: String },
     SetPtrTarget { owner: Uuid, path: Vec<usize>, target: Option<Uuid> },
@@ -209,7 +232,14 @@ struct AddBytesState {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, PartialEq)]
-enum EditField { Value, Name, Comment }
+enum EditField {
+    Value,
+    Name,
+    Comment,
+    /// A single component of a vector/matrix node, by index into its
+    /// `components` (row-major for matrices).
+    Component(usize),
+}
 
 #[derive(Clone)]
 struct EditState {
@@ -311,6 +341,12 @@ pub struct NemclassApp {
     collapsed: HashSet<String>,
     expanded_ptrs: HashSet<String>,
     edit_state: Option<EditState>,
+    /// The class-view row the user last clicked, as `(owner class, local path)`.
+    /// This is what the class toolbar's Add/Insert/Delete/type buttons act on;
+    /// with nothing selected they fall back to appending at the end of the class.
+    selected_node: Option<(Uuid, Vec<usize>)>,
+    /// Code-generator panel state (language choice + last generated output).
+    generator_panel: GeneratorPanel,
 
     // Auto-dissect controls (Memory View toolbar)
     /// Number of bytes to dissect (hex or decimal, user-editable).
@@ -574,6 +610,8 @@ impl NemclassApp {
             collapsed: HashSet::new(),
             expanded_ptrs: HashSet::new(),
             edit_state: None,
+            selected_node: None,
+            generator_panel: GeneratorPanel::default(),
             dissect_len_text: "0x100".to_owned(),
             #[cfg(target_os = "linux")]
             dissect_preview: None,
@@ -1163,7 +1201,21 @@ impl NemclassApp {
     fn take_snapshot(&mut self) {
         let Some(uuid) = self.selected_class else { return; };
         let Some(proc) = &self.process else {
+            // Detached: still size the buffer to the class so every node renders
+            // a zero rather than the `<?>` short-buffer placeholder. The layout
+            // is the point of the detached view; `<?>` on every row hid it.
+            let total_size = self
+                .project
+                .get_class(&uuid)
+                .map(|c| {
+                    let mut visited = std::collections::HashSet::new();
+                    nemclass_model::resolved_class_size(c, &self.project, &mut visited)
+                })
+                .unwrap_or(0);
+            self.class_base = None;
+            self.mem_buf = vec![0u8; total_size];
             self.rebuild_snapshots_from_buf(uuid);
+            self.last_snapshot = Some(Instant::now());
             return;
         };
 
@@ -1543,6 +1595,82 @@ impl NemclassApp {
             Err(e) => {
                 self.last_error = Some(format!("Write: {e}"));
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Vector / matrix components
+    // -----------------------------------------------------------------------
+
+    /// Draw one float component of a vector/matrix node: a monospace value that
+    /// becomes an inline edit box on double-click, committed straight to the
+    /// target's memory.
+    ///
+    /// `index` is the component's position in the node (row-major for matrices)
+    /// and, together with `id_path`, keys the edit state so only the clicked
+    /// component turns into a text box.
+    fn float_component_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        id_path: &str,
+        index: usize,
+        value: f64,
+        width: FloatWidth,
+        addr: usize,
+    ) {
+        let editing = self
+            .edit_state
+            .as_ref()
+            .is_some_and(|e| e.node_id == id_path && e.field == EditField::Component(index));
+
+        if editing {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.edit_state.as_mut().unwrap().text)
+                    .desired_width(72.0),
+            );
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if resp.lost_focus() || enter {
+                let edit = self.edit_state.take().unwrap();
+                self.write_float_component(addr, width, edit.text.trim());
+            } else if escape {
+                self.edit_state = None;
+            }
+        } else {
+            let resp = ui.add(
+                egui::Label::new(egui::RichText::new(width.format(value)).monospace())
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            );
+            if resp.double_clicked() && self.process.is_some() {
+                self.edit_state = Some(EditState {
+                    node_id: id_path.to_owned(),
+                    // Seed with the full-precision value, not the 3-decimal
+                    // display form, so re-committing an untouched cell doesn't
+                    // quietly round the target's memory.
+                    text: value.to_string(),
+                    field: EditField::Component(index),
+                });
+            }
+        }
+    }
+
+    /// Write one edited float component back to the target.
+    fn write_float_component(&mut self, addr: usize, width: FloatWidth, text: &str) {
+        let Some(proc) = &self.process else {
+            self.last_error = Some("Write: not attached".to_owned());
+            return;
+        };
+        let Some(bytes) = width.parse_to_ne_bytes(text) else {
+            self.last_error = Some(format!("Write: '{text}' is not a valid {}", width.rust_ty()));
+            return;
+        };
+        match proc.write_buf(addr, &bytes) {
+            Ok(_) => {
+                self.last_error = None;
+                self.last_snapshot = None;
+            }
+            Err(e) => self.last_error = Some(format!("Write: {e}")),
         }
     }
 }
@@ -2508,6 +2636,12 @@ impl NemclassApp {
         }
     }
 
+    /// Code-generator tab. `project`/`node_registry` are disjoint field borrows,
+    /// so the panel can read them while it mutably holds its own state.
+    fn show_generator_tab(&mut self, ui: &mut egui::Ui) {
+        self.generator_panel.ui(ui, &self.project, &self.node_registry);
+    }
+
     fn show_pointer_scan_tab(&mut self, ui: &mut egui::Ui) {
         #[cfg(target_os = "linux")]
         let pid: Option<nemclass_core::Pid> = self.process.as_ref().map(|p| p.pid());
@@ -3012,6 +3146,230 @@ impl NemclassApp {
     // Central panel (memory table)
     // -----------------------------------------------------------------------
 
+    /// The class-view field toolbar: bulk add/insert/delete of bytes, plus
+    /// one-click type changes — the ReClass/yclass "top header".
+    ///
+    /// Everything here acts on [`Self::selected_node`] (click a row to set it).
+    /// With nothing selected, `Add` still works and appends to the end of the
+    /// class, so a brand-new empty class can be filled from here.
+    fn show_class_toolbar(&mut self, ui: &mut egui::Ui) {
+        let Some(class_uuid) = self.selected_class else { return };
+        let selected = self.selected_node.clone();
+        let has_sel = selected.is_some();
+
+        // Collected inside the closures, applied once they release `self`.
+        let mut op: Option<NodeEditOp> = None;
+
+        /// One-click type button, coloured by family like ReClass/yclass.
+        fn type_button(
+            ui: &mut egui::Ui,
+            label: &str,
+            fill: egui::Color32,
+            enabled: bool,
+        ) -> bool {
+            ui.add_enabled(
+                enabled,
+                egui::Button::new(
+                    egui::RichText::new(label).color(egui::Color32::BLACK).monospace(),
+                )
+                .fill(fill),
+            )
+            .clicked()
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+
+            ui.menu_button("Add", |ui| {
+                ui.set_width(76.0);
+                for n in [8usize, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
+                    if ui.button(n.to_string()).clicked() {
+                        op = Some(match &selected {
+                            Some((owner, path)) => NodeEditOp::AddBytes {
+                                owner: *owner,
+                                path: path.clone(),
+                                count: n,
+                            },
+                            None => NodeEditOp::AppendBytes { owner: class_uuid, count: n },
+                        });
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Add N bytes after the selected field (or at the end of the class)");
+
+            // NOTE: the selection-dependent widgets are greyed out one at a
+            // time rather than by wrapping a group in `add_enabled_ui` — a
+            // nested `Ui` inside `horizontal_wrapped` claims the whole
+            // remaining row and wraps independently, which tore the toolbar
+            // into a stray vertical column.
+            ui.menu_button("Insert", |ui| {
+                ui.set_width(76.0);
+                for n in [1usize, 2, 4, 8, 16, 64, 256, 1024] {
+                    if ui.add_enabled(has_sel, egui::Button::new(n.to_string())).clicked() {
+                        if let Some((owner, path)) = &selected {
+                            op = Some(NodeEditOp::InsertBytes {
+                                owner: *owner,
+                                path: path.clone(),
+                                count: n,
+                            });
+                        }
+                        ui.close();
+                    }
+                }
+                if !has_sel {
+                    ui.weak("select a field first");
+                }
+            })
+            .response
+            .on_hover_text("Insert N bytes before the selected field");
+
+            ui.menu_button("Delete", |ui| {
+                ui.set_width(76.0);
+                for n in [1usize, 2, 4, 16, 64, 256, 1024] {
+                    if ui.add_enabled(has_sel, egui::Button::new(n.to_string())).clicked() {
+                        if let Some((owner, path)) = &selected {
+                            op = Some(NodeEditOp::DeleteRange {
+                                owner: *owner,
+                                path: path.clone(),
+                                count: n,
+                            });
+                        }
+                        ui.close();
+                    }
+                }
+                if !has_sel {
+                    ui.weak("select a field first");
+                }
+            })
+            .response
+            .on_hover_text("Delete N fields starting at the selected one");
+
+            ui.separator();
+
+            // Type-change buttons. Each family gets one fill colour so the row
+            // is scannable at a glance.
+            let mut change = |ui: &mut egui::Ui, label: &str, tag: &'static str, fill| {
+                if type_button(ui, label, fill, has_sel)
+                    && let Some((owner, path)) = &selected
+                {
+                    op = Some(NodeEditOp::ChangeType {
+                        owner: *owner,
+                        path: path.clone(),
+                        new_tag: tag,
+                    });
+                }
+            };
+
+            const GOLD: egui::Color32 = egui::Color32::from_rgb(230, 190, 80);
+            const GREEN: egui::Color32 = egui::Color32::from_rgb(150, 210, 150);
+            const BLUE: egui::Color32 = egui::Color32::from_rgb(150, 190, 230);
+            const RED: egui::Color32 = egui::Color32::from_rgb(230, 160, 160);
+            const GRAY: egui::Color32 = egui::Color32::from_rgb(170, 170, 170);
+            const BROWN: egui::Color32 = egui::Color32::from_rgb(200, 170, 130);
+
+            change(ui, "Bool", "Bool", GOLD);
+            ui.separator();
+            change(ui, "U8", "UInt8", GREEN);
+            change(ui, "U16", "UInt16", GREEN);
+            change(ui, "U32", "UInt32", GREEN);
+            change(ui, "U64", "UInt64", GREEN);
+            ui.separator();
+            change(ui, "I8", "Int8", BLUE);
+            change(ui, "I16", "Int16", BLUE);
+            change(ui, "I32", "Int32", BLUE);
+            change(ui, "I64", "Int64", BLUE);
+            ui.separator();
+            change(ui, "F32", "Float", RED);
+            change(ui, "F64", "Double", RED);
+            ui.separator();
+            change(ui, "H8", "Hex8", GRAY);
+            change(ui, "H16", "Hex16", GRAY);
+            change(ui, "H32", "Hex32", GRAY);
+            change(ui, "H64", "Hex64", GRAY);
+            ui.separator();
+            change(ui, "Ptr", "Pointer", BROWN);
+            change(ui, "Str", "StrPtr", BROWN);
+            ui.separator();
+
+            // Vector and matrix kinds carry a shape, so they get submenus
+            // rather than one button each.
+            ui.menu_button("Vec", |ui| {
+                ui.set_width(96.0);
+                for (tag, components, width) in VECTOR_SHAPES {
+                    let label = format!("Vec{components} {}", width.rust_ty());
+                    if ui.add_enabled(has_sel, egui::Button::new(label)).clicked() {
+                        if let Some((owner, path)) = &selected {
+                            op = Some(NodeEditOp::ChangeType {
+                                owner: *owner,
+                                path: path.clone(),
+                                new_tag: tag,
+                            });
+                        }
+                        ui.close();
+                    }
+                }
+                if !has_sel {
+                    ui.weak("select a field first");
+                }
+            });
+
+            ui.menu_button("Mat", |ui| {
+                ui.set_width(112.0);
+                for (tag, rows, cols, width) in MATRIX_SHAPES {
+                    let label = format!("Mat{rows}x{cols} {}", width.rust_ty());
+                    if ui.add_enabled(has_sel, egui::Button::new(label)).clicked() {
+                        if let Some((owner, path)) = &selected {
+                            op = Some(NodeEditOp::ChangeType {
+                                owner: *owner,
+                                path: path.clone(),
+                                new_tag: tag,
+                            });
+                        }
+                        ui.close();
+                    }
+                }
+                if !has_sel {
+                    ui.weak("select a field first");
+                }
+            });
+
+            // Selection indicator — without it, the disabled buttons above look
+            // broken rather than "nothing is selected".
+            ui.separator();
+            match &selected {
+                Some((owner, path)) => {
+                    let name = self
+                        .node_snapshots
+                        .iter()
+                        .find(|s| s.owner_class == *owner && s.local_path == *path)
+                        .map(|s| {
+                            if s.name.is_empty() {
+                                format!("<{}>", s.type_tag)
+                            } else {
+                                s.name.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| "(field)".to_owned());
+                    ui.label(format!("→ {name}"));
+                }
+                None => {
+                    ui.weak("click a field to select it");
+                }
+            }
+        });
+
+        if let Some(op) = op {
+            // A range delete can invalidate the selected path, so drop the
+            // selection rather than leaving it pointing at a shifted field.
+            if matches!(op, NodeEditOp::DeleteRange { .. }) {
+                self.selected_node = None;
+            }
+            self.apply_node_edit(op);
+        }
+    }
+
     fn show_class_view(&mut self, ui: &mut egui::Ui) {
         if self.selected_class.is_none() {
             ui.centered_and_justified(|ui| {
@@ -3020,10 +3378,25 @@ impl NemclassApp {
             return;
         }
 
+        // Field toolbar first: it must work on an empty class too, so the user
+        // can "Add 64 bytes" into a class that has no nodes yet.
+        self.show_class_toolbar(ui);
+        ui.separator();
+
         if self.process.is_none() {
             ui.colored_label(
                 egui::Color32::YELLOW,
                 "Not attached — showing demo layout (zeroed buffer).",
+            );
+            ui.add_space(4.0);
+        } else if self.class_base.is_none() {
+            // Attached, but nothing told us *where* the class lives. Without
+            // this the table silently shows a zero buffer that looks like real
+            // (all-zero) target memory.
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "No base address — set an address formula above, or resolve one \
+                 via a script/pointer scan.",
             );
             ui.add_space(4.0);
         }
@@ -3059,23 +3432,43 @@ impl NemclassApp {
             &self.live_cache,
         );
 
+        // Rows are a fixed height, so it must clear the *tallest* widget a row
+        // can host — the collapse arrow and the inline text edit are both taller
+        // than plain body text, and a short row clipped them.
         let text_height = ui.text_style_height(&egui::TextStyle::Body);
-        let row_height = text_height + 4.0;
+        let row_height = text_height.max(ui.spacing().interact_size.y) + 4.0;
+
+        // Never wrap inside a cell. A wrapped second line overflows the fixed
+        // row height and is clipped, which is what turned a 16-digit address
+        // into a smear of half-visible rows.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
 
         // Collect a pending disasm-goto request during the table draw and apply
         // it after the closure exits (avoids the borrow conflict on `self`).
         #[cfg(target_os = "linux")]
         { self.pending_disasm_goto = None; }
 
+        // Row the user clicked this frame, applied after the body closure ends.
+        let mut clicked_row: Option<(Uuid, Vec<usize>)> = None;
+        let selected_node = self.selected_node.clone();
+
+        // Column widths matter more than they look: a resizable `TableBuilder`
+        // hands each column its width in order and gives the last one whatever
+        // is left, so if the fixed widths overflow the pane the trailing
+        // columns (Value, Comment — and with them the matrix cells) are pushed
+        // off the right edge with no scrollbar to reach them. The five fixed
+        // widths below sum to ~475px so all six columns survive a narrow dock
+        // pane; every one is still drag-resizable, and Comment absorbs the
+        // slack in a wide one.
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
-            .column(Column::initial(140.0).at_least(80.0))   // Address
-            .column(Column::initial(60.0).at_least(40.0))    // Offset
-            .column(Column::initial(90.0).at_least(60.0))    // Type
-            .column(Column::initial(120.0).at_least(60.0))   // Name
-            .column(Column::remainder().at_least(80.0))      // Value
-            .column(Column::initial(150.0).at_least(60.0))   // Comment
+            .column(Column::initial(130.0).at_least(80.0))   // Address
+            .column(Column::initial(66.0).at_least(48.0))    // Offset
+            .column(Column::initial(68.0).at_least(50.0))    // Type
+            .column(Column::initial(85.0).at_least(60.0))    // Name
+            .column(Column::initial(128.0).at_least(80.0))   // Value
+            .column(Column::remainder().at_least(40.0))      // Comment
             .header(row_height + 2.0, |mut header| {
                 header.col(|ui| { ui.strong("Address"); });
                 header.col(|ui| { ui.strong("Offset"); });
@@ -3105,6 +3498,8 @@ impl NemclassApp {
                             let pointer_target = snap.pointer_target;
                             let snap_owner     = snap.owner_class;
                             let snap_local_path = snap.local_path.clone();
+                            let components     = snap.components.clone();
+                            let float_width    = snap.float_width;
 
                             // For live-expandable nodes, we treat them as
                             // containers (has_children for collapse toggle) even
@@ -3116,16 +3511,32 @@ impl NemclassApp {
                             #[cfg(not(target_os = "linux"))]
                             let is_live_container = false;
 
-                            row.col(|ui| { ui.monospace(format!("0x{address:016X}")); });
-                            row.col(|ui| { ui.monospace(format!("+{offset:#06X}")); });
-                            row.col(|ui| { ui.label(type_tag); });
+                            // A matrix expands into one child row per matrix row.
+                            let is_matrix = matrix_shape(type_tag).is_some();
+                            let is_vector = vector_shape(type_tag).is_some();
+
+                            row.set_selected(
+                                selected_node.as_ref().is_some_and(|(o, p)| {
+                                    *o == snap_owner && *p == snap_local_path
+                                }),
+                            );
+
+                            let (_, r) = row.col(|ui| { mono_cell(ui, format!("0x{address:012X}")); });
+                            let mut row_clicked = r.clicked();
+                            let (_, r) = row.col(|ui| { mono_cell(ui, format!("+{offset:#06X}")); });
+                            row_clicked |= r.clicked();
+                            let (_, r) = row.col(|ui| { text_cell(ui, type_tag); });
+                            row_clicked |= r.clicked();
+                            if row_clicked {
+                                clicked_row = Some((snap_owner, snap_local_path.clone()));
+                            }
 
                             row.col(|ui| {
                                 ui.horizontal(|ui| {
                                     let indent = depth as f32 * 12.0;
                                     if indent > 0.0 { ui.add_space(indent); }
 
-                                    if has_children || is_live_container {
+                                    if has_children || is_live_container || is_matrix {
                                         if type_tag == "Pointer" {
                                             let is_expanded = self.expanded_ptrs.contains(&id_path);
                                             let arrow = if is_expanded { "▼" } else { "▶" };
@@ -3170,13 +3581,16 @@ impl NemclassApp {
                                             self.edit_state = None;
                                         }
                                     } else {
-                                        let resp = ui.label(&name);
+                                        let resp = text_cell(ui, &name);
                                         if resp.double_clicked() {
                                             self.edit_state = Some(EditState {
                                                 node_id: id_path.clone(),
                                                 text: name.clone(),
                                                 field: EditField::Name,
                                             });
+                                        } else if resp.clicked() {
+                                            clicked_row =
+                                                Some((snap_owner, snap_local_path.clone()));
                                         }
                                     }
                                 });
@@ -3188,7 +3602,39 @@ impl NemclassApp {
                                     .as_ref()
                                     .is_some_and(|e| e.node_id == id_path && e.field == EditField::Value);
 
-                                if is_editable(type_tag) && self.process.is_some() {
+                                if is_vector {
+                                    // One editable cell per component, laid out
+                                    // inline: `(x, y, z)` is three separate
+                                    // values, not one string.
+                                    if components.is_empty() {
+                                        text_cell(ui, &value);
+                                    } else {
+                                        let width = float_width.unwrap_or(FloatWidth::F32);
+                                        let wsz = width.size();
+                                        ui.horizontal(|ui| {
+                                            for (i, v) in components.iter().enumerate() {
+                                                self.float_component_cell(
+                                                    ui,
+                                                    &id_path,
+                                                    i,
+                                                    *v,
+                                                    width,
+                                                    address.wrapping_add(i * wsz),
+                                                );
+                                            }
+                                        });
+                                    }
+                                } else if is_matrix {
+                                    // Shape summary; the cells live in the
+                                    // per-matrix-row children below.
+                                    let resp = text_cell(ui, &value);
+                                    resp.context_menu(|ui| {
+                                        self.build_node_context_menu(
+                                            ui, snap_owner, snap_local_path.clone(),
+                                            type_tag, &value, pointer_target,
+                                        );
+                                    });
+                                } else if is_editable(type_tag) && self.process.is_some() {
                                     if editing {
                                         let resp = ui.text_edit_singleline(
                                             &mut self.edit_state.as_mut().unwrap().text,
@@ -3253,7 +3699,7 @@ impl NemclassApp {
                                         self.edit_state = None;
                                     }
                                 } else {
-                                    let resp = ui.label(&comment);
+                                    let resp = text_cell(ui, &comment);
                                     if resp.double_clicked() {
                                         self.edit_state = Some(EditState {
                                             node_id: id_path.clone(),
@@ -3263,6 +3709,53 @@ impl NemclassApp {
                                     }
                                 }
                             });
+                        }
+
+                        // One row of an expanded matrix: `cols` editable cells.
+                        ViewRow::MatrixRow { snap_idx, row: mrow } => {
+                            let snap = &self.node_snapshots[*snap_idx];
+                            let Some((_, cols, width)) = matrix_shape(snap.type_tag) else { return };
+                            let cols = cols as usize;
+                            let wsz = width.size();
+                            let base_index = *mrow * cols;
+
+                            let id_path = snap.id_path.clone();
+                            let depth = snap.depth;
+                            let base_addr = snap.address;
+                            let base_offset = snap.offset;
+                            let cells: Vec<f64> = snap
+                                .components
+                                .get(base_index..base_index + cols)
+                                .map(<[f64]>::to_vec)
+                                .unwrap_or_default();
+
+                            let row_addr = base_addr.wrapping_add(base_index * wsz);
+                            row.col(|ui| { mono_cell(ui, format!("0x{row_addr:012X}")); });
+                            row.col(|ui| {
+                                mono_cell(ui, format!("+{:#06X}", base_offset + base_index * wsz));
+                            });
+                            row.col(|ui| { text_cell(ui, ""); });
+                            row.col(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_space((depth as f32 + 1.0) * 12.0 + 16.0);
+                                    text_cell(ui, &format!("[{mrow}]"));
+                                });
+                            });
+                            row.col(|ui| {
+                                ui.horizontal(|ui| {
+                                    for (c, v) in cells.iter().enumerate() {
+                                        self.float_component_cell(
+                                            ui,
+                                            &id_path,
+                                            base_index + c,
+                                            *v,
+                                            width,
+                                            row_addr.wrapping_add(c * wsz),
+                                        );
+                                    }
+                                });
+                            });
+                            row.col(|ui| { text_cell(ui, ""); });
                         }
 
                         #[cfg(target_os = "linux")]
@@ -3350,6 +3843,16 @@ impl NemclassApp {
                 });
             });
 
+        // Clicking a row makes it the toolbar's target; clicking the selected
+        // row again clears the selection (so "Add bytes" goes back to appending).
+        if let Some(hit) = clicked_row {
+            self.selected_node = if self.selected_node.as_ref() == Some(&hit) {
+                None
+            } else {
+                Some(hit)
+            };
+        }
+
         // Apply any pending disasm navigation collected during the draw phase.
         #[cfg(target_os = "linux")]
         if let Some(addr) = self.pending_disasm_goto.take() {
@@ -3433,6 +3936,33 @@ impl NemclassApp {
                     ui.close();
                 }
             }
+
+            ui.separator();
+            ui.menu_button("Vector ▸", |ui| {
+                for (tag, components, width) in VECTOR_SHAPES {
+                    if ui.button(format!("Vec{components} {}", width.rust_ty())).clicked() {
+                        self.pending_node_edits.push(NodeEditOp::ChangeType {
+                            owner: snap_owner,
+                            path: snap_local_path.clone(),
+                            new_tag: tag,
+                        });
+                        ui.close();
+                    }
+                }
+            });
+            ui.menu_button("Matrix ▸", |ui| {
+                for (tag, rows, cols, width) in MATRIX_SHAPES {
+                    if ui.button(format!("Mat{rows}x{cols} {}", width.rust_ty())).clicked() {
+                        self.pending_node_edits.push(NodeEditOp::ChangeType {
+                            owner: snap_owner,
+                            path: snap_local_path.clone(),
+                            new_tag: tag,
+                        });
+                        ui.close();
+                    }
+                }
+            });
+
             ui.separator();
             if ui.button("Class Instance…").clicked() {
                 self.class_picker = Some(ClassPickerState {
@@ -3767,6 +4297,21 @@ impl NemclassApp {
                 }
                 invalidate(self);
             }
+            NodeEditOp::DeleteRange { owner, path, count } => {
+                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
+                    // Clamp to the end of the sibling list: "delete 1024 fields"
+                    // on a 12-field class removes the 12, not nothing.
+                    let end = idx.saturating_add(count).min(vec.len());
+                    vec.drain(idx..end);
+                }
+                invalidate(self);
+            }
+            NodeEditOp::AppendBytes { owner, count } => {
+                if let Some(class) = self.project.get_class_mut(&owner) {
+                    class.children.extend(hex_fill(count));
+                }
+                invalidate(self);
+            }
             NodeEditOp::AddBytes { owner, path, count } => {
                 if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
                     let insert_at = idx + 1;
@@ -3915,6 +4460,10 @@ fn flatten_nodes(
             node.memory_size()
         };
 
+        // Vector/matrix nodes carry their components alongside the rendered
+        // string so the table can lay out (and edit) each one separately.
+        let (components, float_width) = read_float_components(node.as_ref(), buf, cur_offset);
+
         out.push(NodeSnapshot {
             address: base_addr.wrapping_add(cur_offset),
             offset: cur_offset,
@@ -3929,6 +4478,8 @@ fn flatten_nodes(
             pointer_target: ptr_target,
             owner_class,
             local_path: local_path.clone(),
+            components,
+            float_width,
         });
 
         // Static children (unchanged).
@@ -4013,6 +4564,43 @@ fn flatten_nodes(
     }
 }
 
+/// Pull the float components out of a vector/matrix node's slice of `buf`.
+///
+/// The shape is recovered from the node's type tag (see `nemclass_model::node::vector`)
+/// rather than by downcasting, so this works through `&dyn Node`. Returns
+/// `(components, Some(width))` for vector/matrix tags — with an *empty* vec when
+/// the buffer is too short to hold the whole node, so a partial read is never
+/// mistaken for real data — and `(vec![], None)` for every other node type.
+fn read_float_components(
+    node: &dyn Node,
+    buf: &[u8],
+    offset: usize,
+) -> (Vec<f64>, Option<FloatWidth>) {
+    let tag = node.type_tag();
+    let (count, width) = if let Some((c, w)) = vector_shape(tag) {
+        (c as usize, w)
+    } else if let Some((r, c, w)) = matrix_shape(tag) {
+        (r as usize * c as usize, w)
+    } else {
+        return (Vec::new(), None);
+    };
+
+    let wsz = width.size();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let Some(start) = offset.checked_add(i * wsz) else { return (Vec::new(), Some(width)) };
+        let Some(end) = start.checked_add(wsz) else { return (Vec::new(), Some(width)) };
+        if end > buf.len() {
+            return (Vec::new(), Some(width));
+        }
+        match width.read(&buf[start..end]) {
+            Some(v) => out.push(v),
+            None => return (Vec::new(), Some(width)),
+        }
+    }
+    (out, Some(width))
+}
+
 fn class_instance_target(node: &dyn Node) -> Option<Uuid> {
     if node.type_tag() != "ClassInstance" { return None; }
     let def = node.to_node_def();
@@ -4058,6 +4646,17 @@ fn build_augmented_rows(
         out.push(ViewRow::Snap(snap_idx));
 
         let snap = &snapshots[snap_idx];
+
+        // An expanded matrix contributes one row per matrix row, laid out from
+        // the components already read into the snapshot.
+        if let Some((rows, cols, _)) = matrix_shape(snap.type_tag)
+            && !collapsed.contains(&snap.id_path)
+            && snap.components.len() == rows as usize * cols as usize
+        {
+            for row in 0..rows as usize {
+                out.push(ViewRow::MatrixRow { snap_idx, row });
+            }
+        }
 
         // Only inject live rows for the three live-expandable type tags,
         // and only when the node is not collapsed.
@@ -4203,6 +4802,34 @@ fn write_parsed(proc: &Process, addr: usize, type_tag: &str, text: &str) -> Resu
     }
 }
 
+// ---------------------------------------------------------------------------
+// Class-view cell helpers
+// ---------------------------------------------------------------------------
+
+/// A monospace table cell that truncates rather than wrapping.
+///
+/// Every class-view cell must go through one of these two helpers: table rows
+/// are a fixed height, so a cell that wraps onto a second line has that line
+/// clipped, and the column reads as garbage (this is what broke the Address
+/// column). The response is click-sensed so a click anywhere in the row can
+/// select it.
+fn mono_cell(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    ui.add(
+        egui::Label::new(egui::RichText::new(text.into()).monospace())
+            .truncate()
+            .sense(egui::Sense::click()),
+    )
+}
+
+/// A proportional table cell that truncates rather than wrapping.
+fn text_cell(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Label::new(text)
+            .truncate()
+            .sense(egui::Sense::click()),
+    )
+}
+
 fn is_editable(type_tag: &str) -> bool {
     matches!(
         type_tag,
@@ -4232,9 +4859,10 @@ fn read_process_buf(proc: &Process, addr: usize, size: usize) -> Vec<u8> {
 
 fn demo_project() -> Project {
     use nemclass_model::node::builtins::{
-        ArrayNode, BoolNode, Float32Node, Float64Node, Hex32Node, Hex64Node,
+        ArrayNode, BoolNode, Float32Node, Hex32Node, Hex64Node,
         Int32Node, PointerNode, UInt8Node, Utf8TextNode,
     };
+    use nemclass_model::{MatrixNode, VectorNode};
 
     let mut project = Project::new("Demo Project");
     let mut player = ClassNode::new("PlayerObject");
@@ -4244,9 +4872,12 @@ fn demo_project() -> Project {
     { let mut n = Int32Node::new("health");      n.comment = "Current HP".into();           player.children.push(Box::new(n)); }
     { let mut n = Int32Node::new("max_health");  n.comment = "Max HP".into();               player.children.push(Box::new(n)); }
     { let mut n = Float32Node::new("mana");      n.comment = "Mana pool".into();            player.children.push(Box::new(n)); }
-    { let mut n = Float64Node::new("pos_x");     n.comment = "X position".into();           player.children.push(Box::new(n)); }
-    { let mut n = Float64Node::new("pos_y");     n.comment = "Y position".into();           player.children.push(Box::new(n)); }
-    { let mut n = Float64Node::new("pos_z");     n.comment = "Z position".into();           player.children.push(Box::new(n)); }
+    { let mut n = VectorNode::new("position", 3, FloatWidth::F32);
+      n.comment = "World position (Vec3 f32)".into();                                       player.children.push(Box::new(n)); }
+    { let mut n = VectorNode::new("rotation", 4, FloatWidth::F32);
+      n.comment = "Orientation quaternion (Vec4 f32)".into();                                player.children.push(Box::new(n)); }
+    { let mut n = MatrixNode::new("view_matrix", 4, 4, FloatWidth::F32);
+      n.comment = "View matrix — expand to edit cells".into();                               player.children.push(Box::new(n)); }
     { let mut n = Hex32Node::new("flags");       n.comment = "State flags (hex)".into();    player.children.push(Box::new(n)); }
     { let mut n = Hex64Node::new("vtable");      n.comment = "vptr (hex)".into();           player.children.push(Box::new(n)); }
     { let mut n = PointerNode::new("next");      n.comment = "Linked list next".into();     player.children.push(Box::new(n)); }
@@ -4484,5 +5115,143 @@ mod tests {
         assert_eq!(after.name, "after");
         assert_eq!(after.offset, 8, "field after instance must sit at resolved_class_size(B) = 8");
         assert_eq!(after.owner_class, a_uuid);
+    }
+
+    // -----------------------------------------------------------------------
+    // Vector / matrix rows
+    // -----------------------------------------------------------------------
+
+    /// A vector node's components must be carried on the snapshot so the table
+    /// can lay out one editable cell per component.
+    #[test]
+    fn vector_snapshot_carries_its_components() {
+        use nemclass_model::{FloatWidth, VectorNode};
+
+        let mut buf = Vec::new();
+        for v in [1.0f32, 2.0, 3.0] {
+            buf.extend_from_slice(&v.to_ne_bytes());
+        }
+
+        let node = VectorNode::new("pos", 3, FloatWidth::F32);
+        let (components, width) = read_float_components(&node, &buf, 0);
+        assert_eq!(components, vec![1.0, 2.0, 3.0]);
+        assert_eq!(width, Some(FloatWidth::F32));
+    }
+
+    /// A buffer too short for the whole node yields *no* components rather than
+    /// a partial read — half a vector shown as if it were real data would be a
+    /// lie about the target's memory.
+    #[test]
+    fn short_buffer_yields_no_components() {
+        use nemclass_model::{FloatWidth, VectorNode};
+
+        let node = VectorNode::new("pos", 3, FloatWidth::F32);
+        let (components, width) = read_float_components(&node, &[0u8; 8], 0);
+        assert!(components.is_empty());
+        assert_eq!(width, Some(FloatWidth::F32));
+    }
+
+    /// Non-vector nodes carry nothing, so the table takes the ordinary
+    /// single-value path for them.
+    #[test]
+    fn scalar_nodes_carry_no_components() {
+        let node = Int32Node::new("health");
+        let (components, width) = read_float_components(&node, &[0u8; 8], 0);
+        assert!(components.is_empty());
+        assert_eq!(width, None);
+    }
+
+    /// An expanded matrix contributes one extra view row per matrix row; a
+    /// collapsed one contributes none.
+    #[test]
+    fn expanded_matrix_injects_one_row_per_matrix_row() {
+        use nemclass_model::{FloatWidth, MatrixNode};
+
+        let reg = NodeRegistry::new().with_builtins();
+        let mut project = Project::new("P");
+        let uuid = Uuid::new_v4();
+        let mut cls = ClassNode::with_uuid(uuid, "C");
+        cls.children.push(Box::new(MatrixNode::new("view", 3, 4, FloatWidth::F32)));
+        project.add_class(cls);
+        let _ = &reg;
+
+        // 3x4 f32 = 48 bytes.
+        let buf = vec![0u8; 48];
+        let mut snapshots = Vec::new();
+        let mut visited = HashSet::new();
+        flatten_nodes(
+            &project.get_class(&uuid).unwrap().children,
+            0x1000,
+            0,
+            0,
+            &buf,
+            String::new(),
+            uuid,
+            &[],
+            &mut snapshots,
+            &project,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &mut visited,
+            8,
+        );
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].type_tag, "Matrix3x4");
+        assert_eq!(snapshots[0].components.len(), 12);
+
+        // Expanded (nothing in `collapsed`): 1 node row + 3 matrix rows.
+        let collapsed = HashSet::new();
+        let rows = build_augmented_rows(
+            &snapshots,
+            &collapsed,
+            #[cfg(target_os = "linux")]
+            &HashMap::new(),
+        );
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(rows[0], ViewRow::Snap(0)));
+        for (i, row) in rows[1..].iter().enumerate() {
+            match row {
+                ViewRow::MatrixRow { snap_idx, row } => {
+                    assert_eq!(*snap_idx, 0);
+                    assert_eq!(*row, i);
+                }
+                _ => panic!("expected a MatrixRow at index {}", i + 1),
+            }
+        }
+
+        // Collapsed: just the node row.
+        let mut collapsed = HashSet::new();
+        collapsed.insert(snapshots[0].id_path.clone());
+        let rows = build_augmented_rows(
+            &snapshots,
+            &collapsed,
+            #[cfg(target_os = "linux")]
+            &HashMap::new(),
+        );
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// "Delete N fields" must clamp to the end of the sibling list rather than
+    /// panicking when N runs past it.
+    #[test]
+    fn delete_range_clamps_to_the_end_of_the_class() {
+        let mut project = Project::new("P");
+        let uuid = Uuid::new_v4();
+        let mut cls = ClassNode::with_uuid(uuid, "C");
+        for i in 0..3 {
+            cls.children.push(Box::new(Int32Node::new(format!("f{i}"))));
+        }
+        project.add_class(cls);
+
+        // Delete 1024 starting at index 1 → removes the last two only.
+        let (vec, idx) = resolve_parent_vec_mut(&mut project, uuid, &[1]).unwrap();
+        let end = idx.saturating_add(1024).min(vec.len());
+        vec.drain(idx..end);
+
+        let children = &project.get_class(&uuid).unwrap().children;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name(), "f0");
     }
 }
