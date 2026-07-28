@@ -1329,14 +1329,6 @@ impl NemclassApp {
             return;
         };
 
-        let modules: Vec<ModuleInfoWithName> = match proc.modules() {
-            Ok(it) => it.collect(),
-            Err(e) => {
-                self.last_error = Some(format!("modules(): {e}"));
-                Vec::new()
-            }
-        };
-
         let formula = self.project.get_class(&uuid)
             .map(|c| c.address_formula.clone())
             .unwrap_or_default();
@@ -1344,11 +1336,24 @@ impl NemclassApp {
         // A script-resolved base (from the "Try resolve (script)" button) takes
         // precedence over the address formula and is sticky until the user edits
         // the formula or detaches.
+        //
+        // The module list is enumerated *inside* this branch, not before it:
+        // `proc.modules()` parses the whole of /proc/<pid>/maps, and this runs on
+        // the snapshot tick (10 Hz by default). Enumerating up front meant paying
+        // for it ten times a second even when the class had no address formula
+        // to resolve, or when a sticky script-resolved base made it moot.
         let base = if let Some(sb) = self.script_resolved_base {
             Some(sb)
         } else if formula.trim().is_empty() {
             None
         } else {
+            let modules: Vec<ModuleInfoWithName> = match proc.modules() {
+                Ok(it) => it.collect(),
+                Err(e) => {
+                    self.last_error = Some(format!("modules(): {e}"));
+                    Vec::new()
+                }
+            };
             let reader = ProcessReader::new(proc, modules);
             match resolve_formula(&formula, &reader, &reader) {
                 Ok(addr) => Some(addr),
@@ -1556,22 +1561,32 @@ impl NemclassApp {
             }
         };
 
+        // Work out what actually needs resolving *before* building the region
+        // index. `RegionIndex::from_pid` parses the whole of /proc/<pid>/maps,
+        // and this runs on the snapshot tick (10 Hz by default) — so a class
+        // with no VTable/Function/FunctionPtr node, which is most classes, paid
+        // a full maps parse ten times a second for a result it never used.
+        //
+        // We clone the metadata we need (addresses + type tags) because we
+        // cannot hold `&self.process` while also taking `&mut self.live_cache`.
+        let targets: Vec<(String, &'static str, usize)> = self
+            .node_snapshots
+            .iter()
+            .filter(|s| matches!(s.type_tag, "VTable" | "Function" | "FunctionPtr"))
+            .filter(|s| !collapsed.contains(&s.id_path))
+            .filter(|s| !self.live_cache.contains_key(&s.id_path))
+            .map(|s| (s.id_path.clone(), s.type_tag, s.address))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+
         // Build a RegionIndex once per refresh (one /proc/<pid>/maps parse).
         let pid = proc.pid();
         let region_index = match RegionIndex::from_pid(pid) {
             Ok(idx) => idx,
             Err(_) => return,
         };
-
-        // Clone the snapshot list metadata we need (addresses + type tags).
-        // We need to avoid holding &self.process while also calling &mut self.live_cache.
-        let targets: Vec<(String, &'static str, usize)> = self
-            .node_snapshots
-            .iter()
-            .filter(|s| matches!(s.type_tag, "VTable" | "Function" | "FunctionPtr"))
-            .filter(|s| !collapsed.contains(&s.id_path))
-            .map(|s| (s.id_path.clone(), s.type_tag, s.address))
-            .collect();
 
         for (id_path, type_tag, node_addr) in targets {
             // Only refresh if not already cached (cache cleared above on collapse).
@@ -2781,12 +2796,10 @@ impl NemclassApp {
         #[cfg(not(target_os = "linux"))]
         let pid: Option<nemclass_core::Pid> = None;
 
-        let modules: Vec<nemclass_core::ModuleInfoWithName> = self
-            .process
-            .as_ref()
-            .and_then(|p| p.modules().ok())
-            .map(|it| it.collect())
-            .unwrap_or_default();
+        // Through the TTL cache, not a fresh enumeration: this ran every frame
+        // the tab was visible, and `p.modules()` parses the whole of
+        // /proc/<pid>/maps. `scanner_modules` exists precisely to prevent that.
+        let modules = self.scanner_modules();
 
         // A chain is anchored in a module image, so the Modules tab's selection
         // is exactly the set of anchors worth searching. Unscoped, every `.so`
@@ -3077,11 +3090,11 @@ impl NemclassApp {
     fn show_modules_tab(&mut self, ui: &mut egui::Ui) {
         #[cfg(target_os = "linux")]
         {
-            let modules = self
-                .process
-                .as_ref()
-                .map(|p| Self::sorted_modules(p))
-                .unwrap_or_default();
+            // Sort the cached list rather than re-enumerating every frame —
+            // `sorted_modules` parses /proc/<pid>/maps, and this tab redraws at
+            // the frame rate.
+            let mut modules = self.scanner_modules();
+            modules.sort_by_key(|m| m.base);
             if let Some(sel) = self.modules_panel.show(ui, &modules)
                 && let Some(proc) = self.process.clone()
             {

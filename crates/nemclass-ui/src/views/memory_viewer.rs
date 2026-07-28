@@ -121,6 +121,9 @@ pub struct MemoryViewer {
 
     // ── string highlights ─────────────────────────────────────────────────
     /// String runs detected in the current `buf`.
+    /// Per-qword pointer classification, refreshed once per snapshot rather
+    /// than once per frame. See `refresh_qword_classes`.
+    qword_classes: Vec<nemclass_core::PointerClass>,
     string_runs: Vec<StringRun>,
 
     // ── region index (Linux only at runtime, always compiled) ─────────────
@@ -156,6 +159,7 @@ impl MemoryViewer {
             bytes_read:    0,
             last_snapshot: None,
 
+            qword_classes: Vec::new(),
             string_runs: Vec::new(),
 
             #[cfg(target_os = "linux")]
@@ -178,6 +182,7 @@ impl MemoryViewer {
         self.bytes_read    = 0;
         self.last_snapshot = None;
         self.string_runs.clear();
+        self.qword_classes.clear();
         self.history.clear();
         self.address_error  = None;
         self.status_msg     = None;
@@ -290,9 +295,46 @@ impl MemoryViewer {
 
         // Detect string runs once per snapshot.
         self.string_runs = detect_strings(&self.buf[..self.bytes_read.min(SNAPSHOT_SIZE)], MIN_STRING_LEN);
+        self.refresh_qword_classes(process);
 
         self.last_snapshot = Some(Instant::now());
     }
+
+    /// Classify every qword in the snapshot as null / not-a-pointer / data /
+    /// code / vtable, once per snapshot.
+    ///
+    /// This used to run in the draw path, so **every frame** classified up to
+    /// 512 qwords — and `classify_value` issues a live read per pointer-looking
+    /// slot, plus a vtable probe on top. That is hundreds of syscalls per frame
+    /// on the UI thread, for a page of which only ~16 rows are visible. Doing it
+    /// on the snapshot cadence (like `string_runs` above) is the same work at a
+    /// fraction of the rate.
+    #[cfg(target_os = "linux")]
+    fn refresh_qword_classes(&mut self, process: &Process) {
+        use nemclass_core::PointerClass;
+        if self.display_type != DisplayType::Qword {
+            self.qword_classes.clear();
+            return;
+        }
+        let Some(idx) = self.region_index.as_ref() else {
+            self.qword_classes.clear();
+            return;
+        };
+        let num_qwords = self.bytes_read / 8;
+        self.qword_classes = (0..num_qwords)
+            .map(|qi| {
+                let off = qi * 8;
+                if off + 8 > self.buf.len() {
+                    return PointerClass::NotPointer;
+                }
+                let v = u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap_or([0u8; 8]));
+                classify_value(v, idx, |addr, buf| process.read_buf(addr, buf))
+            })
+            .collect();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn refresh_qword_classes(&mut self, _process: &Process) {}
 
     // -----------------------------------------------------------------------
     // Main draw entry point
@@ -486,31 +528,9 @@ impl MemoryViewer {
         // Qword; stays empty otherwise to avoid unnecessary work.
         //
         // The type annotation is needed so the cfg-gated branches agree.
+        // Computed once per snapshot in `refresh_qword_classes`, not per frame.
         use nemclass_core::PointerClass;
-        let qword_classes: Vec<PointerClass> = if self.display_type == DisplayType::Qword {
-            #[cfg(target_os = "linux")]
-            {
-                if let Some(idx) = &self.region_index {
-                    let num_qwords = self.bytes_read / 8;
-                    (0..num_qwords)
-                        .map(|qi| {
-                            let off = qi * 8;
-                            if off + 8 > self.buf.len() { return PointerClass::NotPointer; }
-                            let v = u64::from_le_bytes(
-                                self.buf[off..off + 8].try_into().unwrap_or([0u8; 8])
-                            );
-                            classify_value(v, idx, |addr, buf| process.read_buf(addr, buf))
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            { Vec::new() }
-        } else {
-            Vec::new()
-        };
+        let qword_classes: Vec<PointerClass> = self.qword_classes.clone();
 
         // Suppress the unused warning on non-Linux where process is only used above.
         #[cfg(not(target_os = "linux"))]

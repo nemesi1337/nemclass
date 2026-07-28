@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use nemclass_core::{Pid, Process};
+use nemclass_core::{ModuleInfoWithName, Pid, Process};
 use crate::process_reader::ProcessReader;
 use nemclass_model::{CheatEntry, CheatTable};
 use nemclass_scan::{FreezeSet, ScanValueType};
@@ -14,6 +14,12 @@ use nemclass_scan::{FreezeSet, ScanValueType};
 use nemclass_scan::ProcessTarget;
 
 const FREEZE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How long a cached module list is reused before `/proc/<pid>/maps` is parsed
+/// again. Module bases only change on `dlopen`/`dlclose`, so a second is ample —
+/// and the alternative was a full maps parse *per frame* in `show` plus another
+/// on every freeze tick.
+const MODULE_CACHE_TTL: Duration = Duration::from_millis(1000);
 
 /// Actions the panel asks the parent app to apply after the draw.
 pub enum CheatTablePanelAction {
@@ -33,6 +39,18 @@ pub struct CheatTablePanel {
     last_freeze: Option<Instant>,
     live_values: Vec<String>,
     pub status_msg: Option<String>,
+    /// Module list for address-formula resolution, cached for
+    /// [`MODULE_CACHE_TTL`]. Rebuilding it means parsing the whole of
+    /// `/proc/<pid>/maps`, which this panel was doing once per drawn frame *and*
+    /// again on every 200 ms freeze tick.
+    modules: Vec<ModuleInfoWithName>,
+    modules_at: Option<Instant>,
+    /// The write target for freezing, held across ticks. `ProcessTarget::attach`
+    /// was called fresh on every tick, five times a second, forever.
+    #[cfg(target_os = "linux")]
+    freeze_target: Option<ProcessTarget>,
+    #[cfg(target_os = "linux")]
+    freeze_target_pid: Option<Pid>,
 }
 
 impl CheatTablePanel {
@@ -42,6 +60,12 @@ impl CheatTablePanel {
             last_freeze: None,
             live_values: Vec::new(),
             status_msg: None,
+            modules: Vec::new(),
+            modules_at: None,
+            #[cfg(target_os = "linux")]
+            freeze_target: None,
+            #[cfg(target_os = "linux")]
+            freeze_target_pid: None,
         }
     }
 
@@ -58,6 +82,30 @@ impl CheatTablePanel {
     pub fn on_detach(&mut self) {
         self.last_freeze = None;
         self.live_values.clear();
+        self.modules.clear();
+        self.modules_at = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.freeze_target = None;
+            self.freeze_target_pid = None;
+        }
+    }
+
+    /// The cached module list, refreshed at most once per [`MODULE_CACHE_TTL`].
+    fn cached_modules(&mut self, process: Option<&Process>) -> &[ModuleInfoWithName] {
+        let Some(p) = process else {
+            self.modules.clear();
+            self.modules_at = None;
+            return &self.modules;
+        };
+        let stale = self
+            .modules_at
+            .is_none_or(|t| t.elapsed() >= MODULE_CACHE_TTL);
+        if stale {
+            self.modules = p.modules().map(|it| it.collect()).unwrap_or_default();
+            self.modules_at = Some(Instant::now());
+        }
+        &self.modules
     }
 
     /// Toggle the frozen state of every entry in the table at once.
@@ -77,7 +125,9 @@ impl CheatTablePanel {
         // Rebuild the live-values list so we have fresh values to freeze with.
         let n = self.table.entries.len();
         self.live_values.resize(n, String::new());
-        let resolver = formula_resolver(process);
+        // Cached — this used to parse the whole of /proc/<pid>/maps every frame.
+        let modules = self.cached_modules(process).to_vec();
+        let resolver = process.map(|p| ProcessReader::new(p, modules));
         for (i, entry) in self.table.entries.iter().enumerate() {
             let vt = ScanValueType::from_tag(&entry.value_type);
             self.live_values[i] = read_entry_value(process, resolver.as_ref(), entry, vt);
@@ -116,7 +166,9 @@ impl CheatTablePanel {
         self.last_freeze = Some(Instant::now());
 
         let mut freeze_set = FreezeSet::new();
-        let resolver = formula_resolver(process);
+        // Cached — this used to parse the whole of /proc/<pid>/maps every tick.
+        let modules = self.cached_modules(process).to_vec();
+        let resolver = process.map(|p| ProcessReader::new(p, modules));
         for entry in &self.table.entries {
             if !entry.frozen {
                 continue;
@@ -133,10 +185,21 @@ impl CheatTablePanel {
         if freeze_set.is_empty() {
             return;
         }
-        if let Some(pid) = pid
-            && let Ok(target) = ProcessTarget::attach(pid)
-        {
-            let _ = freeze_set.apply(&target);
+        let Some(pid) = pid else { return };
+        // Attach once and hold it. This ran `ProcessTarget::attach` fresh on
+        // every tick — five times a second, for as long as the app was open.
+        if self.freeze_target_pid != Some(pid) {
+            self.freeze_target = ProcessTarget::attach(pid).ok();
+            self.freeze_target_pid = self.freeze_target.is_some().then_some(pid);
+        }
+        let Some(target) = self.freeze_target.as_ref() else {
+            self.status_msg = Some(format!("Cannot write to pid {pid} — values not frozen."));
+            return;
+        };
+        // Report *why* a value did not stick instead of discarding the result.
+        let report = freeze_set.apply(target);
+        if let Some(problem) = report.problem() {
+            self.status_msg = Some(problem);
         }
     }
 
@@ -203,7 +266,10 @@ impl CheatTablePanel {
         // ── refresh live values ──────────────────────────────────────────────
         let n = self.table.entries.len();
         self.live_values.resize(n, String::new());
-        let resolver = formula_resolver(process);
+        // Cached — this used to parse the whole of /proc/<pid>/maps every frame,
+        // and again further down for a value write.
+        let modules = self.cached_modules(process).to_vec();
+        let resolver = process.map(|p| ProcessReader::new(p, modules.clone()));
         for (i, entry) in self.table.entries.iter().enumerate() {
             let vt = ScanValueType::from_tag(&entry.value_type);
             self.live_values[i] = read_entry_value(process, resolver.as_ref(), entry, vt);
@@ -347,7 +413,8 @@ impl CheatTablePanel {
             }
         if let Some((idx, val_text)) = write_value
             && let Some(entry) = self.table.entries.get_mut(idx) {
-                let addr = resolve_entry_addr(entry, formula_resolver(process).as_ref());
+                let resolver = process.map(|p| ProcessReader::new(p, modules.clone()));
+                let addr = resolve_entry_addr(entry, resolver.as_ref());
                 let vt = ScanValueType::from_tag(&entry.value_type);
                 if let (Some(addr), Some(vt), Some(proc)) = (addr, vt, process)
                     && write_value_typed(proc, addr, vt, &val_text).is_ok()
@@ -402,16 +469,6 @@ fn resolve_entry_addr(entry: &CheatEntry, resolver: Option<&ProcessReader<'_>>) 
     }
     let r = resolver?;
     nemclass_model::resolve_formula(&entry.address, r, r).ok()
-}
-
-/// Builds the formula resolver for a frame, or `None` when nothing is attached.
-///
-/// The module list comes from `/proc/<pid>/maps`, so this is built once per
-/// draw/tick rather than per entry.
-fn formula_resolver(process: Option<&Process>) -> Option<ProcessReader<'_>> {
-    let p = process?;
-    let modules = p.modules().map(|it| it.collect()).unwrap_or_default();
-    Some(ProcessReader::new(p, modules))
 }
 
 fn read_entry_bytes(
