@@ -2,6 +2,61 @@ use iced_x86::{
     Code, Decoder, DecoderOptions, FlowControl, Formatter, Instruction, NasmFormatter, OpKind,
 };
 
+/// The decode width to use for a *target* module — 16/32/64-bit x86.
+///
+/// This exists because the width is a property of the **module being inspected**,
+/// not of the host running nemclass. A Wine/Proton process maps 32-bit (WoW64)
+/// and 64-bit PE images alongside native ELF objects in one address space, so
+/// picking the width from `cfg!(target_pointer_width)` decodes a 32-bit module as
+/// 64-bit garbage. Callers derive this from the module's own image headers (see
+/// `process::pe::pointer_size`) and pass it explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bitness {
+    /// 32-bit protected mode — PE32 (`0x10b`) images, 32-bit ELF objects.
+    X86,
+    /// 64-bit long mode — PE32+ (`0x20b`) images, 64-bit ELF objects.
+    X64,
+}
+
+impl Bitness {
+    /// The width as iced-x86 expects it: `32` or `64`.
+    pub fn bits(self) -> u32 {
+        match self {
+            Bitness::X86 => 32,
+            Bitness::X64 => 64,
+        }
+    }
+
+    /// Pointer width in bytes: `4` or `8`.
+    pub fn pointer_size(self) -> usize {
+        match self {
+            Bitness::X86 => 4,
+            Bitness::X64 => 8,
+        }
+    }
+
+    /// Builds a [`Bitness`] from a pointer width in bytes, as reported by
+    /// `process::pe::pointer_size`. Any width other than 4 or 8 is `None`.
+    pub fn from_pointer_size(size: usize) -> Option<Self> {
+        match size {
+            4 => Some(Bitness::X86),
+            8 => Some(Bitness::X64),
+            _ => None,
+        }
+    }
+}
+
+/// The width of the *host* nemclass is running on.
+///
+/// This is the fallback the deprecated bitness-less entry points use so existing
+/// callers keep their current behaviour. It is **not** a correct default for a
+/// target module — prefer deriving a [`Bitness`] from the module's headers.
+pub const HOST_BITNESS: Bitness = if cfg!(target_pointer_width = "64") {
+    Bitness::X64
+} else {
+    Bitness::X86
+};
+
 /// Coarse flow-control classification of an instruction, distilled from
 /// iced-x86's finer [`FlowControl`] so the dissector/analysis layer can reason
 /// about a function's control flow without depending on iced-x86 types.
@@ -114,7 +169,7 @@ fn ip_rel_memory_target(instruction: &Instruction) -> Option<u64> {
         .then(|| instruction.ip_rel_memory_address())
 }
 
-fn are_operands_static(instruction: &Instruction) -> bool {
+fn are_operands_static(instruction: &Instruction, bitness: Bitness) -> bool {
     // Check for unconditional and conditional branches. Kept as nested `if`s
     // (not collapsed) to mirror the two distinct conditions being reasoned about.
     #[allow(clippy::collapsible_if)]
@@ -160,9 +215,10 @@ fn are_operands_static(instruction: &Instruction) -> bool {
                 }
 
                 // On x64, RIP-relative memory references are often considered static
-                // relative to the instruction block.
-                #[cfg(target_pointer_width = "64")]
-                if instruction.is_ip_rel_memory_operand() {
+                // relative to the instruction block. This is a property of the
+                // *decoded* code, not of the host, so it keys off `bitness` — a
+                // 32-bit module has no RIP-relative addressing at all.
+                if bitness == Bitness::X64 && instruction.is_ip_rel_memory_operand() {
                     continue;
                 }
 
@@ -183,8 +239,8 @@ fn are_operands_static(instruction: &Instruction) -> bool {
     true
 }
 
-fn get_static_instruction_bytes(instruction: &Instruction) -> i32 {
-    if are_operands_static(instruction) {
+fn get_static_instruction_bytes(instruction: &Instruction, bitness: Bitness) -> i32 {
+    if are_operands_static(instruction, bitness) {
         return instruction.len() as i32;
     }
 
@@ -237,8 +293,19 @@ fn get_static_instruction_bytes(instruction: &Instruction) -> i32 {
 /// decoded instruction lengths (≥ `min_len`, or shorter if the code runs out /
 /// an invalid instruction is hit).
 pub fn operand_wildcard_mask(code: &[u8], virtual_address: u64, min_len: usize) -> Vec<bool> {
-    let bitness = if cfg!(target_pointer_width = "64") { 64 } else { 32 };
-    let mut decoder = Decoder::with_ip(bitness, code, virtual_address, DecoderOptions::NONE);
+    operand_wildcard_mask_with_bitness(code, virtual_address, HOST_BITNESS, min_len)
+}
+
+/// [`operand_wildcard_mask`] with an explicit decode width.
+///
+/// Prefer this whenever the target module's width is known — see [`Bitness`].
+pub fn operand_wildcard_mask_with_bitness(
+    code: &[u8],
+    virtual_address: u64,
+    bitness: Bitness,
+    min_len: usize,
+) -> Vec<bool> {
+    let mut decoder = Decoder::with_ip(bitness.bits(), code, virtual_address, DecoderOptions::NONE);
     let mut mask: Vec<bool> = Vec::new();
     let mut instruction = Instruction::default();
 
@@ -350,6 +417,30 @@ pub fn disassemble_instructions<F>(
     code: &[u8],
     virtual_address: u64,
     determine_static_bytes: bool,
+    callback: F,
+) where
+    F: FnMut(InstructionData) -> bool,
+{
+    disassemble_instructions_with_bitness(
+        code,
+        virtual_address,
+        HOST_BITNESS,
+        determine_static_bytes,
+        callback,
+    )
+}
+
+/// [`disassemble_instructions`] with an explicit decode width.
+///
+/// Prefer this whenever the target module's width is known — see [`Bitness`].
+/// Decoding a 32-bit (WoW64) PE image at 64-bit width produces plausible-looking
+/// but entirely wrong instructions, so the width must come from the module's own
+/// headers rather than from the host.
+pub fn disassemble_instructions_with_bitness<F>(
+    code: &[u8],
+    virtual_address: u64,
+    bitness: Bitness,
+    determine_static_bytes: bool,
     mut callback: F,
 ) where
     F: FnMut(InstructionData) -> bool,
@@ -358,13 +449,7 @@ pub fn disassemble_instructions<F>(
         return;
     }
 
-    let bitness = if cfg!(target_pointer_width = "64") {
-        64
-    } else {
-        32
-    };
-
-    let mut decoder = Decoder::with_ip(bitness, code, virtual_address, DecoderOptions::NONE);
+    let mut decoder = Decoder::with_ip(bitness.bits(), code, virtual_address, DecoderOptions::NONE);
     let mut formatter = NasmFormatter::new();
     formatter
         .options_mut()
@@ -400,7 +485,7 @@ pub fn disassemble_instructions<F>(
             formatter.format(&instruction, &mut formatted_str);
 
             let static_b = if determine_static_bytes {
-                get_static_instruction_bytes(&instruction)
+                get_static_instruction_bytes(&instruction, bitness)
             } else {
                 -1
             };
@@ -453,6 +538,101 @@ mod tests {
             false // stop after the first instruction
         });
         out.expect("expected one decoded instruction")
+    }
+
+    /// Decodes exactly one instruction at [`VA`] at an explicit width.
+    fn decode_one_at(code: &[u8], bitness: Bitness) -> InstructionData {
+        let mut out = None;
+        disassemble_instructions_with_bitness(code, VA, bitness, true, |ins| {
+            out = Some(ins);
+            false
+        });
+        out.expect("expected one decoded instruction")
+    }
+
+    /// The same bytes mean different things at different widths. `8B 45 08` is
+    /// `mov eax, [rbp+8]` in 64-bit mode but `mov eax, [ebp+8]` in 32-bit mode —
+    /// the register file differs, which is exactly what argument inference reads.
+    #[test]
+    fn same_bytes_decode_differently_per_bitness() {
+        const CODE: &[u8] = &[0x8B, 0x45, 0x08];
+
+        let x64 = decode_one_at(CODE, Bitness::X64);
+        let x86 = decode_one_at(CODE, Bitness::X86);
+
+        assert!(
+            x64.instruction.contains("rbp"),
+            "64-bit decode should use rbp, got {:?}",
+            x64.instruction
+        );
+        assert!(
+            x86.instruction.contains("ebp"),
+            "32-bit decode should use ebp, got {:?}",
+            x86.instruction
+        );
+        assert_ne!(x64.instruction, x86.instruction);
+    }
+
+    /// A REX-prefixed 64-bit instruction is not a REX prefix at all in 32-bit
+    /// mode — `48` is `dec eax` there, so the instruction *lengths* diverge too.
+    /// This is the failure mode that made 32-bit modules decode as nonsense.
+    #[test]
+    fn rex_prefix_is_a_separate_instruction_in_x86() {
+        const CODE: &[u8] = &[0x48, 0x89, 0xE5]; // mov rbp, rsp (x64)
+
+        let x64 = decode_one_at(CODE, Bitness::X64);
+        assert_eq!(x64.length, 3, "x64 decodes all three bytes as one insn");
+
+        let x86 = decode_one_at(CODE, Bitness::X86);
+        assert_eq!(x86.length, 1, "x86 decodes 0x48 alone as `dec eax`");
+    }
+
+    /// RIP-relative addressing exists only in 64-bit mode, so the static-byte
+    /// accounting in `are_operands_static` must key off the target width rather
+    /// than the host's. Same bytes, different static-byte verdict.
+    #[test]
+    fn ip_relative_static_bytes_track_target_bitness() {
+        // 48 8B 05 <disp32> = mov rax, [rip+disp32] in 64-bit mode.
+        const CODE: &[u8] = &[0x48, 0x8B, 0x05, 0xDE, 0xAD, 0xBE, 0xEF];
+
+        let x64 = decode_one_at(CODE, Bitness::X64);
+        assert_eq!(
+            x64.static_instruction_bytes, x64.length as i32,
+            "a RIP-relative operand counts as fully static in 64-bit mode"
+        );
+
+        // In 32-bit mode the same lead byte is `dec eax`, which has no operands
+        // to treat specially — it is trivially static and one byte long.
+        let x86 = decode_one_at(CODE, Bitness::X86);
+        assert_eq!(x86.length, 1);
+        assert_eq!(x86.static_instruction_bytes, 1);
+    }
+
+    /// Regression guard: a direct `call rel32` resolves to the same target at
+    /// both widths, so threading bitness through must not disturb branch maths.
+    #[test]
+    fn call_target_is_bitness_independent() {
+        // call rel32 -> 0x2000 from VA 0x1000.
+        const CODE: &[u8] = &[0xE8, 0xFB, 0x0F, 0x00, 0x00];
+
+        for bitness in [Bitness::X86, Bitness::X64] {
+            let ins = decode_one_at(CODE, bitness);
+            assert_eq!(ins.kind, FlowKind::Call, "{bitness:?}");
+            assert_eq!(ins.target, Some(0x2000), "{bitness:?}");
+        }
+    }
+
+    /// `HOST_BITNESS` must agree with the pointer width the crate was built for,
+    /// and the bitness-less entry points must keep delegating to it.
+    #[test]
+    fn host_bitness_matches_build_target() {
+        assert_eq!(HOST_BITNESS.pointer_size(), core::mem::size_of::<usize>());
+        assert_eq!(Bitness::from_pointer_size(4), Some(Bitness::X86));
+        assert_eq!(Bitness::from_pointer_size(8), Some(Bitness::X64));
+        assert_eq!(Bitness::from_pointer_size(2), None);
+
+        const CODE: &[u8] = &[0x90]; // nop — decodes identically everywhere
+        assert_eq!(decode_one(CODE).instruction, decode_one_at(CODE, HOST_BITNESS).instruction);
     }
 
     #[test]

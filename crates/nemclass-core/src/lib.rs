@@ -34,6 +34,12 @@ pub use internal::{
     find_code_refs,
     make_masked_signature,
     operand_wildcard_mask,
+    // Target decode width. Derived from the inspected module's own headers, not
+    // from the host — a Wine process maps 32-bit and 64-bit images side by side.
+    Bitness,
+    HOST_BITNESS,
+    disassemble_instructions_with_bitness,
+    operand_wildcard_mask_with_bitness,
     // Memory-dissection analysis (M5.1): address classification, string
     // detection, and pointer/vtable classification. The pure cores
     // (`RegionIndex::from_sections`, `detect_strings`, `classify_value`) are
@@ -65,7 +71,8 @@ pub use internal::{SymbolResolver, symbol_resolver};
 // linear function walk and the in-process pointer classifier.
 #[cfg(target_os = "linux")]
 pub use internal::{
-    DissectResult, FunctionDisasm, classify_in_process, disassemble_function, disassemble_range,
+    DissectResult, FunctionDisasm, classify_in_process, disassemble_function,
+    disassemble_function_with_bitness, disassemble_range, disassemble_range_with_bitness,
     dissect_regions, module_exec_regions,
 };
 

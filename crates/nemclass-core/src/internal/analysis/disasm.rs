@@ -13,7 +13,9 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::internal::decoder::{FlowKind, InstructionData, disassemble_instructions};
+use crate::internal::decoder::{
+    Bitness, FlowKind, HOST_BITNESS, InstructionData, disassemble_instructions_with_bitness,
+};
 
 /// The result of disassembling one function: its decoded instructions and the
 /// de-duplicated, in-order list of direct `call` targets found within it.
@@ -46,6 +48,20 @@ pub fn disassemble_function(
     addr: u64,
     max_bytes: usize,
 ) -> crate::Result<FunctionDisasm> {
+    disassemble_function_with_bitness(process, addr, HOST_BITNESS, max_bytes)
+}
+
+/// [`disassemble_function`] with an explicit decode width.
+///
+/// Prefer this whenever the containing module's width is known — decoding a
+/// 32-bit (WoW64) image at 64-bit width yields plausible-looking nonsense. See
+/// [`Bitness`].
+pub fn disassemble_function_with_bitness(
+    process: &crate::Process,
+    addr: u64,
+    bitness: Bitness,
+    max_bytes: usize,
+) -> crate::Result<FunctionDisasm> {
     let mut result = FunctionDisasm::default();
     if max_bytes == 0 {
         return Ok(result);
@@ -64,7 +80,7 @@ pub fn disassemble_function(
     // Decode linearly. The closure drives termination: we keep each instruction,
     // record call targets, and return `false` (stop) after a ret/int3 or an
     // invalid/zero-length decode.
-    disassemble_instructions(&buf, addr, true, |ins| {
+    disassemble_instructions_with_bitness(&buf, addr, bitness, true, |ins| {
         // An invalid or zero-length decode means we've run off the end of real
         // code (e.g. into data); keep nothing more and stop.
         if ins.length == 0 || ins.instruction == "???" {
@@ -105,6 +121,16 @@ pub fn disassemble_range(
     addr: u64,
     len: usize,
 ) -> crate::Result<Vec<InstructionData>> {
+    disassemble_range_with_bitness(process, addr, HOST_BITNESS, len)
+}
+
+/// [`disassemble_range`] with an explicit decode width. See [`Bitness`].
+pub fn disassemble_range_with_bitness(
+    process: &crate::Process,
+    addr: u64,
+    bitness: Bitness,
+    len: usize,
+) -> crate::Result<Vec<InstructionData>> {
     let mut out = Vec::new();
     if len == 0 {
         return Ok(out);
@@ -122,7 +148,7 @@ pub fn disassemble_range(
 
     // Decode linearly, keeping every instruction. Stop only on an invalid /
     // zero-length decode (running off the end of code), never on ret/int3.
-    disassemble_instructions(&buf, addr, true, |ins| {
+    disassemble_instructions_with_bitness(&buf, addr, bitness, true, |ins| {
         if ins.length == 0 || ins.instruction == "???" {
             return false;
         }

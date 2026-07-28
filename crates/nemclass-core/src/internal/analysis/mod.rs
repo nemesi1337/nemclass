@@ -35,7 +35,10 @@ pub use region_index::{AddrClass, RegionIndex};
 pub use strings::{StrKind, StringRun, detect_strings, string_at};
 
 #[cfg(target_os = "linux")]
-pub use disasm::{FunctionDisasm, disassemble_function, disassemble_range};
+pub use disasm::{
+    FunctionDisasm, disassemble_function, disassemble_function_with_bitness, disassemble_range,
+    disassemble_range_with_bitness,
+};
 
 #[cfg(target_os = "linux")]
 pub use dissect::{DissectResult, dissect_regions, module_exec_regions};
