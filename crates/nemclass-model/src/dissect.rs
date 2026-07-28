@@ -38,7 +38,7 @@
 //!   callers can reason about false positives (very large integer constants will
 //!   be shown as hex, which is usually what the user wants anyway).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use nemclass_core::{PointerClass, StrKind, string_at};
 
@@ -70,14 +70,14 @@ fn leaf_def(type_tag: &'static str, name: String) -> NodeDef {
         type_tag: type_tag.to_string(),
         name,
         comment: String::new(),
-        attrs: HashMap::new(),
+        attrs: BTreeMap::new(),
         nodes: Vec::new(),
     }
 }
 
 /// Constructs a [`NodeDef`] with a single integer attribute.
 fn leaf_def_with_int(type_tag: &'static str, name: String, attr: &str, val: i64) -> NodeDef {
-    let mut attrs = HashMap::new();
+    let mut attrs = BTreeMap::new();
     attrs.insert(attr.to_string(), toml::Value::Integer(val));
     NodeDef {
         type_tag: type_tag.to_string(),

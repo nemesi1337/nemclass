@@ -243,7 +243,7 @@ impl Node for VectorNode {
             type_tag: self.type_tag().to_string(),
             name: self.name.clone(),
             comment: self.comment.clone(),
-            attrs: std::collections::HashMap::new(),
+            attrs: std::collections::BTreeMap::new(),
             nodes: Vec::new(),
         }
     }
@@ -338,7 +338,7 @@ impl Node for MatrixNode {
             type_tag: self.type_tag().to_string(),
             name: self.name.clone(),
             comment: self.comment.clone(),
-            attrs: std::collections::HashMap::new(),
+            attrs: std::collections::BTreeMap::new(),
             nodes: Vec::new(),
         }
     }

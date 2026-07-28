@@ -19,15 +19,19 @@ pub mod serialize;
 pub use address::{MemoryReader, ModuleResolver, parse as parse_address, resolve_formula};
 pub use cheat_table::{CheatEntry, CheatTable};
 pub use class::ClassNode;
-pub use codegen::{CodeGenerator, Language, generate as generate_code, resolved_class_size, resolved_node_size};
+pub use codegen::{
+    CodeGenerator, Language, class_size, generate as generate_code, resolved_class_size,
+    resolved_node_size,
+};
 pub use enums::EnumDescription;
 pub use error::{ModelError, Result};
 pub use node::registry::NodeRegistry;
 pub use node::vector::{
     FloatWidth, MATRIX_SHAPES, MatrixNode, VECTOR_SHAPES, VectorNode, matrix_shape, vector_shape,
 };
+pub use node::unknown::UnknownNode;
 pub use node::{Node, RenderedValue};
-pub use project::Project;
+pub use project::{Project, SCHEMA_VERSION};
 
 #[cfg(test)]
 mod tests;

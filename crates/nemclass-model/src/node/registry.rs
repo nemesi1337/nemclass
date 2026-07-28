@@ -84,7 +84,13 @@ impl NodeRegistry {
         let tag = def.type_tag.clone();
         match self.entries.get(tag.as_str()) {
             Some((_, de)) => de(def, self),
-            None => Err(ModelError::UnknownNodeType(tag)),
+            // Deliberately not an error. This propagated out of
+            // `Project::from_toml` with `?`, so one node written by a newer
+            // build — or by a build with a plugin this one lacks — made the
+            // whole project file unopenable. Keep the definition verbatim
+            // instead, so it renders as a placeholder and is written back
+            // unchanged on save rather than silently stripped.
+            None => Ok(Box::new(crate::node::unknown::UnknownNode::new(def))),
         }
     }
 

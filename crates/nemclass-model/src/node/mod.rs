@@ -1,6 +1,7 @@
 pub mod builtins;
 pub mod function;
 pub mod registry;
+pub mod unknown;
 pub mod vector;
 pub mod vtable;
 

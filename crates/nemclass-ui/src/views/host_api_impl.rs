@@ -975,11 +975,33 @@ mod inner {
                     if let Some(c) = comment { node.set_comment(c); }
 
                     let registry = self.node_registry;
+                    // Resolve each child's real byte width *before* taking the
+                    // mutable borrow. `Node::memory_size()` reports 0 for a
+                    // `ClassInstance` — it has no project context to look the
+                    // target class up in — so walking the cursor with it placed
+                    // every field after an embedded class at the wrong offset,
+                    // and made the "falls inside an existing field" check fire
+                    // on offsets that were in fact correct.
+                    let child_sizes: Vec<usize> = {
+                        let class = self.project.get_class(&uuid).unwrap();
+                        class
+                            .children
+                            .iter()
+                            .map(|child| {
+                                let mut visited = std::collections::HashSet::from([uuid]);
+                                nemclass_model::resolved_node_size(
+                                    child.as_ref(),
+                                    self.project,
+                                    &mut visited,
+                                )
+                            })
+                            .collect()
+                    };
                     let class = self.project.get_class_mut(&uuid).unwrap();
                     // Walk children; `cursor` is the start offset of each child.
                     let mut cursor = 0usize;
                     let mut insert_at: Option<usize> = None;
-                    for (i, child) in class.children.iter().enumerate() {
+                    for (i, size) in child_sizes.iter().enumerate() {
                         if cursor == offset {
                             insert_at = Some(i);
                             break;
@@ -987,7 +1009,7 @@ mod inner {
                         if cursor > offset {
                             return Err(format!("offset {offset:#x} falls inside an existing field"));
                         }
-                        cursor = cursor.saturating_add(child.memory_size());
+                        cursor = cursor.saturating_add(*size);
                     }
                     match insert_at {
                         Some(i) => class.children.insert(i, node),

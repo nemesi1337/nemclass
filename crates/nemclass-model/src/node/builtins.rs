@@ -22,7 +22,7 @@ fn simple_def(type_tag: &'static str, name: &str, comment: &str) -> NodeDef {
         type_tag: type_tag.to_string(),
         name: name.to_string(),
         comment: comment.to_string(),
-        attrs: std::collections::HashMap::new(),
+        attrs: std::collections::BTreeMap::new(),
         nodes: Vec::new(),
     }
 }
@@ -161,7 +161,7 @@ impl Node for PointerNode {
         true
     }
     fn to_node_def(&self) -> NodeDef {
-        let mut attrs = std::collections::HashMap::new();
+        let mut attrs = std::collections::BTreeMap::new();
         if let Some(uuid) = &self.target_class_uuid {
             attrs.insert("target_class_uuid".to_string(), toml::Value::String(uuid.to_string()));
         }
@@ -208,7 +208,7 @@ impl Node for ClassInstanceNode {
         }
     }
     fn to_node_def(&self) -> NodeDef {
-        let mut attrs = std::collections::HashMap::new();
+        let mut attrs = std::collections::BTreeMap::new();
         attrs.insert("class_uuid".to_string(), toml::Value::String(self.class_uuid.to_string()));
         NodeDef {
             type_tag: "ClassInstance".to_string(),
@@ -255,7 +255,7 @@ impl Node for ArrayNode {
         }
     }
     fn to_node_def(&self) -> NodeDef {
-        let mut attrs = std::collections::HashMap::new();
+        let mut attrs = std::collections::BTreeMap::new();
         attrs.insert("count".to_string(), toml::Value::Integer(self.count as i64));
         attrs.insert("element_size".to_string(), toml::Value::Integer(self.element_size as i64));
         NodeDef {
@@ -302,7 +302,7 @@ impl Node for Utf8TextNode {
         RenderedValue { value: format!("\"{s}\""), type_tag: "Utf8Text", memory_size: self.length }
     }
     fn to_node_def(&self) -> NodeDef {
-        let mut attrs = std::collections::HashMap::new();
+        let mut attrs = std::collections::BTreeMap::new();
         attrs.insert("length".to_string(), toml::Value::Integer(self.length as i64));
         NodeDef {
             type_tag: "Utf8Text".to_string(),
@@ -351,7 +351,7 @@ impl Node for Utf16TextNode {
         RenderedValue { value: format!("\"{s}\""), type_tag: "Utf16Text", memory_size: self.length }
     }
     fn to_node_def(&self) -> NodeDef {
-        let mut attrs = std::collections::HashMap::new();
+        let mut attrs = std::collections::BTreeMap::new();
         attrs.insert("length".to_string(), toml::Value::Integer(self.length as i64));
         NodeDef {
             type_tag: "Utf16Text".to_string(),

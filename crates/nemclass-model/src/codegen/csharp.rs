@@ -14,7 +14,9 @@
 //! }
 //! ```
 
-use super::{CodeGenerator, FieldKind, Language, PrimKind, resolve_fields, sanitize_ident};
+use super::{
+    CodeGenerator, FieldKind, Language, PrimKind, emitted_array_len, escape_comment, resolve_fields, sanitize_ident,
+};
 use crate::node::registry::NodeRegistry;
 use crate::node::vector::FloatWidth;
 use crate::project::Project;
@@ -92,7 +94,7 @@ impl CodeGenerator for CSharpCodeGenerator {
             out.push_str("[StructLayout(LayoutKind.Explicit, CharSet = CharSet.Ansi)]\n");
             out.push_str(&format!("public struct {cname}"));
             if !class.comment.is_empty() {
-                out.push_str(&format!(" // {}", class.comment));
+                out.push_str(&format!(" // {}", escape_comment(&class.comment)));
             }
             out.push_str("\n{\n");
 
@@ -102,8 +104,19 @@ impl CodeGenerator for CSharpCodeGenerator {
                 let comment_part = if f.comment.is_empty() {
                     String::new()
                 } else {
-                    format!(" //{}", f.comment)
+                    format!(" // {}", escape_comment(&f.comment))
                 };
+
+                // `fixed byte x[0]` is a hard C# error (CS0842), as is
+                // `SizeConst = 0`. The field contributes no bytes, so record it
+                // as a comment and keep the layout identical.
+                if emitted_array_len(&f.kind) == Some(0) {
+                    out.push_str(&format!(
+                        "    // {} — 0 bytes at 0x{:X}, omitted{}\n",
+                        f.name, f.offset, comment_part
+                    ));
+                    continue;
+                }
 
                 match &f.kind {
                     FieldKind::Primitive(p) => {

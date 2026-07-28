@@ -96,7 +96,7 @@ impl Node for VTableNode {
             type_tag: "VTable".to_string(),
             name: self.name.clone(),
             comment: self.comment.clone(),
-            attrs: std::collections::HashMap::new(),
+            attrs: std::collections::BTreeMap::new(),
             nodes: Vec::new(),
         }
     }
@@ -157,7 +157,7 @@ impl Node for VMethodNode {
             type_tag: "VMethod".to_string(),
             name: self.name.clone(),
             comment: self.comment.clone(),
-            attrs: std::collections::HashMap::new(),
+            attrs: std::collections::BTreeMap::new(),
             nodes: Vec::new(),
         }
     }

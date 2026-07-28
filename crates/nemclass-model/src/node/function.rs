@@ -90,7 +90,7 @@ impl Node for FunctionNode {
     }
 
     fn to_node_def(&self) -> NodeDef {
-        let mut attrs = std::collections::HashMap::new();
+        let mut attrs = std::collections::BTreeMap::new();
         attrs.insert("signature".to_string(), toml::Value::String(self.signature.clone()));
         NodeDef {
             type_tag: "Function".to_string(),
@@ -153,7 +153,7 @@ impl Node for FunctionPtrNode {
             type_tag: "FunctionPtr".to_string(),
             name: self.name.clone(),
             comment: self.comment.clone(),
-            attrs: std::collections::HashMap::new(),
+            attrs: std::collections::BTreeMap::new(),
             nodes: Vec::new(),
         }
     }

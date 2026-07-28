@@ -123,8 +123,10 @@ fn cpp_struct_fields() {
     assert!(out.contains("uint8_t _pad[4];"), "missing _pad: {out}");
     // Utf8Text → char array
     assert!(out.contains("char name[32];"), "missing name: {out}");
-    // Utf16Text → wchar_t array (32 bytes / 2 = 16 chars)
-    assert!(out.contains("wchar_t wname[16];"), "missing wname: {out}");
+    // Utf16Text → char16_t array (32 bytes / 2 = 16 chars). Deliberately not
+    // `wchar_t`, which is 4 bytes on Linux/GCC and made the field twice its
+    // real width, failing the class's own generated `static_assert`.
+    assert!(out.contains("char16_t wname[16];"), "missing wname: {out}");
 }
 
 #[test]
@@ -569,4 +571,195 @@ fn vector_and_matrix_fields_emit_arrays_and_advance_offsets() {
     // C# fixed buffers are 1-D, so the matrix flattens to rows*cols.
     assert!(cs.contains("public unsafe fixed float view[16];"), "{cs}");
     assert!(cs.contains("[FieldOffset(0x6C)]"), "{cs}");
+}
+
+// ---------------------------------------------------------------------------
+// Output must actually compile
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rust_struct_comment_does_not_swallow_the_opening_brace() {
+    // `pub struct Entity // game entity {` puts the brace inside a line
+    // comment, so the struct body becomes top-level tokens and the whole file
+    // fails to parse. Every class carrying a comment hit this.
+    let (project, reg, entity_uuid, _) = make_project();
+    let _ = entity_uuid;
+    let out = generate(Language::Rust, &project, &reg);
+
+    assert!(
+        out.contains("pub struct Entity {"),
+        "the opening brace must be on the struct line, not inside a comment:\n{out}"
+    );
+    assert!(
+        out.contains("// game entity"),
+        "the class comment must still be emitted:\n{out}"
+    );
+    for line in out.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("pub struct") {
+            assert!(
+                trimmed.ends_with('{'),
+                "a struct header must end in `{{`, got: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_multiline_comment_never_escapes_the_comment() {
+    // Node and class comments are free-form and round-trip through the project
+    // file, so a newline in one used to splice arbitrary text into the struct
+    // body as code.
+    let (mut project, reg, uuid, _) = make_project();
+    {
+        let entity = project.get_class_mut(&uuid).expect("Entity");
+        entity.comment = "line one\nstruct Evil { pub x: u8 }".to_string();
+        entity.children[0].set_comment("hp\nnot code".to_string());
+    }
+
+    for lang in [Language::Rust, Language::Cpp, Language::CSharp] {
+        let out = generate(lang, &project, &reg);
+        for line in out.lines() {
+            if line.contains("not code") || line.contains("struct Evil") {
+                let comment_at = line.find("//").unwrap_or(usize::MAX);
+                let payload_at = line
+                    .find("not code")
+                    .or_else(|| line.find("struct Evil"))
+                    .unwrap();
+                assert!(
+                    comment_at < payload_at,
+                    "{lang:?}: comment text escaped its comment: {line}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_length_fields_are_not_emitted_as_zero_length_members() {
+    // `uint8_t x[0]` is ill-formed ISO C++ and `fixed byte x[0]` is a hard C#
+    // error (CS0842). An ArrayNode defaults to count 0 and an unresolved
+    // ClassInstance becomes RawBytes(0), so this is reachable by accident.
+    let reg = registry();
+    let mut project = Project::new("Empty");
+    let mut c = ClassNode::with_uuid(Uuid::new_v4(), "HasEmpties");
+    c.children.push(Box::new(ArrayNode::new("nothing", 0, 4)));
+    c.children.push(Box::new(ClassInstanceNode::new("dangling", Uuid::new_v4())));
+    c.children.push(Box::new(Int32Node::new("real")));
+    project.add_class(c);
+
+    for lang in [Language::Rust, Language::Cpp, Language::CSharp] {
+        let out = generate(lang, &project, &reg);
+        assert!(!out.contains("[0]"), "{lang:?} emitted a zero-length member:\n{out}");
+        assert!(!out.contains("[0];"), "{lang:?} emitted a zero-length member:\n{out}");
+        assert!(!out.contains("SizeConst = 0"), "{lang:?}:\n{out}");
+        assert!(out.contains("real"), "{lang:?} dropped the real field:\n{out}");
+    }
+}
+
+#[test]
+fn an_empty_class_emits_no_impossible_size_assertion() {
+    // `static_assert(sizeof(X) == 0x0)` can never hold: an empty C++ class has
+    // sizeof 1 even under #pragma pack(1).
+    let reg = registry();
+    let mut project = Project::new("Empty");
+    project.add_class(ClassNode::with_uuid(Uuid::new_v4(), "Nothing"));
+
+    let out = generate(Language::Cpp, &project, &reg);
+    assert!(
+        !out.contains("static_assert(sizeof(Nothing) == 0x0)"),
+        "emitted an assertion that can never hold:\n{out}"
+    );
+}
+
+#[test]
+fn every_call_site_agrees_on_the_size_of_a_self_embedding_class() {
+    // The recursive form takes the visited set as a parameter, and callers that
+    // passed a bare HashSet::new() never seeded it with the root's own UUID —
+    // so the codegen assert, Project::resolved_class_size and the UI layout
+    // could each report a different size for the same class.
+    let reg = registry();
+    let mut project = Project::new("Cyclic");
+    let uuid = Uuid::new_v4();
+    let mut c = ClassNode::with_uuid(uuid, "SelfEmbed");
+    c.children.push(Box::new(Int32Node::new("head")));
+    c.children.push(Box::new(ClassInstanceNode::new("me", uuid)));
+    project.add_class(c);
+
+    let class = project.get_class(&uuid).expect("class");
+    let via_project = project.resolved_class_size(&uuid);
+    let via_codegen = crate::codegen::class_size(class, &project);
+    assert_eq!(via_project, via_codegen);
+
+    // And the emitted assertion must quote that same number.
+    let out = generate(Language::Cpp, &project, &reg);
+    assert!(
+        out.contains(&format!("static_assert(sizeof(SelfEmbed) == 0x{via_project:X});")),
+        "generated size disagrees with resolved_class_size ({via_project}):\n{out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The generated sources must actually compile
+// ---------------------------------------------------------------------------
+
+/// Run `prog` over `path`, returning `None` when the compiler is not installed
+/// (so the suite still passes on a machine without it) and `Some(stderr)`
+/// otherwise.
+fn syntax_check(prog: &str, args: &[&str]) -> Option<(bool, String)> {
+    let out = match std::process::Command::new(prog).args(args).output() {
+        Ok(o) => o,
+        // No such compiler on this machine — skip rather than fail.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("running {prog}: {e}"),
+    };
+    Some((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
+}
+
+/// String assertions cannot catch a type whose real width differs from the one
+/// the size arithmetic assumed — that is how the C++ generator shipped
+/// `wchar_t` for UTF-16 text, which is 2 bytes on MSVC but 4 on Linux/GCC, so
+/// every class containing a UTF-16 field failed its own generated
+/// `static_assert`. Compile the output for real.
+#[test]
+fn generated_cpp_compiles_including_its_own_size_assertions() {
+    let (mut project, reg, uuid, _) = make_project();
+    // Exercise the comment paths at the same time.
+    project.get_class_mut(&uuid).unwrap().comment = "game entity\nsecond line".to_string();
+
+    let dir = std::env::temp_dir().join("nemclass-codegen-cpp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gen.hpp");
+    std::fs::write(&path, generate(Language::Cpp, &project, &reg)).unwrap();
+
+    let Some((ok, stderr)) = syntax_check(
+        "g++",
+        &["-std=c++17", "-fsyntax-only", "-Wno-pragma-once-outside-header",
+          "-x", "c++", path.to_str().unwrap()],
+    ) else {
+        eprintln!("g++ not installed — skipping");
+        return;
+    };
+    assert!(ok, "generated C++ does not compile:\n{stderr}");
+}
+
+#[test]
+fn generated_rust_compiles_including_its_own_size_assertions() {
+    let (mut project, reg, uuid, _) = make_project();
+    project.get_class_mut(&uuid).unwrap().comment = "game entity\nsecond line".to_string();
+
+    let dir = std::env::temp_dir().join("nemclass-codegen-rust");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gen.rs");
+    std::fs::write(&path, generate(Language::Rust, &project, &reg)).unwrap();
+
+    let Some((ok, stderr)) = syntax_check(
+        "rustc",
+        &["--crate-type", "lib", "--edition", "2021", "--emit=metadata",
+          "-o", dir.join("gen.rmeta").to_str().unwrap(), path.to_str().unwrap()],
+    ) else {
+        eprintln!("rustc not installed — skipping");
+        return;
+    };
+    assert!(ok, "generated Rust does not compile:\n{stderr}");
 }

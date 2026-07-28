@@ -2,8 +2,9 @@
 //!
 //! Output shape:
 //! ```rust
+//! // optional class comment
 //! #[repr(C)]
-//! pub struct PlayerStruct { // optional comment
+//! pub struct PlayerStruct {
 //!     pub health: i32,    // 0x0000 player HP
 //!     pub speed: f32,     // 0x0004
 //! }
@@ -15,9 +16,8 @@
 //! tuple-struct newtype + associated const block instead of an `enum` keyword, which
 //! is safe for any integer value (including bit-flag sets).
 
-use std::collections::HashSet;
 
-use super::{CodeGenerator, FieldKind, Language, PrimKind, resolve_fields, resolved_class_size, sanitize_ident};
+use super::{CodeGenerator, FieldKind, Language, PrimKind, class_size, emitted_array_len, escape_comment, resolve_fields, sanitize_ident};
 use crate::node::registry::NodeRegistry;
 use crate::project::Project;
 
@@ -101,14 +101,17 @@ impl CodeGenerator for RustCodeGenerator {
             let cname = sanitize_ident(&class.name);
             // Use resolved size so ClassInstance fields count their target's
             // real byte width rather than the placeholder 0 from memory_size().
-            let total_size = resolved_class_size(class, project, &mut HashSet::new());
+            let total_size = class_size(class, project);
 
-            out.push_str("#[repr(C)]\n");
-            out.push_str(&format!("pub struct {cname}"));
+            // The comment goes on its own line *above* the item, not trailing
+            // the `pub struct X` line: appending `// …` there put the opening
+            // brace inside the comment, so every class carrying a comment
+            // generated a Rust file that does not parse.
             if !class.comment.is_empty() {
-                out.push_str(&format!(" // {}", class.comment));
+                out.push_str(&format!("// {}\n", escape_comment(&class.comment)));
             }
-            out.push_str(" {\n");
+            out.push_str("#[repr(C)]\n");
+            out.push_str(&format!("pub struct {cname} {{\n"));
 
             let fields = resolve_fields(class, project, registry);
 
@@ -116,8 +119,16 @@ impl CodeGenerator for RustCodeGenerator {
                 let comment_part = if f.comment.is_empty() {
                     format!(" // 0x{:04X}", f.offset)
                 } else {
-                    format!(" // 0x{:04X} {}", f.offset, f.comment)
+                    format!(" // 0x{:04X} {}", f.offset, escape_comment(&f.comment))
                 };
+
+                // A zero-length member is not representable in this
+                // language; the field contributes no bytes, so record it as a
+                // comment and keep the layout identical.
+                if emitted_array_len(&f.kind) == Some(0) {
+                    out.push_str(&format!("    // {} — 0 bytes, omitted{}\n", f.name, comment_part));
+                    continue;
+                }
 
                 let line = match &f.kind {
                     FieldKind::Primitive(p) => {

@@ -437,7 +437,7 @@ fn array_memory_size_saturates_instead_of_panicking() {
 fn deserialize_rejects_overdeep_tree_instead_of_overflowing() {
     use crate::error::ModelError;
     use crate::serialize::NodeDef;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     // Build a Class-node chain far deeper than MAX_NODE_DEPTH (128), iteratively
     // so the test itself never recurses.
@@ -446,7 +446,7 @@ fn deserialize_rejects_overdeep_tree_instead_of_overflowing() {
             type_tag: "Class".to_string(),
             name: "n".to_string(),
             comment: String::new(),
-            attrs: HashMap::new(),
+            attrs: BTreeMap::new(),
             nodes: child.into_iter().collect(),
         }
     }
@@ -751,4 +751,113 @@ fn vtable_toml_string_round_trip() {
     let buf = ptr_buf(0xCAFE_BABE_0000_0001);
     let r = ch[1].render(&buf, 0);
     assert!(r.value.starts_with("bool Init()"), "signature lost: {}", r.value);
+}
+
+// ---------------------------------------------------------------------------
+// Forward compatibility: a node type this build does not know
+// ---------------------------------------------------------------------------
+
+/// A project file written by a newer build, or by one with a plugin this build
+/// lacks, contains a node type with no registered deserializer. That used to
+/// make `from_toml` return `UnknownNodeType`, which `Project::from_toml`
+/// propagated with `?` — so one unrecognised node made the whole project
+/// unopenable.
+const FUTURE_PROJECT: &str = r#"
+[project]
+name = "FromTheFuture"
+version = "1"
+
+[[classes]]
+uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+name = "Player"
+comment = ""
+address_formula = ""
+
+[[classes.nodes]]
+type = "Int32"
+name = "health"
+comment = ""
+
+[[classes.nodes]]
+type = "QuantumFloat"
+name = "spooky"
+comment = "from a newer build"
+precision = 42
+flavour = "strange"
+
+[[classes.nodes]]
+type = "Int32"
+name = "mana"
+comment = ""
+"#;
+
+#[test]
+fn an_unknown_node_type_does_not_make_the_project_unopenable() {
+    let reg = NodeRegistry::new().with_builtins();
+    let project = Project::from_toml(FUTURE_PROJECT, &reg)
+        .expect("an unrecognised node type must not fail the whole load");
+
+    let class = project.classes_in_order().next().expect("Player");
+    assert_eq!(class.children.len(), 3, "no node may be dropped");
+    assert_eq!(class.children[0].name(), "health");
+    assert_eq!(class.children[1].name(), "spooky");
+    assert_eq!(class.children[2].name(), "mana");
+    assert_eq!(class.children[1].type_tag(), "Unknown");
+}
+
+#[test]
+fn an_unknown_node_round_trips_byte_for_byte() {
+    // Opening and re-saving in an older build must not strip the fields it did
+    // not understand.
+    let reg = NodeRegistry::new().with_builtins();
+    let project = Project::from_toml(FUTURE_PROJECT, &reg).unwrap();
+    let saved = project.to_toml(&reg).unwrap();
+
+    assert!(saved.contains("QuantumFloat"), "original type tag lost:\n{saved}");
+    assert!(saved.contains("precision"), "unknown attribute lost:\n{saved}");
+    assert!(saved.contains("flavour"), "unknown attribute lost:\n{saved}");
+    assert!(saved.contains("from a newer build"), "comment lost:\n{saved}");
+
+    // And it survives a second trip unchanged.
+    let reloaded = Project::from_toml(&saved, &reg).unwrap();
+    assert_eq!(reloaded.to_toml(&reg).unwrap(), saved);
+}
+
+#[test]
+fn a_duplicate_class_uuid_is_an_error_not_a_silent_loss() {
+    // `add_class` overwrites on a UUID collision and does not push to
+    // `class_order`, so the file used to load with a class simply missing.
+    let reg = NodeRegistry::new().with_builtins();
+    let dup = r#"
+[project]
+name = "Dup"
+version = "1"
+
+[[classes]]
+uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+name = "First"
+comment = ""
+address_formula = ""
+
+[[classes]]
+uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+name = "Second"
+comment = ""
+address_formula = ""
+"#;
+    let Err(err) = Project::from_toml(dup, &reg) else {
+        panic!("a duplicate uuid must be reported");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("duplicate class uuid"), "unhelpful error: {msg}");
+}
+
+#[test]
+fn a_newer_schema_version_is_refused_rather_than_half_loaded() {
+    let reg = NodeRegistry::new().with_builtins();
+    let future = FUTURE_PROJECT.replace(r#"version = "1""#, r#"version = "99""#);
+    let Err(err) = Project::from_toml(&future, &reg) else {
+        panic!("a newer schema must be refused");
+    };
+    assert!(err.to_string().contains("newer than this build"), "{err}");
 }

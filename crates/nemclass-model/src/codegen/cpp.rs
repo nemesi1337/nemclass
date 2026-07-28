@@ -12,9 +12,8 @@
 //! #pragma pack(pop)
 //! ```
 
-use std::collections::HashSet;
 
-use super::{CodeGenerator, FieldKind, Language, PrimKind, resolve_fields, resolved_class_size, sanitize_ident};
+use super::{CodeGenerator, FieldKind, Language, PrimKind, class_size, emitted_array_len, escape_comment, resolve_fields, sanitize_ident};
 use crate::node::registry::NodeRegistry;
 use crate::project::Project;
 
@@ -87,12 +86,12 @@ impl CodeGenerator for CppCodeGenerator {
             let cname = sanitize_ident(&class.name);
             // Use resolved size so ClassInstance fields count their target's
             // real byte width rather than the placeholder 0 from memory_size().
-            let total_size = resolved_class_size(class, project, &mut HashSet::new());
+            let total_size = class_size(class, project);
 
             // Class header
             out.push_str(&format!("class {cname}"));
             if !class.comment.is_empty() {
-                out.push_str(&format!(" // {}", class.comment));
+                out.push_str(&format!(" // {}", escape_comment(&class.comment)));
             }
             out.push_str("\n{\npublic:\n");
 
@@ -102,9 +101,17 @@ impl CodeGenerator for CppCodeGenerator {
                 let comment_part = if f.comment.is_empty() {
                     String::new()
                 } else {
-                    format!(" {}", f.comment)
+                    format!(" {}", escape_comment(&f.comment))
                 };
                 let offset_comment = format!(" //0x{:04X}{comment_part}", f.offset);
+
+                // A zero-length member is not representable in this
+                // language; the field contributes no bytes, so record it as a
+                // comment and keep the layout identical.
+                if emitted_array_len(&f.kind) == Some(0) {
+                    out.push_str(&format!("    // {} — 0 bytes, omitted{}\n", f.name, offset_comment));
+                    continue;
+                }
 
                 let line = match &f.kind {
                     FieldKind::Primitive(p) => {
@@ -130,11 +137,15 @@ impl CodeGenerator for CppCodeGenerator {
                         format!("    char {}[{}];{}\n", f.name, len, offset_comment)
                     }
                     FieldKind::Utf16Text(len) => {
-                        // len is byte count; each wchar_t is 2 bytes.
+                        // `char16_t`, not `wchar_t`. `wchar_t` is 2 bytes on
+                        // MSVC but **4** on Linux/GCC, so emitting it made every
+                        // UTF-16 field twice its real width on this platform and
+                        // the generated `static_assert` failed on the class that
+                        // contained it. `char16_t` is exactly 2 bytes everywhere.
                         // div_ceil so an odd byte length rounds up rather than
                         // silently dropping the trailing byte.
                         let char_count = len.div_ceil(2);
-                        format!("    wchar_t {}[{}];{}\n", f.name, char_count, offset_comment)
+                        format!("    char16_t {}[{}];{}\n", f.name, char_count, offset_comment)
                     }
                     FieldKind::Vector { components, width } => {
                         format!(
@@ -153,9 +164,18 @@ impl CodeGenerator for CppCodeGenerator {
             }
 
             out.push_str(&format!("}}; //Size: 0x{total_size:04X}\n"));
-            out.push_str(&format!(
-                "static_assert(sizeof({cname}) == 0x{total_size:X});\n\n"
-            ));
+            // An empty class has `sizeof == 1` in C++ even under `#pragma
+            // pack(1)` — there is no such thing as a zero-sized type — so
+            // asserting `== 0` on a class with no fields emits code that can
+            // never compile. Skip the assert rather than emit a guaranteed
+            // failure.
+            if total_size > 0 {
+                out.push_str(&format!(
+                    "static_assert(sizeof({cname}) == 0x{total_size:X});\n\n"
+                ));
+            } else {
+                out.push_str("// (no fields — size assertion omitted)\n\n");
+            }
         }
 
         out.push_str("#pragma pack(pop)\n");

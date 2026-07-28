@@ -15,6 +15,13 @@ pub struct Project {
     pub enums: Vec<EnumDescription>,
 }
 
+/// The `project.nemclass` schema version this build writes and can read.
+///
+/// Bump it whenever the on-disk shape changes in a way an older build would
+/// misread. [`Project::from_toml`] refuses a file whose version is higher, so a
+/// future format never loads quietly and wrongly in an old binary.
+pub const SCHEMA_VERSION: u32 = 1;
+
 impl Project {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -51,9 +58,7 @@ impl Project {
     /// embedded class instance or a dereferenced pointer target.
     pub fn resolved_class_size(&self, uuid: &Uuid) -> usize {
         let Some(class) = self.classes.get(uuid) else { return 0 };
-        let mut visited: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        visited.insert(*uuid);
-        crate::codegen::resolved_class_size(class, self, &mut visited)
+        crate::codegen::class_size(class, self)
     }
 
     /// Remove a class, returning `ClassReferenced` error if any other class references it.
@@ -105,7 +110,7 @@ impl Project {
         let file = ProjectFile {
             project: ProjectMeta {
                 name: self.name.clone(),
-                version: "1".to_string(),
+                version: SCHEMA_VERSION.to_string(),
             },
             enums,
             classes,
@@ -129,9 +134,30 @@ impl Project {
             });
         }
 
+        // The schema version this build writes is `SCHEMA_VERSION`. A file from
+        // a *newer* schema is not silently half-loaded: `from_toml` used to
+        // ignore the version field entirely, so a future format change would
+        // have loaded quietly and wrongly.
+        if let Some(v) = file.project.version.parse::<u32>().ok().filter(|v| *v > SCHEMA_VERSION) {
+            return Err(ModelError::DeserializeError(format!(
+                "project schema version {v} is newer than this build understands \
+                 (max {SCHEMA_VERSION}); upgrade nemclass to open it"
+            )));
+        }
+
         for cdef in file.classes {
             let uuid = cdef.uuid.parse::<Uuid>()
                 .map_err(|e| ModelError::DeserializeError(format!("bad class uuid: {e}")))?;
+            // Two classes sharing a UUID silently destroyed one of them:
+            // `add_class` overwrites the entry and does not push to
+            // `class_order`, so the file loaded with a class missing and no
+            // diagnostic at all.
+            if project.classes.contains_key(&uuid) {
+                return Err(ModelError::DeserializeError(format!(
+                    "duplicate class uuid {uuid} (classes '{}' and '{}')",
+                    project.classes[&uuid].name, cdef.name
+                )));
+            }
             let mut class = ClassNode::with_uuid(uuid, cdef.name);
             class.comment = cdef.comment;
             class.address_formula = cdef.address_formula;

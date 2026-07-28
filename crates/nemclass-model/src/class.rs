@@ -109,7 +109,7 @@ impl Node for ClassNode {
     }
 
     fn to_node_def(&self) -> NodeDef {
-        let mut attrs = std::collections::HashMap::new();
+        let mut attrs = std::collections::BTreeMap::new();
         attrs.insert("uuid".to_string(), toml::Value::String(self.uuid.to_string()));
         attrs.insert(
             "address_formula".to_string(),

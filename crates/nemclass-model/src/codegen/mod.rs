@@ -71,6 +71,57 @@ pub fn generate(language: Language, project: &Project, registry: &NodeRegistry) 
 // Shared helpers used by all three generators
 // ---------------------------------------------------------------------------
 
+/// The array length a field kind would emit, for the kinds that emit an array.
+///
+/// A length of `0` must not reach the output: `uint8_t x[0]` is a GCC extension
+/// and ill-formed ISO C++, and `fixed byte x[0]` is a hard C# error (CS0842).
+/// Zero-length fields arise routinely — an `ArrayNode` defaults to `count = 0`,
+/// a `Utf8Text` to `length = 0`, and an unresolved `ClassInstance` becomes
+/// `RawBytes(0)` — so every generator checks this and emits a comment instead of
+/// a member. The field contributes no bytes either way, so the layout is
+/// unchanged.
+pub(crate) fn emitted_array_len(kind: &FieldKind) -> Option<usize> {
+    match kind {
+        FieldKind::RawBytes(n) | FieldKind::Array { count: n } => Some(*n),
+        FieldKind::Utf8Text(n) => Some(*n),
+        FieldKind::Utf16Text(n) => Some(n.div_ceil(2)),
+        FieldKind::Vector { components, .. } => Some(*components),
+        _ => None,
+    }
+}
+
+/// Flatten a user comment so it is safe to splice into a single-line (`//`)
+/// comment in generated source.
+///
+/// Node and class comments are free-form multi-line strings — the UI accepts
+/// anything and the project format round-trips it. Emitted raw, a comment
+/// containing a newline ended the comment and spliced the remainder into the
+/// struct body as code, so one stray Enter in a comment field produced a source
+/// file that does not compile. Newlines, carriage returns and tabs collapse to
+/// single spaces; the result never leaves the comment.
+pub(crate) fn escape_comment(comment: &str) -> String {
+    let flattened: String = comment
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect();
+    // Collapse the runs the mapping can create so a multi-line comment does not
+    // emit a stretch of blank space.
+    let mut out = String::with_capacity(flattened.len());
+    let mut last_space = false;
+    for c in flattened.chars() {
+        if c == ' ' {
+            if !last_space {
+                out.push(c);
+            }
+            last_space = true;
+        } else {
+            out.push(c);
+            last_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 /// Sanitize an identifier: replace characters that are not alphanumeric or `_`
 /// with `_`. If the result starts with a digit, prefix with `_`.
 pub(crate) fn sanitize_ident(name: &str) -> String {
@@ -104,6 +155,21 @@ pub fn resolved_class_size(
     class.children.iter().map(|child| {
         resolved_node_size(child.as_ref(), project, visited)
     }).fold(0usize, usize::saturating_add)
+}
+
+/// [`resolved_class_size`] with the cycle guard seeded correctly — **the entry
+/// point every caller outside this module should use**.
+///
+/// The recursive form takes the `visited` set as a parameter, and callers that
+/// passed a bare `HashSet::new()` never seeded it with the root class's own
+/// UUID. A class that embeds itself (directly or through a cycle) therefore got
+/// a different answer depending on who asked: the C++ `static_assert`, the Rust
+/// size assert, `Project::resolved_class_size` and the UI's field layout could
+/// all disagree about the same class. Seeding here means one answer everywhere.
+pub fn class_size(class: &crate::class::ClassNode, project: &Project) -> usize {
+    let mut visited = HashSet::new();
+    visited.insert(class.uuid);
+    resolved_class_size(class, project, &mut visited)
 }
 
 /// Size that a single node contributes. For `ClassInstance`, recurses into the
