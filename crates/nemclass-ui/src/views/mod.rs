@@ -2655,6 +2655,15 @@ impl NemclassApp {
             .map(|it| it.collect())
             .unwrap_or_default();
 
+        // A chain is anchored in a module image, so the Modules tab's selection
+        // is exactly the set of anchors worth searching. Unscoped, every `.so`
+        // in the process is an anchor and the result list fills with chains
+        // rooted in libc and ld.so. An empty selection stays unfiltered.
+        let modules = self.modules_panel.scope(&modules);
+        if let Some(hint) = self.modules_panel.scope_hint(&modules) {
+            ui.weak(hint);
+        }
+
         let rt = self.runtime.as_ref().expect("bg runtime").handle();
         let action = self.pointer_scan_panel.show(
             ui,
@@ -2702,6 +2711,17 @@ impl NemclassApp {
         // image so the path survives a restart. Re-parsing /proc/<pid>/maps every
         // frame is what this cache exists to avoid.
         let modules = self.scanner_modules();
+
+        // Same scope as the pointer scan: a hit's formula is anchored in one of
+        // these images, so narrowing the list keeps spider formulas expressed
+        // relative to the modules the user is actually working in. A hit whose
+        // base falls outside them still resolves — `hit_row` falls back to an
+        // absolute anchor.
+        let modules = self.modules_panel.scope(&modules);
+        if let Some(hint) = self.modules_panel.scope_hint(&modules) {
+            ui.weak(hint);
+        }
+
         let rt = self.runtime.as_ref().expect("bg runtime").handle();
 
         self.spider_panel.set_live_interval(self.snapshot_interval);
