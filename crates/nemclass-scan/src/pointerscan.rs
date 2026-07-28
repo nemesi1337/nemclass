@@ -190,9 +190,14 @@ impl PointerMap {
             }
         }
 
-        entries.sort_unstable_by_key(|&(v, _)| v);
-        // Deduplicate identical (value,address) pairs that the chunk overlap can
-        // produce at region-internal boundaries.
+        // Sort by the whole `(value, address)` tuple, not just the value. The
+        // chunk overlap above deliberately re-emits the last `psize` bytes of
+        // each window, so every internal chunk boundary produces a genuine
+        // duplicate pair — and `dedup` only removes *consecutive* equals. Keying
+        // the sort on `value` alone leaves equal-valued entries in arbitrary
+        // order, so those duplicates survive and `find_paths` then yields the
+        // same `PointerPath` more than once (2^depth times through a chain).
+        entries.sort_unstable();
         entries.dedup();
 
         Ok(Self { entries, truncated })
@@ -323,11 +328,14 @@ pub fn pointer_scan<T: ScanTarget>(
 ///
 /// Shared with [`crate::spider`], which harvests candidate pointers the same way.
 pub(crate) fn read_word(bytes: &[u8]) -> usize {
-    let mut v = 0usize;
+    // Accumulate in `u64`, not `usize`: the default `pointer_size` is 8, so on a
+    // 32-bit host `(b as usize) << (i * 8)` would shift a 32-bit value by up to
+    // 56 — a panic in debug and a silently masked result in release.
+    let mut v = 0u64;
     for (i, &b) in bytes.iter().take(8).enumerate() {
-        v |= (b as usize) << (i * 8);
+        v |= u64::from(b) << (i * 8);
     }
-    v
+    v as usize
 }
 
 /// True if `addr` falls inside any `(base, end)` range (sorted ascending).
@@ -491,5 +499,35 @@ mod tests {
         assert!(!is_mapped(&ranges, 0x2500)); // gap
         assert!(is_mapped(&ranges, 0x3000));
         assert!(!is_mapped(&ranges, 0x0fff));
+    }
+
+    #[test]
+    fn chunk_overlap_does_not_duplicate_map_entries() {
+        // `build` walks a region in 1 MiB windows that deliberately overlap by
+        // one pointer width, so the word at each internal boundary is harvested
+        // twice. Sorting on the value alone left those pairs in arbitrary order
+        // and `dedup` (consecutive-only) missed them, so every boundary leaked a
+        // duplicate entry — and `find_paths` then emitted the same path twice.
+        const CHUNK: usize = 1 << 20;
+        let base = 0x10000usize;
+        let mut buf = vec![0u8; CHUNK + 0x100];
+
+        // The duplicated slot is the one at the window boundary.
+        let dup_addr = base + CHUNK;
+        put(&mut buf, base, dup_addr, 0x20000);
+
+        let target =
+            MockTarget::with_regions(base, buf, vec![Region::new(base, CHUNK + 0x100)]);
+        let cfg = PointerScanConfig { alignment: 8, pointer_size: 8, ..Default::default() };
+        let map = PointerMap::build(&target, &cfg).unwrap();
+
+        let hits = map.entries.iter().filter(|&&(v, a)| v == 0x20000 && a == dup_addr).count();
+        assert_eq!(hits, 1, "the boundary word must be harvested exactly once");
+
+        let mut sorted = map.entries.clone();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "the map must contain no duplicate pairs at all");
     }
 }

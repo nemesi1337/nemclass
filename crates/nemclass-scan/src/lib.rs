@@ -59,7 +59,7 @@ mod signature;
 mod value_type;
 
 pub use compare::ScanCompareType;
-pub use freeze::FreezeSet;
+pub use freeze::{FreezeReport, FreezeSet};
 pub use pattern::{BytePattern, PatternByte, PatternError};
 pub use pointerscan::{
     pointer_scan, PointerMap, PointerPath, PointerScanConfig, PointerScanResult,

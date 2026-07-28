@@ -106,10 +106,18 @@ impl From<nemclass_core::Error> for ScanError {
 
 /// Per-pass counters from the last completed scan.
 ///
-/// `unreadable` is the interesting one: a next scan re-reads addresses that a
-/// previous generation matched, and any of them may have been freed or unmapped
-/// since. Those results are dropped individually, and this is how a caller can
-/// tell the user that happened.
+/// The two "could not read" counters are the interesting ones, and they measure
+/// different things because the two passes fail differently:
+///
+/// - `unreadable` (next scan) — a next scan re-reads addresses a previous
+///   generation matched, and any of them may have been freed or unmapped since.
+///   Those results are dropped individually, and this is how a caller tells the
+///   user that happened.
+/// - `skipped_bytes` (first scan) — a region listed as readable in the maps
+///   snapshot can still fault part-way through (the target `munmap`ped it, or a
+///   `PROT_NONE` guard page sits inside a merged mapping). Those spans are
+///   stepped over rather than aborting the pass, and this is how many bytes were
+///   never examined. Non-zero means the results are incomplete.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanStats {
     /// Candidate positions (first scan) or previous results (next scan) examined.
@@ -118,12 +126,24 @@ pub struct ScanStats {
     pub matched: usize,
     /// How many previous results could not be read back and were dropped.
     pub unreadable: usize,
+    /// Bytes inside nominally readable regions that a first scan could not read
+    /// and therefore skipped.
+    pub skipped_bytes: usize,
 }
 
 /// The read buffer size for the first-scan chunked region walk (a handful of
 /// pages). Regions larger than this are read in overlapping windows so a value
 /// straddling a chunk boundary is still found.
 const CHUNK_SIZE: usize = 64 * 1024;
+
+/// The granularity a first scan steps over an unreadable span at. Faults happen
+/// per page, so this is the smallest useful skip.
+const PAGE_SIZE: usize = 4096;
+
+/// How many consecutive faulting windows a region tolerates before the walk
+/// gives up on it. Without a cap, a region that has been unmapped in its
+/// entirety would cost one syscall per page across its whole span.
+const MAX_CONSECUTIVE_FAULTS: usize = 16;
 
 /// How many result generations the undo history keeps (matches ReClass.NET's
 /// `CircularBuffer<ScanResultStore>(3)`).
@@ -408,6 +428,7 @@ impl<T: ScanTarget> Scanner<T> {
         let mut results = ScanResults::with_stride(stride);
         let mut buf = vec![0u8; CHUNK_SIZE.max(stride)];
         let mut scanned = 0usize;
+        let mut skipped = 0usize;
         self.truncated = false;
 
         // An estimate, since a region may read short: the walked span divided by
@@ -426,6 +447,7 @@ impl<T: ScanTarget> Scanner<T> {
                 &mut results,
                 observer,
                 &mut scanned,
+                &mut skipped,
                 total,
             )?;
             if outcome == WalkOutcome::Cancelled {
@@ -443,6 +465,7 @@ impl<T: ScanTarget> Scanner<T> {
             scanned,
             matched: results.len(),
             unreadable: 0,
+            skipped_bytes: skipped,
         };
         self.push_generation(results);
         self.has_scanned = true;
@@ -559,6 +582,9 @@ impl<T: ScanTarget> Scanner<T> {
             scanned: previous.len(),
             matched: results.len(),
             unreadable,
+            // A next scan reads only known result addresses, so there is no
+            // region span to skip — unreadable results are counted individually.
+            skipped_bytes: 0,
         };
         self.push_generation(results);
         Ok(self.results())
@@ -569,6 +595,14 @@ impl<T: ScanTarget> Scanner<T> {
     ///
     /// `scanned` accumulates across regions so progress is reported against the
     /// whole pass, not per region.
+    ///
+    /// A region that faults part-way through does **not** abort the pass. The
+    /// maps snapshot is taken once and the target keeps running, so an
+    /// `munmap`, a `PROT_NONE` guard page inside a merged mapping, or a
+    /// `ptrace_scope` change routinely makes part of a "readable" region
+    /// unreadable. Those spans are stepped over a page at a time and their size
+    /// accumulated into `skipped`; only a region that faults repeatedly is
+    /// abandoned wholesale.
     #[allow(clippy::too_many_arguments)]
     fn scan_region_first(
         &self,
@@ -580,27 +614,63 @@ impl<T: ScanTarget> Scanner<T> {
         out: &mut ScanResults,
         observer: &mut dyn ScanObserver,
         scanned: &mut usize,
+        skipped: &mut usize,
         total: usize,
     ) -> Result<WalkOutcome> {
         let align = self.alignment();
         // Start on an aligned address so every candidate in this region sits on
         // the same lattice, independent of where the region happens to begin.
-        let mut addr = region.base.next_multiple_of(align);
+        let mut addr = Self::align_up(region.base, align);
         let region_end = region.end();
         // Candidates since the last observer tick, so the check itself costs
         // nothing per position.
         let mut since_tick = 0usize;
+        // Consecutive failed windows. A region that is entirely gone would
+        // otherwise cost one syscall per page for its whole span.
+        let mut consecutive_faults = 0usize;
 
         while addr < region_end {
             // Never read past the region: cap the request to what remains.
             let remaining = region_end - addr;
-            let want = buf.len().min(remaining);
-            let read = self.target.read(addr, &mut buf[..want])?;
-            if read < stride {
-                // Not enough bytes left in this region (or a short read at the
-                // tail) to hold even one value — done with this region.
+            if remaining < stride {
+                // The region tail is too short to hold even one value. This is
+                // the ordinary way the walk ends, not a fault.
                 break;
             }
+            let want = buf.len().min(remaining);
+            let read = match self.target.read(addr, &mut buf[..want]) {
+                Ok(n) => {
+                    consecutive_faults = 0;
+                    n
+                }
+                Err(_) => {
+                    // `addr` itself is unreadable. Step over the page it sits in
+                    // and try the next one; a hole is usually a page or two.
+                    consecutive_faults += 1;
+                    if consecutive_faults > MAX_CONSECUTIVE_FAULTS {
+                        *skipped += remaining;
+                        break;
+                    }
+                    let next = Self::next_page(addr).min(region_end);
+                    *skipped += next - addr;
+                    addr = Self::align_up(next, align);
+                    continue;
+                }
+            };
+            if read < stride {
+                // A hole starts inside this window before a whole value fits.
+                // Resume after the faulting page rather than abandoning the
+                // rest of the region.
+                let next = Self::next_page(addr.saturating_add(read)).min(region_end);
+                *skipped += next - addr;
+                addr = Self::align_up(next, align);
+                continue;
+            }
+            // A short read (`read < want`) is *not* accounted as skipped here:
+            // the advance below resumes at `addr + read - (stride - 1)`, the
+            // next iteration faults, and the page-skip path above counts the
+            // hole exactly once. Counting the window remainder as well would
+            // double-count every byte past the hole that is scanned normally.
 
             // The last position where a full stride still fits in what we read.
             let last = read - stride;
@@ -640,11 +710,34 @@ impl<T: ScanTarget> Scanner<T> {
             // value straddling the previous chunk boundary is still tested, then
             // round back up to the alignment lattice so candidates stay on it.
             // Advance by at least `align` to make progress even in the degenerate
-            // `read == stride` case.
+            // `read == stride` case. Saturating throughout: a region abutting the
+            // top of the address space would otherwise overflow here, which
+            // panics in debug and silently wraps to 0 in release.
             let step = (read - (stride - 1)).max(1);
-            addr = (addr + step).next_multiple_of(align).max(addr + align);
+            let floor = addr.saturating_add(align);
+            addr = Self::align_up(addr.saturating_add(step), align).max(floor);
         }
         Ok(WalkOutcome::Completed)
+    }
+
+    /// The start of the page after the one containing `addr`, saturating at the
+    /// top of the address space.
+    fn next_page(addr: usize) -> usize {
+        match addr.checked_add(PAGE_SIZE) {
+            // `addr & !(PAGE_SIZE - 1)` is the page base; + one page is the next.
+            Some(_) => (addr & !(PAGE_SIZE - 1)).saturating_add(PAGE_SIZE),
+            None => usize::MAX,
+        }
+    }
+
+    /// `addr` rounded up to a multiple of `align`, saturating instead of
+    /// panicking on overflow (`usize::next_multiple_of` panics in debug).
+    fn align_up(addr: usize, align: usize) -> usize {
+        debug_assert!(align > 0);
+        match addr.checked_next_multiple_of(align) {
+            Some(v) => v,
+            None => usize::MAX,
+        }
     }
 
     /// The scan stride: the needle's width when present, else the type's fixed

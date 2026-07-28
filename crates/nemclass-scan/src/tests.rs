@@ -299,14 +299,16 @@ fn freeze_set_applies_to_write_target() {
     freeze.set(BASE + 4, 99i32.to_le_bytes().to_vec());
     assert_eq!(freeze.len(), 1);
 
-    let ok = freeze.apply(&target).unwrap();
-    assert_eq!(ok, 1);
+    let report = freeze.apply(&target);
+    assert_eq!(report.written, 1);
+    assert!(report.all_written());
+    assert!(report.problem().is_none());
     assert_eq!(target.peek(BASE + 4, 4), 99i32.to_le_bytes());
 
     // Simulate the target changing the value, then re-apply pins it back.
     target.poke(BASE + 4, &0i32.to_le_bytes());
     assert_eq!(target.peek(BASE + 4, 4), 0i32.to_le_bytes());
-    freeze.apply(&target).unwrap();
+    freeze.apply(&target);
     assert_eq!(target.peek(BASE + 4, 4), 99i32.to_le_bytes());
 
     // Removing the entry stops it being re-pinned.
@@ -1170,4 +1172,97 @@ fn next_scan_progress_totals_the_previous_generation() {
         totals.iter().all(|&t| t == candidates),
         "a next scan's total is exactly the previous generation's size"
     );
+}
+
+// ── fault tolerance ────────────────────────────────────────────────────────
+
+#[test]
+fn a_hole_inside_a_region_does_not_abort_the_scan() {
+    // Three pages. The middle one is unreadable — the target unmapped it after
+    // the maps snapshot was taken. The value in page 1 and the value in page 3
+    // must both still be found, and the skipped span reported.
+    const PAGE: usize = 4096;
+    let mut buf = vec![0u8; 3 * PAGE];
+    buf[0..4].copy_from_slice(&1337i32.to_le_bytes());
+    buf[2 * PAGE + 16..2 * PAGE + 20].copy_from_slice(&1337i32.to_le_bytes());
+
+    let target = MockTarget::new(BASE, buf).with_hole(BASE + PAGE, BASE + 2 * PAGE);
+
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    let results = scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "1337")))
+        .expect("a hole must not abort the pass");
+
+    let addrs: Vec<usize> = results.iter().map(|r| r.address).collect();
+    assert!(
+        addrs.contains(&BASE) && addrs.contains(&(BASE + 2 * PAGE + 16)),
+        "both readable pages must be scanned, got {addrs:x?}"
+    );
+    assert_eq!(
+        scanner.last_scan_stats().skipped_bytes,
+        PAGE,
+        "exactly the unreadable page is reported skipped — no double counting"
+    );
+}
+
+#[test]
+fn a_fully_unmapped_region_is_skipped_without_erroring() {
+    const PAGE: usize = 4096;
+    let mut buf = vec![0u8; 2 * PAGE];
+    buf[PAGE..PAGE + 4].copy_from_slice(&42i32.to_le_bytes());
+
+    // The first region is entirely gone; the second still holds the value.
+    let regions = vec![Region::new(BASE, PAGE), Region::new(BASE + PAGE, PAGE)];
+    let target =
+        MockTarget::with_regions(BASE, buf, regions).with_hole(BASE, BASE + PAGE);
+
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    let results = scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "42")))
+        .expect("a dead region must not abort the pass");
+
+    assert_eq!(results.iter().map(|r| r.address).collect::<Vec<_>>(), vec![BASE + PAGE]);
+    assert!(scanner.last_scan_stats().skipped_bytes > 0);
+}
+
+#[test]
+fn a_clean_scan_reports_nothing_skipped() {
+    let target = MockTarget::new(BASE, buf_with_i32(8, 1337));
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    scanner
+        .first_scan(ScanCompareType::Exact, Some(needle(ScanValueType::I32, "1337")))
+        .unwrap();
+    assert_eq!(scanner.last_scan_stats().skipped_bytes, 0);
+}
+
+#[test]
+fn mock_target_write_actually_stores_bytes() {
+    // A test double that accepted writes and discarded them let freeze/write
+    // code pass its tests having written nothing.
+    let target = MockTarget::new(BASE, vec![0u8; 16]);
+    let n = target.write(BASE + 4, &7i32.to_le_bytes()).unwrap();
+    assert_eq!(n, 4);
+    assert_eq!(target.peek(BASE + 4, 4).unwrap(), 7i32.to_le_bytes());
+}
+
+#[test]
+fn freeze_reports_why_an_entry_did_not_stick() {
+    // One entry lands on a live page, one on an unmapped one. The old `apply`
+    // returned only a success count, so the UI could not tell the user which
+    // value was not actually pinned, or why.
+    let target = MockTarget::new(BASE, vec![0u8; 32]).with_hole(BASE + 16, BASE + 32);
+    let mut freeze = FreezeSet::new();
+    freeze.set(BASE + 4, 99i32.to_le_bytes().to_vec());
+    freeze.set(BASE + 20, 7i32.to_le_bytes().to_vec());
+
+    let report = freeze.apply(&target);
+    assert_eq!(report.written, 1);
+    assert_eq!(report.failed, 1);
+    assert!(!report.all_written());
+    assert!(
+        report.problem().is_some_and(|m| m.contains("1 of 2")),
+        "the report must name how many values did not stick, and why"
+    );
+    // The reachable entry was still pinned: one bad address does not abort.
+    assert_eq!(target.peek(BASE + 4, 4).unwrap(), 99i32.to_le_bytes());
 }

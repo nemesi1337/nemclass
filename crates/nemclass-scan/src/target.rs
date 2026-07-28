@@ -8,6 +8,7 @@
 //! `nemclass_core::{Process, ProviderRegistry}`.
 
 use nemclass_core::Result;
+use std::sync::Mutex;
 
 /// One contiguous, readable span of the target's address space that the scanner
 /// may walk. Platform-neutral (mirrors the useful part of
@@ -258,25 +259,56 @@ pub trait WriteTarget {
 /// buffer). Reads and writes clamp to the buffer, mirroring a real target's
 /// short transfer at a region edge. This is the sole test double the scanner is
 /// exercised through — no live process required.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MockTarget {
     base: usize,
-    buf: Vec<u8>,
+    /// Behind a `Mutex` so [`WriteTarget::write`], which takes `&self`, can
+    /// actually store bytes. A test double that accepted writes and silently
+    /// discarded them would let freeze/write code pass its tests having written
+    /// nothing.
+    buf: Mutex<Vec<u8>>,
     regions: Vec<Region>,
+    /// Absolute address ranges that fail to read, so a test can reproduce a
+    /// target that unmapped part of a nominally readable region mid-scan.
+    holes: Vec<(usize, usize)>,
+}
+
+impl Clone for MockTarget {
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base,
+            buf: Mutex::new(self.buf_lock().clone()),
+            regions: self.regions.clone(),
+            holes: self.holes.clone(),
+        }
+    }
 }
 
 impl MockTarget {
     /// A target whose whole buffer is one region starting at `base`.
     pub fn new(base: usize, buf: Vec<u8>) -> Self {
         let regions = vec![Region::new(base, buf.len())];
-        Self { base, buf, regions }
+        Self::with_regions(base, buf, regions)
     }
 
     /// A target with explicit, possibly-partial [`Region`]s over the buffer.
     /// Regions are given as absolute address ranges; the scanner will only read
     /// within them, so this exercises region-boundary behaviour.
     pub fn with_regions(base: usize, buf: Vec<u8>, regions: Vec<Region>) -> Self {
-        Self { base, buf, regions }
+        Self {
+            base,
+            buf: Mutex::new(buf),
+            regions,
+            holes: Vec::new(),
+        }
+    }
+
+    /// Marks `[start, end)` unreadable: reads that begin inside it fail, and
+    /// reads that run into it stop short — exactly how `process_vm_readv`
+    /// behaves against an unmapped page inside a listed region.
+    pub fn with_hole(mut self, start: usize, end: usize) -> Self {
+        self.holes.push((start, end));
+        self
     }
 
     /// The base address the buffer is mapped at.
@@ -287,19 +319,39 @@ impl MockTarget {
     /// Mutable access to the backing buffer, so a test can mutate the target
     /// between a first and next scan.
     pub fn buf_mut(&mut self) -> &mut [u8] {
-        &mut self.buf
+        self.buf.get_mut().expect("mock target buffer poisoned")
     }
 
     /// Reads the current bytes at absolute `addr` for `len` bytes, for test
     /// assertions. Returns `None` if out of range.
-    pub fn peek(&self, addr: usize, len: usize) -> Option<&[u8]> {
+    pub fn peek(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
         let start = addr.checked_sub(self.base)?;
-        self.buf.get(start..start + len)
+        let end = start.checked_add(len)?;
+        self.buf_lock().get(start..end).map(<[u8]>::to_vec)
+    }
+
+    fn buf_lock(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.buf.lock().expect("mock target buffer poisoned")
     }
 
     /// Translates an absolute address into a buffer offset, if in range.
-    fn offset_of(&self, addr: usize) -> Option<usize> {
-        addr.checked_sub(self.base).filter(|&o| o <= self.buf.len())
+    fn offset_of(&self, addr: usize, len: usize) -> Option<usize> {
+        addr.checked_sub(self.base).filter(|&o| o <= len)
+    }
+
+    /// How many bytes are readable starting at `addr` before the first hole.
+    fn readable_from(&self, addr: usize) -> Option<usize> {
+        if self.holes.iter().any(|&(s, e)| addr >= s && addr < e) {
+            return None;
+        }
+        Some(
+            self.holes
+                .iter()
+                .filter(|&&(s, _)| s > addr)
+                .map(|&(s, _)| s - addr)
+                .min()
+                .unwrap_or(usize::MAX),
+        )
     }
 }
 
@@ -309,22 +361,34 @@ impl ScanTarget for MockTarget {
     }
 
     fn read(&self, addr: usize, buf: &mut [u8]) -> Result<usize> {
-        let Some(offset) = self.offset_of(addr) else {
+        let Some(until_hole) = self.readable_from(addr) else {
+            return Err(nemclass_core::Error::InvalidAddress);
+        };
+        let src = self.buf_lock();
+        let Some(offset) = self.offset_of(addr, src.len()) else {
             return Ok(0);
         };
-        let available = self.buf.len() - offset;
-        let n = available.min(buf.len());
-        buf[..n].copy_from_slice(&self.buf[offset..offset + n]);
+        let available = src.len() - offset;
+        let n = available.min(buf.len()).min(until_hole);
+        buf[..n].copy_from_slice(&src[offset..offset + n]);
         Ok(n)
     }
 }
 
 impl WriteTarget for MockTarget {
-    fn write(&self, _addr: usize, _buf: &[u8]) -> Result<usize> {
-        // Interior mutability is intentionally not offered on the shared-ref
-        // `MockTarget`; freeze-write tests use a `&mut` helper instead (see the
-        // crate tests). A shared-ref write would need a `Cell`/`Mutex` wrapper.
-        Ok(0)
+    fn write(&self, addr: usize, buf: &[u8]) -> Result<usize> {
+        // A hole is unmapped, so it fails writes exactly as it fails reads.
+        let Some(until_hole) = self.readable_from(addr) else {
+            return Err(nemclass_core::Error::InvalidAddress);
+        };
+        let mut dst = self.buf_lock();
+        let Some(offset) = self.offset_of(addr, dst.len()) else {
+            return Ok(0);
+        };
+        let available = dst.len() - offset;
+        let n = available.min(buf.len()).min(until_hole);
+        dst[offset..offset + n].copy_from_slice(&buf[..n]);
+        Ok(n)
     }
 }
 

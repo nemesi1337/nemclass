@@ -1,8 +1,6 @@
 //! Frozen values — addresses whose bytes are periodically re-written so the
 //! target can't change them (Cheat Engine's "freeze" checkbox).
 
-use nemclass_core::Result;
-
 use crate::target::WriteTarget;
 
 /// A set of frozen `(address, bytes)` entries. The UI calls [`FreezeSet::apply`]
@@ -48,17 +46,66 @@ impl FreezeSet {
     ///
     /// A short or failed write on one entry does not abort the rest — freezing
     /// is best-effort and a transiently-unmapped page should not stop the other
-    /// entries from being re-pinned. Returns the number of entries whose full
-    /// byte span was written.
-    pub fn apply<T: WriteTarget>(&self, target: &T) -> Result<usize> {
-        let mut ok = 0;
+    /// entries from being re-pinned. The per-entry outcome is reported rather
+    /// than discarded: a caller that only saw a success count could not tell
+    /// "not frozen because the process died" from "not frozen because the page
+    /// is read-only" from "frozen fine".
+    pub fn apply<T: WriteTarget>(&self, target: &T) -> FreezeReport {
+        let mut report = FreezeReport::default();
         for (addr, bytes) in &self.entries {
-            if let Ok(written) = target.write(*addr, bytes)
-                && written == bytes.len()
-            {
-                ok += 1;
+            match target.write(*addr, bytes) {
+                Ok(written) if written == bytes.len() => report.written += 1,
+                Ok(_) => report.short += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    report.last_error = Some(e);
+                }
             }
         }
-        Ok(ok)
+        report
+    }
+}
+
+/// The per-pass outcome of [`FreezeSet::apply`].
+///
+/// `written + short + failed` always equals the entry count, so a caller can
+/// tell the user exactly how many values are actually pinned and why the rest
+/// are not.
+#[derive(Debug, Default)]
+pub struct FreezeReport {
+    /// Entries whose full byte span was written.
+    pub written: usize,
+    /// Entries the target accepted only partially (a page boundary, a shrinking
+    /// mapping).
+    pub short: usize,
+    /// Entries whose write returned an error.
+    pub failed: usize,
+    /// The last error seen, for a status message.
+    pub last_error: Option<nemclass_core::Error>,
+}
+
+impl FreezeReport {
+    /// Whether every entry was fully written.
+    pub fn all_written(&self) -> bool {
+        self.short == 0 && self.failed == 0
+    }
+
+    /// A short human-readable reason when some entry did not stick, else `None`.
+    pub fn problem(&self) -> Option<String> {
+        if self.all_written() {
+            return None;
+        }
+        Some(match &self.last_error {
+            Some(e) => format!(
+                "{} of {} frozen values not written: {e}",
+                self.short + self.failed,
+                self.written + self.short + self.failed
+            ),
+            None => format!(
+                "{} of {} frozen values only partially written",
+                self.short,
+                self.written + self.short + self.failed
+            ),
+        })
     }
 }

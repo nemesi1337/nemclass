@@ -461,8 +461,9 @@ pub fn spider_scan_with<T: ScanTarget>(
 
             // First slot at or after the struct base that is absolutely aligned;
             // offsets stay relative to the raw base (see `SpiderPath`).
-            let start = frame.addr.next_multiple_of(align) - frame.addr;
-            let window_end = start + cfg.struct_size;
+            let aligned = frame.addr.checked_next_multiple_of(align).unwrap_or(frame.addr);
+            let start = aligned - frame.addr;
+            let window_end = start.saturating_add(cfg.struct_size);
 
             let mut off = start;
             while off < window_end && off < limit {
@@ -488,7 +489,7 @@ pub fn spider_scan_with<T: ScanTarget>(
                 // pointers are aligned in absolute terms, so test the absolute
                 // address rather than the offset.
                 if frame.depth < cfg.max_depth
-                    && (frame.addr + off) % psize == 0
+                    && frame.addr.saturating_add(off) % psize == 0
                     && cover.has(off, psize)
                 {
                     let word = read_word(&win[off..off + psize]);
