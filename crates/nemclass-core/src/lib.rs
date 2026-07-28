@@ -34,6 +34,10 @@ pub use internal::{
     find_code_refs,
     make_masked_signature,
     operand_wildcard_mask,
+    // Back-sync: where to start decoding so a window *ending* at an address
+    // shows the real instructions that precede it (variable-length x86).
+    sync_backward_start,
+    sync_backward_start_with_bitness,
     // Target decode width. Derived from the inspected module's own headers, not
     // from the host — a Wine process maps 32-bit and 64-bit images side by side.
     Bitness,

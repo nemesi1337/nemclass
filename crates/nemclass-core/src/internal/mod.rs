@@ -49,7 +49,8 @@ pub use process::{
 pub use decoder::{
     Bitness, FlowKind, HOST_BITNESS, InstructionData, disassemble_instructions,
     disassemble_instructions_with_bitness, find_code_refs, make_masked_signature,
-    operand_wildcard_mask, operand_wildcard_mask_with_bitness,
+    operand_wildcard_mask, operand_wildcard_mask_with_bitness, sync_backward_start,
+    sync_backward_start_with_bitness,
 };
 
 // Memory-dissection analysis surface (M5.1). The `analysis` module tree stays

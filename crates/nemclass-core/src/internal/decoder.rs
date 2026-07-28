@@ -403,6 +403,96 @@ pub fn find_code_refs(code: &[u8], virtual_address: u64, target: u64) -> Vec<u64
     refs
 }
 
+/// Finds a decode-aligned start address for a *backward* context window ending
+/// at `target`.
+///
+/// x86 instructions are variable-length, so the bytes preceding an address
+/// cannot simply be decoded from an arbitrary offset: unless the stream happens
+/// to line up, every "preceding" instruction it yields is fiction. This is the
+/// back-sync an interactive disassembler does to show the code leading up to the
+/// address you jumped to.
+///
+/// Every start in `code` (mapped at `virtual_address`) is tried, and each votes
+/// on where the instruction *covering* `target` begins. Because x86 streams
+/// re-synchronise after a few instructions, the great majority agree; the winner
+/// is that consensus, and the returned start is the earliest one that reaches it
+/// (the most context we can justify). Voting rather than demanding an exact
+/// landing also handles a `target` that is itself mid-instruction — the case a
+/// hand-typed address hits.
+///
+/// `code` should extend a little *past* `target` — up to the 15-byte maximum
+/// instruction length — so an instruction covering it can be decoded whole. A
+/// window that stops at `target` can only ever detect an exact landing.
+///
+/// Returns `None` when nothing can be established: an empty window, a `target`
+/// at or behind its start, or no candidate reaching `target` at all. The caller
+/// should then begin at `target` itself — no context beats invented context.
+pub fn sync_backward_start(code: &[u8], virtual_address: u64, target: u64) -> Option<u64> {
+    sync_backward_start_with_bitness(code, virtual_address, HOST_BITNESS, target)
+}
+
+/// [`sync_backward_start`] with an explicit decode width. See [`Bitness`].
+pub fn sync_backward_start_with_bitness(
+    code: &[u8],
+    virtual_address: u64,
+    bitness: Bitness,
+    target: u64,
+) -> Option<u64> {
+    // anchor -> (votes, earliest start that produced it)
+    let mut votes: std::collections::HashMap<u64, (usize, u64)> = std::collections::HashMap::new();
+
+    for offset in 0..code.len() {
+        let start = virtual_address.checked_add(offset as u64)?;
+        // At or past the target there is no preceding context left to find.
+        if start >= target {
+            break;
+        }
+        let Some(anchor) = anchor_covering(&code[offset..], start, bitness, target) else {
+            continue;
+        };
+        let entry = votes.entry(anchor).or_insert((0, start));
+        entry.0 += 1;
+        entry.1 = entry.1.min(start);
+    }
+
+    votes
+        .into_values()
+        // Most votes wins; a tie goes to whichever offers more context.
+        .max_by_key(|&(count, start)| (count, std::cmp::Reverse(start)))
+        .map(|(_, start)| start)
+}
+
+/// Decoding `code` from `virtual_address`, the address of the instruction that
+/// covers `target` (`target` itself when it is an instruction boundary).
+///
+/// `None` if the stream hits an invalid decode (not real code at this alignment)
+/// or runs out of bytes before covering `target`.
+fn anchor_covering(
+    code: &[u8],
+    virtual_address: u64,
+    bitness: Bitness,
+    target: u64,
+) -> Option<u64> {
+    let mut decoder = Decoder::with_ip(bitness.bits(), code, virtual_address, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    loop {
+        let ip = decoder.ip();
+        if ip == target {
+            return Some(target);
+        }
+        if ip > target || !decoder.can_decode() {
+            return None;
+        }
+        decoder.decode_out(&mut instruction);
+        if instruction.is_invalid() {
+            return None;
+        }
+        if decoder.ip() > target {
+            return Some(ip);
+        }
+    }
+}
+
 /// Format a byte slice as an IDA hex signature, emitting `??` where `mask[i]`.
 fn format_masked(bytes: &[u8], mask: &[bool]) -> String {
     bytes
@@ -548,6 +638,83 @@ mod tests {
             false
         });
         out.expect("expected one decoded instruction")
+    }
+
+    /// The addresses decoded from `start` over `code` (mapped at `start`).
+    fn addresses_from(code: &[u8], start: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        disassemble_instructions(code, start, false, |ins| {
+            out.push(ins.address);
+            ins.instruction != "???"
+        });
+        out
+    }
+
+    /// The easy case: the window is already instruction-aligned, so the very
+    /// first candidate (the whole window) syncs onto the target.
+    #[test]
+    fn back_sync_keeps_an_aligned_window_whole() {
+        // [0x1000, 0x1006): nop; nop; mov rbp, rsp; nop — ends exactly at target.
+        const CODE: &[u8] = &[0x90, 0x90, 0x48, 0x89, 0xE5, 0x90];
+
+        assert_eq!(sync_backward_start(CODE, VA, VA + 6), Some(VA));
+    }
+
+    /// The case that makes back-sync necessary: decoding from the front of the
+    /// window straddles the target, so a later start has to be chosen. Here the
+    /// window opens mid-`movabs`, and only dropping its first byte yields a
+    /// stream that lands on the target.
+    #[test]
+    fn back_sync_skips_a_start_that_desyncs() {
+        // 0x48 0xB8 starts a 10-byte `movabs rax, imm64` that the 6-byte window
+        // cannot hold; from VA+1 the bytes are a 5-byte `mov eax, 0`.
+        const CODE: &[u8] = &[0x48, 0xB8, 0x00, 0x00, 0x00, 0x00];
+        let target = VA + 6;
+
+        let start = sync_backward_start(CODE, VA, target).expect("a start should sync");
+
+        assert_eq!(start, VA + 1);
+        // The guarantee the caller relies on: decoding from `start` reaches the
+        // target exactly, so every instruction shown before it is real.
+        let offset = (start - VA) as usize;
+        let addrs = addresses_from(&CODE[offset..], start);
+        assert_eq!(addrs, vec![VA + 1]);
+    }
+
+    /// A target *inside* the window (not at its end) syncs just as well — this is
+    /// what a listing centred on an address needs.
+    #[test]
+    fn back_sync_finds_a_target_inside_the_window() {
+        const CODE: &[u8] = &[0x90; 8];
+
+        assert_eq!(sync_backward_start(CODE, VA, VA + 5), Some(VA));
+    }
+
+    /// A target that is itself *mid-instruction* — what a hand-typed address
+    /// usually is — has no exact landing, so the consensus on which instruction
+    /// covers it decides. Two of the three viable starts agree on the `mov` at
+    /// VA+1, so the window opens at the earliest of them.
+    #[test]
+    fn back_sync_handles_a_target_inside_an_instruction() {
+        // nop; mov eax, 44332211h; nop — the target falls inside the `mov`.
+        const CODE: &[u8] = &[0x90, 0xB8, 0x11, 0x22, 0x33, 0x44, 0x90];
+        let target = VA + 3;
+
+        let start = sync_backward_start(CODE, VA, target).expect("a start should win the vote");
+
+        assert_eq!(start, VA);
+        // Decoding from there really does cover the target rather than land on it.
+        let addrs = addresses_from(CODE, start);
+        assert!(addrs.contains(&(VA + 1)) && !addrs.contains(&target));
+    }
+
+    /// Nothing to sync: an empty window, or a target at/behind its start. The
+    /// caller then begins at the target itself rather than inventing context.
+    #[test]
+    fn back_sync_returns_none_when_there_is_no_context() {
+        assert_eq!(sync_backward_start(&[], VA, VA + 4), None);
+        assert_eq!(sync_backward_start(&[0x90; 4], VA, VA), None);
+        assert_eq!(sync_backward_start(&[0x90; 4], VA, VA - 1), None);
     }
 
     /// The same bytes mean different things at different widths. `8B 45 08` is
