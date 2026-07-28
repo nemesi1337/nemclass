@@ -1,0 +1,22 @@
+[package]
+name = "nemclass-app"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["scripting"]
+scripting = ["nemclass-ui/scripting", "nemclass-script/scripting"]
+
+[[bin]]
+name = "nemclass"
+path = "src/main.rs"
+
+[dependencies]
+nemclass-core.workspace = true
+nemclass-model.workspace = true
+nemclass-script.workspace = true
+nemclass-ui.workspace = true
+eframe.workspace = true
+egui.workspace = true
+env_logger.workspace = true
+log = "0.4"

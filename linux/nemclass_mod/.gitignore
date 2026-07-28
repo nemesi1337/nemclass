@@ -1,0 +1,18 @@
+# kbuild / module build artifacts
+*.o
+.*.o.d
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+.module-common.o
+Module.symvers
+modules.order
+modules.builtin*
+.tmp_versions/
+
+# userspace test binaries
+test/fixture
+test/nemclient

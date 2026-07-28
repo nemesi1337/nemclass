@@ -1,0 +1,53 @@
+[package]
+name = "nemclass-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["std", "alloc"]
+alloc = []
+std = []
+# Richer on-disk symbolication (M5.2): the `SymbolResolver`. Off by default so
+# the base build stays lean and never compiles addr2line/object/pdb. Each backing
+# crate is optional and target-scoped below; `dep:` keys pull only what the
+# active target actually has, so enabling `symbols` on Linux never references the
+# (Windows-only) pdb crates and vice-versa.
+symbols = [
+    "dep:addr2line",
+    "dep:object",
+    "dep:pdb-addr2line",
+]
+# Test-only seams: a public `Process::from_backend_for_test` and an in-memory
+# `MockMemoryBackend`, so the ui/scan layers can exercise the hex viewer,
+# disassembler, and analysis against known bytes without a live `/proc` target.
+# Off by default; never compiled into a release build.
+test-util = []
+
+[dependencies]
+iced-x86.workspace = true
+bitflags.workspace = true
+obfstr.workspace = true
+libc.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+
+# DWARF/ELF symbolication for the `symbols` feature — Unix only (addr2line's
+# `loader` reads a Mach-O/ELF/PE object off disk; we use the ELF path). Optional
+# so a Unix build without `--features symbols` never compiles them.
+[target.'cfg(unix)'.dependencies]
+addr2line = { workspace = true, optional = true }
+object = { workspace = true, optional = true }
+
+# Native Windows backend (`ReadProcessMemory`/`OpenProcess`/...). Compiled only
+# on Windows targets, so the Linux build never sees `windows-sys`.
+#
+# PDB symbolication for the `symbols` feature — Windows only. Optional so a
+# Windows build without `--features symbols` never compiles the pdb crates.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+# pdb-addr2line vendors its own version-locked `pdb` crate (re-exported as
+# `pdb_addr2line::pdb`) which we open PDBs through, so a standalone `pdb` dep is
+# intentionally omitted — mixing the two `pdb` versions yields distinct,
+# incompatible `PDB` types. The workspace still pins `pdb` for a future direct
+# symbol-enumeration path.
+pdb-addr2line = { workspace = true, optional = true }

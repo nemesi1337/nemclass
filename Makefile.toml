@@ -1,0 +1,218 @@
+# cargo-make task runner for the nemclass workspace.
+#
+#   cargo install cargo-make      # one-time
+#   cargo make <task>             # run a task
+#   cargo make --list-all-steps   # see everything
+#
+# Rust tasks cover the whole workspace. The `kmod-*` tasks build / install /
+# load / unload the out-of-tree Linux kernel module in `linux/nemclass_mod/`
+# (Linux + root for the privileged ones). The module's auth key is read from
+#   $HOME/.local/data/nemclass_kernel_key   (override with NEMCLASS_KEY_FILE)
+# which `cargo make gen-key` can create for you.
+
+[config]
+# Only our tasks — no cargo-make's built-in predefined tasks.
+skip_core_tasks = true
+# Our shell tasks must run once, not once per workspace member.
+default_to_workspace = false
+
+[env]
+MOD_DIR = "linux/nemclass_mod"
+MOD_NAME = "nemclass_mod"
+# Default key-file location. Scripts honour an externally-exported
+# NEMCLASS_KEY_FILE (see the `:-` fallbacks below), so this is only a hint /
+# documentation anchor; exporting the var overrides it.
+NEMCLASS_KEY_FILE = "${HOME}/.local/data/nemclass_kernel_key"
+
+# ---------------------------------------------------------------------------
+# Rust workspace
+# ---------------------------------------------------------------------------
+
+[tasks.default]
+description = "Default task: build the workspace."
+alias = "build"
+
+[tasks.build]
+description = "Build the whole workspace (debug)."
+command = "cargo"
+args = ["build", "--workspace"]
+
+[tasks.build-release]
+description = "Build the whole workspace (release)."
+command = "cargo"
+args = ["build", "--workspace", "--release"]
+
+[tasks.check]
+description = "Type-check the whole workspace."
+command = "cargo"
+args = ["check", "--workspace"]
+
+[tasks.test]
+description = "Run all workspace tests."
+command = "cargo"
+args = ["test", "--workspace"]
+
+[tasks.test-symbols]
+description = "Run nemclass-core tests with the DWARF/PDB `symbols` feature."
+command = "cargo"
+args = ["test", "-p", "nemclass-core", "--features", "symbols"]
+
+[tasks.clippy]
+description = "Lint the whole workspace, denying warnings."
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.fmt]
+description = "Format all crates in place."
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.fmt-check]
+description = "Check formatting without writing (CI-friendly)."
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+# Clears target/doc so stale external-crate docs from earlier (pre --no-deps)
+# builds don't linger in the sidebar/search index.
+[tasks.doc-clean]
+description = "Remove stale doc output before building API docs."
+command = "cargo"
+args = ["clean", "--doc"]
+
+[tasks.doc]
+description = "Build the API docs (workspace crates only, no dependencies)."
+dependencies = ["doc-clean"]
+command = "cargo"
+args = [
+    "doc",
+    "--no-deps",
+    "--open",
+    "-p", "nemclass-core",
+    "-p", "nemclass-model",
+    "-p", "nemclass-script",
+    "-p", "nemclass-scan",
+    "-p", "nemclass-ui",
+    "-p", "nemclass-app",
+]
+
+[tasks.run]
+description = "Run the desktop app (nemclass-app). Extra args pass through."
+command = "cargo"
+args = ["run", "-p", "nemclass-app", "${@}"]
+
+[tasks.ci]
+description = "The pre-commit gate: fmt-check + clippy + test."
+dependencies = ["fmt-check", "clippy", "test"]
+
+[tasks.windows-check]
+description = "Cross-check nemclass-core for the Windows target."
+command = "cargo"
+args = ["check", "-p", "nemclass-core", "--target", "x86_64-pc-windows-gnu"]
+
+# ---------------------------------------------------------------------------
+# Kernel module (linux/nemclass_mod) — Linux only
+# ---------------------------------------------------------------------------
+
+[tasks.kmod-build]
+description = "Build the nemclass_mod kernel module (.ko) for the running kernel."
+condition = { platforms = ["linux"] }
+script = '''
+set -eu
+make -C "${MOD_DIR}" all
+echo "built ${MOD_DIR}/${MOD_NAME}.ko"
+'''
+
+[tasks.kmod-clean]
+description = "Clean the kernel module build artifacts."
+condition = { platforms = ["linux"] }
+script = '''
+set -eu
+make -C "${MOD_DIR}" clean
+'''
+
+[tasks.kmod-install]
+description = "Install the module via DKMS (symlink + build + install). Needs root."
+condition = { platforms = ["linux"] }
+script = '''
+set -eu
+sudo "${MOD_DIR}/install-dkms.sh"
+'''
+
+[tasks.kmod-uninstall]
+description = "Remove the module from DKMS. Needs root."
+condition = { platforms = ["linux"] }
+script = '''
+set -eu
+sudo "${MOD_DIR}/install-dkms.sh" uninstall
+'''
+
+[tasks.kmod-load]
+description = "Load nemclass_mod with the auth key from the key file. Needs root."
+condition = { platforms = ["linux"] }
+script = '''
+set -eu
+KEYFILE="${NEMCLASS_KEY_FILE:-$HOME/.local/data/nemclass_kernel_key}"
+if [ ! -f "$KEYFILE" ]; then
+    echo "no key file at: $KEYFILE" >&2
+    echo "generate one with 'cargo make gen-key' (or set NEMCLASS_KEY_FILE)." >&2
+    exit 1
+fi
+KEY="$(tr -d '[:space:]' < "$KEYFILE")"
+if [ -z "$KEY" ]; then echo "key file $KEYFILE is empty" >&2; exit 1; fi
+# The module wants raw hex with no 0x prefix (see docs/kernel-module.md).
+sudo modprobe "${MOD_NAME}" key="$KEY" ${NEMCLASS_MODPROBE_ARGS:-}
+echo "loaded ${MOD_NAME} (key from $KEYFILE)"
+'''
+
+[tasks.kmod-unload]
+description = "Unload nemclass_mod (idempotent). Needs root."
+condition = { platforms = ["linux"] }
+script = '''
+set -eu
+if lsmod | grep -q "^${MOD_NAME}\b"; then
+    sudo modprobe -r "${MOD_NAME}" 2>/dev/null || sudo rmmod "${MOD_NAME}"
+    echo "unloaded ${MOD_NAME}"
+else
+    echo "${MOD_NAME} is not loaded"
+fi
+'''
+
+[tasks.kmod-reload]
+description = "Unload then reload the module with the current key."
+condition = { platforms = ["linux"] }
+dependencies = ["kmod-unload", "kmod-load"]
+
+[tasks.kmod-status]
+description = "Show DKMS + load status of the module."
+condition = { platforms = ["linux"] }
+script = '''
+dkms status "${MOD_NAME}" 2>/dev/null || echo "dkms: ${MOD_NAME} not registered"
+if lsmod | grep -q "^${MOD_NAME}\b"; then
+    echo "lsmod: ${MOD_NAME} loaded"
+else
+    echo "lsmod: ${MOD_NAME} not loaded"
+fi
+ls -l /proc/nemclass 2>/dev/null || true
+'''
+
+# ---------------------------------------------------------------------------
+# Auth key (optional helper)
+# ---------------------------------------------------------------------------
+
+[tasks.gen-key]
+description = "Generate a random hex auth key at the key file (FORCE=1 to overwrite)."
+script = '''
+set -eu
+KEYFILE="${NEMCLASS_KEY_FILE:-$HOME/.local/data/nemclass_kernel_key}"
+if [ -f "$KEYFILE" ] && [ "${FORCE:-0}" != "1" ]; then
+    echo "key file already exists: $KEYFILE" >&2
+    echo "pass FORCE=1 to overwrite (this invalidates a currently-loaded module's key)." >&2
+    exit 1
+fi
+mkdir -p "$(dirname "$KEYFILE")"
+umask 077
+# 16 bytes -> 32 hex chars, raw hex (no 0x), which is what modprobe/the UI expect.
+openssl rand -hex 16 > "$KEYFILE"
+chmod 600 "$KEYFILE"
+echo "wrote a new key to $KEYFILE"
+'''

@@ -1,15 +1,104 @@
-[package]
-name = "reclass-rs"
+[workspace]
+resolver = "2"
+members = [
+    "crates/nemclass-core",
+    "crates/nemclass-scan",
+    "crates/nemclass-model",
+    "crates/nemclass-script",
+    "crates/nemclass-ui",
+    "crates/nemclass-app",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = ["std", "alloc"]
-alloc = []
-std = []
-
-[dependencies]
+[workspace.dependencies]
+# External
 iced-x86 = { version = "1.21.0", features = ["default"] }
 bitflags = "2.4.0"
 obfstr = "0.4.3"
-libc = { version = "0.2.189" }
+libc = "0.2.189"
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+# serde is pinned BELOW 1.0.220 DELIBERATELY. serde 1.0.220 split out `serde_core`
+# and removed the facade `serde::__private`, which the entire rustyscript/deno swc
+# tree (swc_config, swc_common, swc_ecma_*) still references. The deno tree itself
+# accepts any serde ("1"); only the newer `toml 1.1.x` chain (via serde_core) forced
+# serde up — so `toml` is held at 0.8 (pre-serde_core; the project only uses
+# to_string/from_str/Value, identical across versions). This lets `--features
+# scripting` compile the v8/JS engine. serde_json is matched (pre-serde_core).
+serde = { version = "=1.0.219", features = ["derive"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+env_logger = "0.11"
+serde_json = "=1.0.140"
+# Win32 bindings for the native Windows memory backend (nemclass-core, cfg(windows)
+# only). windows-sys is the raw-FFI crate (no wrappers) — smaller and faster to
+# build than the higher-level `windows` crate. Feature list = only the namespaces
+# the backend touches: process/module/memory enumeration + read/write.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+# rustyscript wraps deno_core/v8 (the `scripting` feature of nemclass-script).
+# Heavy build — an optional dep, pinned. Enabled only via `--features scripting`.
+#
+# Pinned to 0.11.0. The `scripting` feature compiles and works — but ONLY because
+# serde is held below 1.0.220 (see the serde pin above). rustyscript's entire swc/deno
+# tree (swc_config, swc_common, swc_ecma_*) references the `serde::__private` facade
+# that serde 1.0.220+ removed; keeping serde at 1.0.219 keeps that facade present, so
+# the swc tree builds unmodified. Do NOT bump serde past 1.0.219 without confirming
+# the swc/deno tree no longer needs `serde::__private`, or the JS engine breaks again.
+# Also keep deno_media_type pinned (in Cargo.lock) to a version deno_ast 0.43.3's
+# exhaustive MediaType match handles (a bare `cargo update` floats it up and breaks).
+rustyscript = "=0.11.0"
+# Symbolication (nemclass-core `symbols` feature, M5.2). All optional in the
+# crate and target-scoped there — the base build never compiles them.
+#   Unix/DWARF: addr2line re-exports a matching `gimli`/`object` and, via its
+#   default `loader` feature, memory-maps+parses the object itself; we still take
+#   `object` directly to read PT_LOAD vaddrs for the runtime→object load-bias.
+#   Windows/PDB: pdb + pdb-addr2line resolve an RVA to a function via the PDB.
+addr2line = "0.27.0"
+object = { version = "0.39.1", default-features = false, features = ["read_core", "elf", "std"] }
+pdb = "0.8.0"
+pdb-addr2line = "0.12.1"
+# UI
+egui = "0.35.0"
+egui_extras = { version = "0.35.0", features = ["default"] }
+eframe = { version = "0.35.0", features = ["default"] }
+# Dockable panel layout (drag/float/tab/split, layout persisted). 0.20.x is the
+# egui-0.35 line. `serde` feature = DockState round-trips into settings.json; it
+# only needs derive, so it does NOT perturb the deliberate serde =1.0.219 pin.
+egui_dock = { version = "0.20", features = ["serde"] }
+# Native file dialogs (replaces the hand-rolled path-input window). Default Linux
+# backend is GTK3 (present on this host); no async runtime needed for blocking picks.
+rfd = "0.15"
+# XDG data dir → ~/.local/share/nemclass/settings.json
+dirs = "6"
+# Background thread pool for the UI's discrete long-running ops (value/pointer
+# scan, dissect, project I/O, script-resolve): each runs on `spawn_blocking` so
+# the eframe frame never stalls. `rt-multi-thread` alone gives the runtime + the
+# blocking pool; result channels are `std::sync::mpsc` (UI polls with `try_recv`),
+# so no `sync`/`net`/`macros` feature is needed. tokio 1.x is ALREADY resolved in
+# Cargo.lock (transitive via the deno/rustyscript tree), so this reuses that exact
+# version and does NOT perturb the serde =1.0.219 pin (tokio's serde is optional
+# and off here).
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+# NOTE: egui_kittest (the obvious headless-UI test harness) is intentionally NOT
+# used: egui_kittest 0.35 hard-depends on `toml ^1.0`, which pulls `serde_core`
+# and forces serde >= 1.0.225 — this breaks the deliberate `serde = "=1.0.219"`
+# pin the scripting/v8 tree needs (see the serde note above). UI verification
+# instead uses pure-logic tests over `MockMemoryBackend` + an eframe offscreen
+# screenshot smoke; neither pulls toml 1.x.
+
+# Internal
+nemclass-core = { path = "crates/nemclass-core" }
+nemclass-scan = { path = "crates/nemclass-scan" }
+nemclass-model = { path = "crates/nemclass-model" }
+nemclass-script = { path = "crates/nemclass-script" }
+nemclass-ui = { path = "crates/nemclass-ui" }

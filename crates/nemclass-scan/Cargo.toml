@@ -1,0 +1,13 @@
+[package]
+name = "nemclass-scan"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nemclass-core.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+# Tests only: verify emitted pointer-scan address formulas parse with the real
+# model grammar. No cycle — nemclass-model does not depend on nemclass-scan.
+nemclass-model.workspace = true
