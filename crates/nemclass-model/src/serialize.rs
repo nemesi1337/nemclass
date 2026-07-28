@@ -40,6 +40,10 @@ pub struct ProjectFile {
 pub struct ProjectMeta {
     pub name: String,
     pub version: String,
+    /// Target pointer width in bytes. Absent means 8 — the width every project
+    /// written before the field existed assumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_size: Option<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

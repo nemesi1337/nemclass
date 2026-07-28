@@ -45,6 +45,54 @@ impl CppCodeGenerator {
         }
     }
 
+    fn uint_type_for_size(size: usize) -> &'static str {
+        match size {
+            1 => "uint8_t",
+            2 => "uint16_t",
+            8 => "uint64_t",
+            _ => "uint32_t",
+        }
+    }
+
+    /// The bare type name a field kind is written with, without the member name
+    /// or any array suffix. Used for array elements, where the count belongs to
+    /// the enclosing declarator.
+    fn base_type(kind: &FieldKind) -> String {
+        match kind {
+            FieldKind::Primitive(p) => Self::prim_type(*p).to_string(),
+            FieldKind::RawBytes(_) => "uint8_t".to_string(),
+            FieldKind::Pointer(Some(target)) => format!("{target}*"),
+            FieldKind::Pointer(None) => "void*".to_string(),
+            FieldKind::ClassInstance(t) | FieldKind::ClassInstanceArray { type_name: t, .. } => {
+                t.clone()
+            }
+            FieldKind::Array { .. } => "uint8_t".to_string(),
+            FieldKind::Utf8Text(_) => "char".to_string(),
+            FieldKind::Utf16Text(_) => "char16_t".to_string(),
+            FieldKind::Utf32Text(_) => "char32_t".to_string(),
+            FieldKind::Vector { width, .. } | FieldKind::Matrix { width, .. } => {
+                width.c_ty().to_string()
+            }
+            // Exact-width rather than `intptr_t`: the generating host's pointer
+            // width is not necessarily the target's, and a mismatch would break
+            // the `static_assert` this file emits for the enclosing class.
+            FieldKind::NativeInt { signed, size } => {
+                if *signed {
+                    Self::int_type_for_size(*size as u8).to_string()
+                } else {
+                    Self::uint_type_for_size(*size).to_string()
+                }
+            }
+            FieldKind::Enum { type_name: Some(t), .. } => t.clone(),
+            FieldKind::Enum { type_name: None, size } => {
+                Self::int_type_for_size(*size as u8).to_string()
+            }
+            FieldKind::BitField { size, .. } => Self::uint_type_for_size(*size).to_string(),
+            FieldKind::TypedArray { element, .. } => Self::base_type(element),
+            FieldKind::Union { .. } => "uint8_t".to_string(),
+            FieldKind::Custom { type_name, .. } => type_name.clone(),
+        }
+    }
 }
 
 impl CodeGenerator for CppCodeGenerator {
@@ -95,7 +143,7 @@ impl CodeGenerator for CppCodeGenerator {
             }
             out.push_str("\n{\npublic:\n");
 
-            let fields = resolve_fields(class, project, registry);
+            let fields = resolve_fields(class, project, registry, Language::Cpp);
 
             for f in &fields {
                 let comment_part = if f.comment.is_empty() {
@@ -159,6 +207,77 @@ impl CodeGenerator for CppCodeGenerator {
                             width.c_ty(), f.name, rows, cols, offset_comment
                         )
                     }
+                    FieldKind::Utf32Text(len) => {
+                        let char_count = len.div_ceil(4);
+                        format!("    char32_t {}[{}];{}\n", f.name, char_count, offset_comment)
+                    }
+                    FieldKind::NativeInt { .. } | FieldKind::Enum { .. } => {
+                        format!("    {} {};{}\n", Self::base_type(&f.kind), f.name, offset_comment)
+                    }
+                    FieldKind::BitField { size, bits } => {
+                        // Not a C++ `: n` bitfield. Adjacent `: n` members share
+                        // storage, and these nodes do not — each occupies its own
+                        // integer — so declaring two in a row would silently pack
+                        // them together and break the size assertion below.
+                        format!(
+                            "    {} {};{} ({} bits)\n",
+                            Self::uint_type_for_size(*size), f.name, offset_comment, bits
+                        )
+                    }
+                    FieldKind::ClassInstanceArray { type_name, count, .. } => {
+                        format!("    {type_name} {}[{}];{}\n", f.name, count, offset_comment)
+                    }
+                    FieldKind::TypedArray { element, count } => {
+                        format!(
+                            "    {} {}[{}];{}\n",
+                            Self::base_type(element), f.name, count, offset_comment
+                        )
+                    }
+                    FieldKind::Union { members } => {
+                        // An anonymous union member: C++ overlaps the members for
+                        // us, so the layout needs no arithmetic here.
+                        let mut u = format!("    union{offset_comment}\n    {{\n");
+                        for m in members {
+                            let mc = if m.comment.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" // {}", escape_comment(&m.comment))
+                            };
+                            if emitted_array_len(&m.kind) == Some(0) {
+                                u.push_str(&format!("        // {} — 0 bytes, omitted{mc}\n", m.name));
+                                continue;
+                            }
+                            match &m.kind {
+                                FieldKind::Union { .. } => {
+                                    // A nested union would need the whole member
+                                    // writer re-entered; say so rather than emit
+                                    // something that silently drops members.
+                                    u.push_str(&format!(
+                                        "        // {} — nested union not expanded{mc}\n",
+                                        m.name
+                                    ));
+                                }
+                                kind => match emitted_array_len(kind) {
+                                    Some(n) => u.push_str(&format!(
+                                        "        {} {}[{}];{mc}\n",
+                                        Self::base_type(kind), m.name, n
+                                    )),
+                                    None => u.push_str(&format!(
+                                        "        {} {};{mc}\n",
+                                        Self::base_type(kind), m.name
+                                    )),
+                                },
+                            }
+                        }
+                        u.push_str(&format!("    }} {};\n", f.name));
+                        u
+                    }
+                    FieldKind::Custom { type_name, array_len, .. } => match array_len {
+                        Some(n) => {
+                            format!("    {type_name} {}[{}];{}\n", f.name, n, offset_comment)
+                        }
+                        None => format!("    {type_name} {};{}\n", f.name, offset_comment),
+                    },
                 };
                 out.push_str(&line);
             }

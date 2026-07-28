@@ -62,6 +62,24 @@ impl Node for UnknownNode {
         self.def.comment = c;
     }
 
+    /// Read straight out of the preserved attributes.
+    ///
+    /// An unknown node has no fields of its own to store the flag in, and
+    /// shadowing it in a Rust field would mean the value on save came from
+    /// somewhere other than the value on load — which is exactly the drift this
+    /// type exists to prevent.
+    fn hidden(&self) -> bool {
+        self.def.attrs.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
+    fn set_hidden(&mut self, hidden: bool) {
+        if hidden {
+            self.def.attrs.insert("hidden".to_string(), toml::Value::Boolean(true));
+        } else {
+            self.def.attrs.remove("hidden");
+        }
+    }
+
     /// Zero: the byte width of an unknown type is, by definition, unknown.
     ///
     /// Fields after it therefore keep the offsets they had in the file rather

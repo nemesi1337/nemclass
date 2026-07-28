@@ -1,11 +1,44 @@
 use std::collections::HashMap;
 
+use crate::codegen::Language;
 use crate::error::{ModelError, Result};
 use crate::node::Node;
 use crate::serialize::NodeDef;
 
-pub type NodeConstructor = fn() -> Box<dyn Node>;
-pub type NodeDeserializer = fn(NodeDef, &NodeRegistry) -> Result<Box<dyn Node>>;
+/// Builds a fresh node of one registered type.
+///
+/// A boxed closure rather than a bare `fn` pointer: a plugin that wants to
+/// register, say, a `Vector<N>` family has to *capture* N, and a `fn` cannot
+/// close over anything. The old signature forced plugins into one free function
+/// per shape — which is exactly why the built-in vector and matrix tags below
+/// were twelve near-identical macro expansions.
+pub type NodeConstructor = Box<dyn Fn() -> Box<dyn Node> + Send + Sync>;
+
+/// Rebuilds a node of one registered type from its serialized form.
+pub type NodeDeserializer =
+    Box<dyn Fn(NodeDef, &NodeRegistry) -> Result<Box<dyn Node>> + Send + Sync>;
+
+/// How a node type spells itself as a field in generated source.
+///
+/// Returned by a [`CodegenHook`]. Without one, an unrecognised type generates as
+/// an anonymous byte blob of the right width — correct layout, useless names.
+#[derive(Debug, Clone)]
+pub struct CustomFieldType {
+    /// The type as written in the target language, e.g. `MyVec3` or `uint32_t`.
+    pub type_name: String,
+    /// When `Some(n)`, emit the field as an `n`-element array of `type_name`.
+    pub array_len: Option<usize>,
+}
+
+/// Per-language spelling for a registered node type.
+pub type CodegenHook =
+    Box<dyn Fn(&NodeDef, Language) -> Option<CustomFieldType> + Send + Sync>;
+
+struct NodeTypeInfo {
+    ctor: NodeConstructor,
+    de: NodeDeserializer,
+    codegen: Option<CodegenHook>,
+}
 
 /// Maximum node-tree nesting accepted when deserializing from (untrusted) TOML.
 /// Bounds the recursive `deserialize_node_inner` below so a crafted/corrupt
@@ -29,8 +62,36 @@ fn check_node_depth(def: &NodeDef) -> Result<()> {
     Ok(())
 }
 
+/// Apply the fields every node carries, however it was constructed.
+///
+/// Deserializers used to set `comment` by hand and nothing set `hidden` at all,
+/// so each new common field meant editing thirty call sites and missing some.
+pub fn apply_common(node: &mut dyn Node, def: &NodeDef) {
+    node.set_comment(def.comment.clone());
+    if def.attrs.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false) {
+        node.set_hidden(true);
+    }
+}
+
+/// Read an integer attribute, or `default` if it is missing or the wrong shape.
+pub fn attr_usize(def: &NodeDef, key: &str, default: usize) -> usize {
+    def.attrs
+        .get(key)
+        .and_then(|v| v.as_integer())
+        .and_then(|i| usize::try_from(i).ok())
+        .unwrap_or(default)
+}
+
+/// Read a string attribute, or `""` if it is missing or the wrong shape.
+pub fn attr_str<'a>(def: &'a NodeDef, key: &str) -> &'a str {
+    def.attrs.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
 pub struct NodeRegistry {
-    entries: HashMap<&'static str, (NodeConstructor, NodeDeserializer)>,
+    entries: HashMap<String, NodeTypeInfo>,
+    /// Registration order, so a type menu built from the registry is stable
+    /// rather than following `HashMap` iteration.
+    order: Vec<String>,
 }
 
 impl Default for NodeRegistry {
@@ -41,20 +102,76 @@ impl Default for NodeRegistry {
 
 impl NodeRegistry {
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self { entries: HashMap::new(), order: Vec::new() }
     }
 
+    /// Register a node type.
+    ///
+    /// `tag` is owned: a plugin that computes its tag at load time used to have
+    /// to `Box::leak` the string to satisfy `&'static str`, leaking once per
+    /// registered type for the life of the process.
     pub fn register(
         &mut self,
-        tag: &'static str,
-        ctor: NodeConstructor,
-        de: NodeDeserializer,
+        tag: impl Into<String>,
+        ctor: impl Fn() -> Box<dyn Node> + Send + Sync + 'static,
+        de: impl Fn(NodeDef, &NodeRegistry) -> Result<Box<dyn Node>> + Send + Sync + 'static,
     ) {
-        self.entries.insert(tag, (ctor, de));
+        let tag = tag.into();
+        if !self.entries.contains_key(&tag) {
+            self.order.push(tag.clone());
+        }
+        self.entries.insert(
+            tag,
+            NodeTypeInfo { ctor: Box::new(ctor), de: Box::new(de), codegen: None },
+        );
+    }
+
+    /// Teach the code generators how to spell an already-registered type.
+    ///
+    /// Returns `false` if `tag` is not registered — registering a spelling for a
+    /// type that cannot be constructed is a caller bug, not something to store.
+    pub fn register_codegen(
+        &mut self,
+        tag: &str,
+        hook: impl Fn(&NodeDef, Language) -> Option<CustomFieldType> + Send + Sync + 'static,
+    ) -> bool {
+        match self.entries.get_mut(tag) {
+            Some(info) => {
+                info.codegen = Some(Box::new(hook));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The generated-source spelling for `def`'s type in `language`, if the type
+    /// registered one.
+    pub fn codegen_field(&self, def: &NodeDef, language: Language) -> Option<CustomFieldType> {
+        self.entries
+            .get(def.type_tag.as_str())
+            .and_then(|info| info.codegen.as_ref())
+            .and_then(|hook| hook(def, language))
     }
 
     pub fn construct(&self, tag: &str) -> Option<Box<dyn Node>> {
-        self.entries.get(tag).map(|(ctor, _)| ctor())
+        self.entries.get(tag).map(|info| (info.ctor)())
+    }
+
+    /// The byte width a freshly constructed `tag` reports, if it is registered.
+    ///
+    /// Used by typed [`ArrayNode`](crate::node::builtins::ArrayNode)s, which
+    /// store their element width rather than looking it up on every size query.
+    pub fn element_size(&self, tag: &str) -> Option<usize> {
+        self.construct(tag).map(|n| n.memory_size())
+    }
+
+    pub fn is_registered(&self, tag: &str) -> bool {
+        self.entries.contains_key(tag)
+    }
+
+    /// Every registered tag, in registration order.
+    pub fn tags(&self) -> impl Iterator<Item = &str> {
+        self.order.iter().map(String::as_str)
     }
 
     /// Serialize a node to its intermediate NodeDef (delegates to `node.to_node_def()`).
@@ -81,9 +198,8 @@ impl NodeRegistry {
 
     /// Recursive core (depth already bounded by [`Self::deserialize_node`]).
     pub(crate) fn deserialize_node_inner(&self, def: NodeDef) -> Result<Box<dyn Node>> {
-        let tag = def.type_tag.clone();
-        match self.entries.get(tag.as_str()) {
-            Some((_, de)) => de(def, self),
+        match self.entries.get(def.type_tag.as_str()) {
+            Some(info) => (info.de)(def, self),
             // Deliberately not an error. This propagated out of
             // `Project::from_toml` with `?`, so one node written by a newer
             // build — or by a build with a plugin this one lacks — made the
@@ -94,7 +210,7 @@ impl NodeRegistry {
         }
     }
 
-    /// Register all M1 built-in node types.
+    /// Register all built-in node types.
     pub fn with_builtins(mut self) -> Self {
         register_builtins(&mut self);
         self
@@ -102,223 +218,234 @@ impl NodeRegistry {
 }
 
 fn register_builtins(reg: &mut NodeRegistry) {
-    use crate::node::builtins::*;
     use crate::class::ClassNode;
-    use toml::Value as TV;
+    use crate::node::bitfield::BitFieldNode;
+    use crate::node::builtins::*;
+    use crate::node::enum_node::EnumNode;
+    use crate::node::function::{FunctionNode, FunctionPtrNode};
+    use crate::node::union::UnionNode;
+    use crate::node::vector::{MATRIX_SHAPES, MatrixNode, VECTOR_SHAPES, VectorNode};
+    use crate::node::vtable::{VMethodNode, VTableNode};
     use uuid::Uuid;
 
+    /// Leaf types whose whole definition is name + comment + hidden.
     macro_rules! reg_simple {
         ($tag:literal, $ty:ty) => {{
-            fn ctor() -> Box<dyn Node> { Box::new(<$ty>::new("")) }
-            fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-                let mut n = <$ty>::new(def.name);
-                n.comment = def.comment;
-                Ok(Box::new(n))
-            }
-            reg.register($tag, ctor, de);
+            reg.register(
+                $tag,
+                || Box::new(<$ty>::new("")),
+                |def, _reg| {
+                    let mut n = <$ty>::new(def.name.clone());
+                    apply_common(&mut n, &def);
+                    Ok(Box::new(n))
+                },
+            );
         }};
     }
 
-    reg_simple!("Int8",   Int8Node);
-    reg_simple!("Int16",  Int16Node);
-    reg_simple!("Int32",  Int32Node);
-    reg_simple!("Int64",  Int64Node);
-    reg_simple!("UInt8",  UInt8Node);
+    reg_simple!("Int8", Int8Node);
+    reg_simple!("Int16", Int16Node);
+    reg_simple!("Int32", Int32Node);
+    reg_simple!("Int64", Int64Node);
+    reg_simple!("UInt8", UInt8Node);
     reg_simple!("UInt16", UInt16Node);
     reg_simple!("UInt32", UInt32Node);
     reg_simple!("UInt64", UInt64Node);
-    reg_simple!("Float",  Float32Node);
+    reg_simple!("NInt", NIntNode);
+    reg_simple!("NUInt", NUIntNode);
+    reg_simple!("Float", Float32Node);
     reg_simple!("Double", Float64Node);
-    reg_simple!("Bool",   BoolNode);
-    reg_simple!("Hex8",   Hex8Node);
-    reg_simple!("Hex16",  Hex16Node);
-    reg_simple!("Hex32",  Hex32Node);
-    reg_simple!("Hex64",  Hex64Node);
+    reg_simple!("Bool", BoolNode);
+    reg_simple!("Hex8", Hex8Node);
+    reg_simple!("Hex16", Hex16Node);
+    reg_simple!("Hex32", Hex32Node);
+    reg_simple!("Hex64", Hex64Node);
+    reg_simple!("FunctionPtr", FunctionPtrNode);
+    reg_simple!("VMethod", VMethodNode);
+    // `StrPtr` predates the ReClass-aligned names but appears in projects
+    // already on disk, so the tag stays.
+    reg_simple!("StrPtr", StrPtrNode);
+    reg_simple!("Utf8TextPtr", Utf8TextPtrNode);
+    reg_simple!("Utf16TextPtr", Utf16TextPtrNode);
+    reg_simple!("Utf32TextPtr", Utf32TextPtrNode);
 
     // PointerNode
-    {
-        fn ctor() -> Box<dyn Node> { Box::new(PointerNode::new("")) }
-        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            let mut n = PointerNode::new(def.name);
-            n.comment = def.comment;
-            if let Some(TV::String(s)) = def.attrs.get("target_class_uuid") {
-                n.target_class_uuid = s.parse::<Uuid>().ok();
-            }
+    reg.register(
+        "Pointer",
+        || Box::new(PointerNode::new("")),
+        |def, _reg| {
+            let mut n = PointerNode::new(def.name.clone());
+            apply_common(&mut n, &def);
+            n.target_class_uuid = attr_str(&def, "target_class_uuid").parse::<Uuid>().ok();
             Ok(Box::new(n))
-        }
-        reg.register("Pointer", ctor, de);
-    }
+        },
+    );
 
     // ClassInstanceNode
-    {
-        fn ctor() -> Box<dyn Node> { Box::new(ClassInstanceNode::new("", Uuid::nil())) }
-        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            let uuid_str = def.attrs.get("class_uuid")
-                .and_then(|v| if let TV::String(s) = v { Some(s.as_str()) } else { None })
-                .unwrap_or("");
-            let class_uuid = uuid_str.parse::<Uuid>().unwrap_or(Uuid::nil());
-            let mut n = ClassInstanceNode::new(def.name, class_uuid);
-            n.comment = def.comment;
+    reg.register(
+        "ClassInstance",
+        || Box::new(ClassInstanceNode::new("", Uuid::nil())),
+        |def, _reg| {
+            let class_uuid = attr_str(&def, "class_uuid").parse::<Uuid>().unwrap_or(Uuid::nil());
+            let mut n = ClassInstanceNode::new(def.name.clone(), class_uuid);
+            apply_common(&mut n, &def);
             Ok(Box::new(n))
-        }
-        reg.register("ClassInstance", ctor, de);
-    }
+        },
+    );
 
-    // ArrayNode
-    {
-        fn ctor() -> Box<dyn Node> { Box::new(ArrayNode::new("", 0, 1)) }
-        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            let count = def.attrs.get("count")
-                .and_then(|v| if let TV::Integer(i) = v { Some(*i as usize) } else { None })
-                .unwrap_or(0);
-            let element_size = def.attrs.get("element_size")
-                .and_then(|v| if let TV::Integer(i) = v { Some(*i as usize) } else { None })
-                .unwrap_or(1);
-            let mut n = ArrayNode::new(def.name, count, element_size);
-            n.comment = def.comment;
+    // ClassInstanceArrayNode
+    reg.register(
+        "ClassInstanceArray",
+        || Box::new(ClassInstanceArrayNode::new("", Uuid::nil(), 0)),
+        |def, _reg| {
+            let class_uuid = attr_str(&def, "class_uuid").parse::<Uuid>().unwrap_or(Uuid::nil());
+            let count = attr_usize(&def, "count", 0);
+            let mut n = ClassInstanceArrayNode::new(def.name.clone(), class_uuid, count);
+            apply_common(&mut n, &def);
             Ok(Box::new(n))
-        }
-        reg.register("Array", ctor, de);
-    }
+        },
+    );
 
-    // Utf8TextNode
-    {
-        fn ctor() -> Box<dyn Node> { Box::new(Utf8TextNode::new("", 64)) }
-        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            let length = def.attrs.get("length")
-                .and_then(|v| if let TV::Integer(i) = v { Some(*i as usize) } else { None })
-                .unwrap_or(64);
-            let mut n = Utf8TextNode::new(def.name, length);
-            n.comment = def.comment;
+    // ArrayNode — `element_type` is optional; without it the array is the
+    // historical untyped byte blob.
+    reg.register(
+        "Array",
+        || Box::new(ArrayNode::new("", 0, 1)),
+        |def, _reg| {
+            let count = attr_usize(&def, "count", 0);
+            let element_size = attr_usize(&def, "element_size", 1);
+            let mut n = ArrayNode::new(def.name.clone(), count, element_size);
+            let element_tag = attr_str(&def, "element_type");
+            if !element_tag.is_empty() {
+                n.set_element_type(element_tag, element_size);
+            }
+            apply_common(&mut n, &def);
             Ok(Box::new(n))
-        }
-        reg.register("Utf8Text", ctor, de);
-    }
+        },
+    );
 
-    // Utf16TextNode
-    {
-        fn ctor() -> Box<dyn Node> { Box::new(Utf16TextNode::new("", 64)) }
-        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            let length = def.attrs.get("length")
-                .and_then(|v| if let TV::Integer(i) = v { Some(*i as usize) } else { None })
-                .unwrap_or(64);
-            let mut n = Utf16TextNode::new(def.name, length);
-            n.comment = def.comment;
-            Ok(Box::new(n))
-        }
-        reg.register("Utf16Text", ctor, de);
-    }
-
-    // StrPtrNode — an 8-byte pointer to a NUL-terminated UTF-8 string.
-    reg_simple!("StrPtr", StrPtrNode);
-
-    // Vector / matrix nodes. The shape lives in the type tag (see
-    // `node::vector`), so each tag gets its own ctor/deserializer pair rather
-    // than reading `components`/`rows` out of `NodeDef::attrs`.
-    {
-        use crate::node::vector::{FloatWidth, MatrixNode, VectorNode};
-
-        macro_rules! reg_vector {
-            ($tag:literal, $comps:expr, $width:expr) => {{
-                fn ctor() -> Box<dyn Node> { Box::new(VectorNode::new("", $comps, $width)) }
-                fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-                    let mut n = VectorNode::new(def.name, $comps, $width);
-                    n.comment = def.comment;
+    // Fixed-length inline text.
+    macro_rules! reg_text {
+        ($tag:literal, $ty:ty) => {{
+            reg.register(
+                $tag,
+                || Box::new(<$ty>::new("", 64)),
+                |def, _reg| {
+                    let length = attr_usize(&def, "length", 64);
+                    let mut n = <$ty>::new(def.name.clone(), length);
+                    apply_common(&mut n, &def);
                     Ok(Box::new(n))
-                }
-                reg.register($tag, ctor, de);
-            }};
-        }
-
-        macro_rules! reg_matrix {
-            ($tag:literal, $rows:expr, $cols:expr, $width:expr) => {{
-                fn ctor() -> Box<dyn Node> { Box::new(MatrixNode::new("", $rows, $cols, $width)) }
-                fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-                    let mut n = MatrixNode::new(def.name, $rows, $cols, $width);
-                    n.comment = def.comment;
-                    Ok(Box::new(n))
-                }
-                reg.register($tag, ctor, de);
-            }};
-        }
-
-        reg_vector!("Vector2",  2, FloatWidth::F32);
-        reg_vector!("Vector3",  3, FloatWidth::F32);
-        reg_vector!("Vector4",  4, FloatWidth::F32);
-        reg_vector!("Vector2d", 2, FloatWidth::F64);
-        reg_vector!("Vector3d", 3, FloatWidth::F64);
-        reg_vector!("Vector4d", 4, FloatWidth::F64);
-
-        reg_matrix!("Matrix3x3",  3, 3, FloatWidth::F32);
-        reg_matrix!("Matrix3x4",  3, 4, FloatWidth::F32);
-        reg_matrix!("Matrix4x4",  4, 4, FloatWidth::F32);
-        reg_matrix!("Matrix3x3d", 3, 3, FloatWidth::F64);
-        reg_matrix!("Matrix3x4d", 3, 4, FloatWidth::F64);
-        reg_matrix!("Matrix4x4d", 4, 4, FloatWidth::F64);
+                },
+            );
+        }};
     }
 
-    // VTableNode (container) — recursive via registry; children are VMethodNodes
-    {
-        use crate::node::vtable::VTableNode;
-        fn ctor() -> Box<dyn Node> { Box::new(VTableNode::new("")) }
-        fn de(def: NodeDef, reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            let mut n = VTableNode::new(def.name);
-            n.comment = def.comment;
+    reg_text!("Utf8Text", Utf8TextNode);
+    reg_text!("Utf16Text", Utf16TextNode);
+    reg_text!("Utf32Text", Utf32TextNode);
+
+    // BitFieldNode
+    reg.register(
+        "BitField",
+        || Box::new(BitFieldNode::new("")),
+        |def, _reg| {
+            let mut n = BitFieldNode::new(def.name.clone());
+            n.set_bits(attr_usize(&def, "bits", crate::node::DEFAULT_POINTER_SIZE * 8));
+            apply_common(&mut n, &def);
+            Ok(Box::new(n))
+        },
+    );
+
+    // EnumNode — the value table is bound later by `Project::bind_enums`, which
+    // is the only place that can see the project's enum list.
+    reg.register(
+        "Enum",
+        || Box::new(EnumNode::new("")),
+        |def, _reg| {
+            let mut n = EnumNode::new(def.name.clone());
+            n.enum_name = attr_str(&def, "enum_name").to_string();
+            apply_common(&mut n, &def);
+            Ok(Box::new(n))
+        },
+    );
+
+    // UnionNode (container) — recursive via registry.
+    reg.register(
+        "Union",
+        || Box::new(UnionNode::new("")),
+        |def, reg| {
+            let mut n = UnionNode::new(def.name.clone());
+            apply_common(&mut n, &def);
             for child_def in def.nodes {
                 n.children.push(reg.deserialize_node_inner(child_def)?);
             }
             Ok(Box::new(n))
-        }
-        reg.register("VTable", ctor, de);
+        },
+    );
+
+    // Vector / matrix nodes. The shape lives in the type tag (see
+    // `node::vector`). Now that constructors are closures the shape is
+    // *captured* rather than macro-expanded, so these are two loops over the
+    // shape tables instead of twelve near-identical blocks.
+    for (tag, components, width) in VECTOR_SHAPES {
+        reg.register(
+            tag,
+            move || Box::new(VectorNode::new("", components, width)),
+            move |def, _reg| {
+                let mut n = VectorNode::new(def.name.clone(), components, width);
+                apply_common(&mut n, &def);
+                Ok(Box::new(n))
+            },
+        );
     }
 
-    // VMethodNode — leaf; name carries the resolved/user method name
-    {
-        use crate::node::vtable::VMethodNode;
-        fn ctor() -> Box<dyn Node> { Box::new(VMethodNode::new("")) }
-        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            let mut n = VMethodNode::new(def.name);
-            n.comment = def.comment;
-            Ok(Box::new(n))
-        }
-        reg.register("VMethod", ctor, de);
+    for (tag, rows, cols, width) in MATRIX_SHAPES {
+        reg.register(
+            tag,
+            move || Box::new(MatrixNode::new("", rows, cols, width)),
+            move |def, _reg| {
+                let mut n = MatrixNode::new(def.name.clone(), rows, cols, width);
+                apply_common(&mut n, &def);
+                Ok(Box::new(n))
+            },
+        );
     }
 
-    // FunctionNode — leaf with an editable `signature` attr
-    {
-        use crate::node::function::FunctionNode;
-        fn ctor() -> Box<dyn Node> { Box::new(FunctionNode::new("")) }
-        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            let mut n = FunctionNode::new(def.name);
-            n.comment = def.comment;
-            if let Some(TV::String(s)) = def.attrs.get("signature") {
-                n.signature = s.clone();
+    // VTableNode (container) — recursive via registry; children are VMethodNodes.
+    reg.register(
+        "VTable",
+        || Box::new(VTableNode::new("")),
+        |def, reg| {
+            let mut n = VTableNode::new(def.name.clone());
+            apply_common(&mut n, &def);
+            for child_def in def.nodes {
+                n.children.push(reg.deserialize_node_inner(child_def)?);
             }
             Ok(Box::new(n))
-        }
-        reg.register("Function", ctor, de);
-    }
+        },
+    );
 
-    // FunctionPtrNode — leaf; no extra attrs
-    {
-        use crate::node::function::FunctionPtrNode;
-        fn ctor() -> Box<dyn Node> { Box::new(FunctionPtrNode::new("")) }
-        fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            let mut n = FunctionPtrNode::new(def.name);
-            n.comment = def.comment;
+    // FunctionNode — leaf with an editable `signature` attr.
+    reg.register(
+        "Function",
+        || Box::new(FunctionNode::new("")),
+        |def, _reg| {
+            let mut n = FunctionNode::new(def.name.clone());
+            let signature = attr_str(&def, "signature");
+            if !signature.is_empty() {
+                n.signature = signature.to_string();
+            }
+            apply_common(&mut n, &def);
             Ok(Box::new(n))
-        }
-        reg.register("FunctionPtr", ctor, de);
-    }
+        },
+    );
 
-    // ClassNode (container) — recursive via registry
-    {
-        fn ctor() -> Box<dyn Node> { Box::new(ClassNode::new("")) }
-        fn de(def: NodeDef, reg: &NodeRegistry) -> Result<Box<dyn Node>> {
-            use uuid::Uuid;
-            let uuid_str = def.attrs.get("uuid")
-                .and_then(|v| if let TV::String(s) = v { Some(s.as_str()) } else { None })
-                .unwrap_or("");
+    // ClassNode (container) — recursive via registry.
+    reg.register(
+        "Class",
+        || Box::new(ClassNode::new("")),
+        |def, reg| {
+            let uuid_str = attr_str(&def, "uuid");
             // Empty = a genuinely new class (mint a fresh id). A PRESENT but
             // malformed uuid is an error, not a silently-minted random identity
             // (which would break cross-class references).
@@ -329,18 +456,14 @@ fn register_builtins(reg: &mut NodeRegistry) {
                     ModelError::DeserializeError(format!("bad class node uuid '{uuid_str}': {e}"))
                 })?
             };
-            let address_formula = def.attrs.get("address_formula")
-                .and_then(|v| if let TV::String(s) = v { Some(s.clone()) } else { None })
-                .unwrap_or_default();
-            let mut class = ClassNode::with_uuid(uuid, def.name);
-            class.comment = def.comment;
-            class.address_formula = address_formula;
+            let mut class = ClassNode::with_uuid(uuid, def.name.clone());
+            class.address_formula = attr_str(&def, "address_formula").to_string();
+            apply_common(&mut class, &def);
             for child_def in def.nodes {
                 // Depth already bounded by the public entry point.
                 class.children.push(reg.deserialize_node_inner(child_def)?);
             }
             Ok(Box::new(class))
-        }
-        reg.register("Class", ctor, de);
-    }
+        },
+    );
 }

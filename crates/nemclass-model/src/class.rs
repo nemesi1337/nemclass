@@ -8,6 +8,7 @@ pub struct ClassNode {
     pub name: String,
     pub comment: String,
     pub address_formula: String,
+    pub hidden: bool,
     pub children: Vec<Box<dyn Node>>,
 }
 
@@ -18,6 +19,7 @@ impl ClassNode {
             name: name.into(),
             comment: String::new(),
             address_formula: String::new(),
+            hidden: false,
             children: Vec::new(),
         }
     }
@@ -28,6 +30,7 @@ impl ClassNode {
             name: name.into(),
             comment: String::new(),
             address_formula: String::new(),
+            hidden: false,
             children: Vec::new(),
         }
     }
@@ -83,10 +86,7 @@ pub(crate) fn children_reference_class(children: &[Box<dyn Node>], target: &Uuid
 impl Node for ClassNode {
     fn type_tag(&self) -> &'static str { "Class" }
 
-    fn name(&self) -> &str { &self.name }
-    fn set_name(&mut self, n: String) { self.name = n; }
-    fn comment(&self) -> &str { &self.comment }
-    fn set_comment(&mut self, c: String) { self.comment = c; }
+    crate::node_common_accessors!();
 
     fn memory_size(&self) -> usize {
         // Saturating: child sizes come from (untrusted) project files, so a bogus
@@ -109,18 +109,13 @@ impl Node for ClassNode {
     }
 
     fn to_node_def(&self) -> NodeDef {
-        let mut attrs = std::collections::BTreeMap::new();
+        let mut attrs = crate::node::builtins::Attrs::new();
         attrs.insert("uuid".to_string(), toml::Value::String(self.uuid.to_string()));
         attrs.insert(
             "address_formula".to_string(),
             toml::Value::String(self.address_formula.clone()),
         );
-        NodeDef {
-            type_tag: "Class".to_string(),
-            name: self.name.clone(),
-            comment: self.comment.clone(),
-            attrs,
-            nodes: Vec::new(), // children serialized separately by the registry
-        }
+        // Children are serialized separately by the registry.
+        crate::node::builtins::node_def("Class", &self.name, &self.comment, self.hidden, attrs)
     }
 }

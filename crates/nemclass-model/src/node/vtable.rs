@@ -7,33 +7,22 @@
 //! buffer.
 //!
 //! Memory layout rationale:
-//! - `VTableNode` occupies **8 bytes** in its parent class — it is a single
-//!   pointer slot (the vptr) stored inline.  The `VMethodNode` children
-//!   describe the *pointed-to* table; they do not add to the parent's size.
-//! - `VMethodNode` reports **8 bytes** (one pointer-sized slot in the vtable
-//!   array), matching `BaseFunctionPtrNode.MemorySize = IntPtr.Size` in the
-//!   C# source.
+//! - `VTableNode` occupies **one pointer** in its parent class — the vptr,
+//!   stored inline.  The `VMethodNode` children describe the *pointed-to*
+//!   table; they do not add to the parent's size.
+//! - `VMethodNode` reports one pointer-sized slot in the vtable array, matching
+//!   `BaseFunctionPtrNode.MemorySize = IntPtr.Size` in the C# source.
+//!
+//! Both widths follow the project's target pointer size, so a 32-bit target's
+//! vtable is four bytes per slot rather than the eight this used to hardcode.
 
-use bytemuck::pod_read_unaligned;
-
+use crate::node::builtins::{Attrs, node_def, read_ptr_sized};
+use crate::node::{DEFAULT_POINTER_SIZE, Node, RenderedValue};
+use crate::node_common_accessors;
 use crate::serialize::NodeDef;
-use crate::node::{Node, RenderedValue};
 
-// ---------------------------------------------------------------------------
-// Internal helpers (mirror builtins.rs)
-// ---------------------------------------------------------------------------
-
-fn read_ptr(buf: &[u8], offset: usize) -> Option<u64> {
-    let end = offset.checked_add(8)?;
-    if end <= buf.len() {
-        Some(pod_read_unaligned::<u64>(&buf[offset..end]))
-    } else {
-        None
-    }
-}
-
-fn fallback_rv(type_tag: &'static str) -> RenderedValue {
-    RenderedValue { value: "<?>".to_string(), type_tag, memory_size: 8 }
+fn fallback_rv(type_tag: &'static str, size: usize) -> RenderedValue {
+    RenderedValue { value: "<?>".to_string(), type_tag, memory_size: size }
 }
 
 // ---------------------------------------------------------------------------
@@ -44,61 +33,62 @@ fn fallback_rv(type_tag: &'static str) -> RenderedValue {
 ///
 /// This is a **container** node: its `children` are the `VMethodNode`s that
 /// describe each slot of the pointed-to vtable.  Like a `PointerNode`, it
-/// occupies exactly 8 bytes in its parent class — the vptr — while the child
-/// slots are in the memory *beyond* that pointer.
+/// occupies exactly one pointer in its parent class — the vptr — while the
+/// child slots are in the memory *beyond* that pointer.
 pub struct VTableNode {
     pub name: String,
     pub comment: String,
+    pub hidden: bool,
     /// The vtable-slot nodes (children must all be `VMethodNode`s in practice,
     /// but the trait uses `Box<dyn Node>` for uniformity).
     pub children: Vec<Box<dyn Node>>,
+    pointer_size: usize,
 }
 
 impl VTableNode {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), comment: String::new(), children: Vec::new() }
+        Self {
+            name: name.into(),
+            comment: String::new(),
+            hidden: false,
+            children: Vec::new(),
+            pointer_size: DEFAULT_POINTER_SIZE,
+        }
     }
 }
 
 impl Node for VTableNode {
     fn type_tag(&self) -> &'static str { "VTable" }
-    fn name(&self) -> &str { &self.name }
-    fn set_name(&mut self, n: String) { self.name = n; }
-    fn comment(&self) -> &str { &self.comment }
-    fn set_comment(&mut self, c: String) { self.comment = c; }
+    node_common_accessors!();
 
-    /// The node itself is an 8-byte pointer slot in its parent class.
-    fn memory_size(&self) -> usize { 8 }
+    /// The node itself is one pointer slot in its parent class.
+    fn memory_size(&self) -> usize { self.pointer_size }
 
     fn children(&self) -> &[Box<dyn Node>] { &self.children }
     fn children_mut(&mut self) -> Option<&mut Vec<Box<dyn Node>>> { Some(&mut self.children) }
 
-    /// Read the 8-byte vptr at `base_offset` and format it as `-> 0x…` (or
+    fn set_pointer_size(&mut self, size: usize) { self.pointer_size = size; }
+
+    /// Read the vptr at `base_offset` and format it as `-> 0x…` (or
     /// `-> null`).  No live process interaction — the caller provides the
     /// buffer.
     fn render(&self, buf: &[u8], base_offset: usize) -> RenderedValue {
-        let Some(v) = read_ptr(buf, base_offset) else {
-            return fallback_rv("VTable");
+        let Some(v) = read_ptr_sized(buf, base_offset, self.pointer_size) else {
+            return fallback_rv("VTable", self.pointer_size);
         };
         let value = if v == 0 {
             "-> null".to_string()
         } else {
             format!("-> 0x{v:016X}")
         };
-        RenderedValue { value, type_tag: "VTable", memory_size: 8 }
+        RenderedValue { value, type_tag: "VTable", memory_size: self.pointer_size }
     }
 
     /// Serialize to a `NodeDef`.  Children are serialized separately by
     /// `NodeRegistry::serialize_node_recursive` — `to_node_def` only fills
     /// the node's own fields and attrs; the registry appends `nodes`.
     fn to_node_def(&self) -> NodeDef {
-        NodeDef {
-            type_tag: "VTable".to_string(),
-            name: self.name.clone(),
-            comment: self.comment.clone(),
-            attrs: std::collections::BTreeMap::new(),
-            nodes: Vec::new(),
-        }
+        node_def("VTable", &self.name, &self.comment, self.hidden, Attrs::new())
     }
 }
 
@@ -116,49 +106,49 @@ impl Node for VTableNode {
 pub struct VMethodNode {
     pub name: String,
     pub comment: String,
+    pub hidden: bool,
+    pointer_size: usize,
 }
 
 impl VMethodNode {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), comment: String::new() }
+        Self {
+            name: name.into(),
+            comment: String::new(),
+            hidden: false,
+            pointer_size: DEFAULT_POINTER_SIZE,
+        }
     }
 }
 
 impl Node for VMethodNode {
     fn type_tag(&self) -> &'static str { "VMethod" }
-    fn name(&self) -> &str { &self.name }
-    fn set_name(&mut self, n: String) { self.name = n; }
-    fn comment(&self) -> &str { &self.comment }
-    fn set_comment(&mut self, c: String) { self.comment = c; }
+    node_common_accessors!();
 
-    /// Each vtable slot holds one 8-byte function pointer.
-    fn memory_size(&self) -> usize { 8 }
+    /// Each vtable slot holds one function pointer.
+    fn memory_size(&self) -> usize { self.pointer_size }
 
     fn children(&self) -> &[Box<dyn Node>] { &[] }
     fn children_mut(&mut self) -> Option<&mut Vec<Box<dyn Node>>> { None }
+
+    fn set_pointer_size(&mut self, size: usize) { self.pointer_size = size; }
 
     /// Read the function pointer at `base_offset` and render as
     /// `{name} -> 0x{addr:016X}`.  When the name is empty the raw address is
     /// shown alone (the UI / symbol layer fills the name in later).
     fn render(&self, buf: &[u8], base_offset: usize) -> RenderedValue {
-        let Some(v) = read_ptr(buf, base_offset) else {
-            return fallback_rv("VMethod");
+        let Some(v) = read_ptr_sized(buf, base_offset, self.pointer_size) else {
+            return fallback_rv("VMethod", self.pointer_size);
         };
         let value = if self.name.is_empty() {
             format!("0x{v:016X}")
         } else {
             format!("{} -> 0x{v:016X}", self.name)
         };
-        RenderedValue { value, type_tag: "VMethod", memory_size: 8 }
+        RenderedValue { value, type_tag: "VMethod", memory_size: self.pointer_size }
     }
 
     fn to_node_def(&self) -> NodeDef {
-        NodeDef {
-            type_tag: "VMethod".to_string(),
-            name: self.name.clone(),
-            comment: self.comment.clone(),
-            attrs: std::collections::BTreeMap::new(),
-            nodes: Vec::new(),
-        }
+        node_def("VMethod", &self.name, &self.comment, self.hidden, Attrs::new())
     }
 }

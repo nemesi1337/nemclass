@@ -3,7 +3,7 @@
 //! Output shape:
 //! ```rust
 //! // optional class comment
-//! #[repr(C)]
+//! #[repr(C, packed)]
 //! pub struct PlayerStruct {
 //!     pub health: i32,    // 0x0000 player HP
 //!     pub speed: f32,     // 0x0004
@@ -48,6 +48,101 @@ impl RustCodeGenerator {
             8 => "i64",
             _ => "i32",
         }
+    }
+
+    fn uint_type_for_size(size: usize) -> &'static str {
+        match size {
+            1 => "u8",
+            2 => "u16",
+            8 => "u64",
+            _ => "u32",
+        }
+    }
+
+    /// The full Rust type for a field, array suffix included.
+    fn field_type(kind: &FieldKind, union_name: &str) -> String {
+        match kind {
+            FieldKind::Primitive(p) => Self::prim_type(*p).to_string(),
+            FieldKind::RawBytes(n) => format!("[u8; {n}]"),
+            FieldKind::Pointer(Some(target)) => format!("*mut {target}"),
+            FieldKind::Pointer(None) => "usize".to_string(),
+            FieldKind::ClassInstance(t) => t.clone(),
+            FieldKind::Array { count } => format!("[u8; {count}]"),
+            FieldKind::Utf8Text(len) => format!("[u8; {len}]"),
+            // div_ceil so an odd byte length rounds up rather than silently
+            // dropping the trailing byte.
+            FieldKind::Utf16Text(len) => format!("[u16; {}]", len.div_ceil(2)),
+            FieldKind::Utf32Text(len) => format!("[u32; {}]", len.div_ceil(4)),
+            FieldKind::Vector { components, width } => {
+                format!("[{}; {}]", width.rust_ty(), components)
+            }
+            // Row-major: the outer array indexes rows.
+            FieldKind::Matrix { rows, cols, width } => {
+                format!("[[{}; {}]; {}]", width.rust_ty(), cols, rows)
+            }
+            // Exact-width rather than `isize`/`usize`: the generating host's
+            // pointer width is not necessarily the target's, and a mismatch
+            // would break the size assertion this file emits.
+            FieldKind::NativeInt { signed, size } => {
+                if *signed {
+                    Self::int_type_for_size(*size as u8).to_string()
+                } else {
+                    Self::uint_type_for_size(*size).to_string()
+                }
+            }
+            FieldKind::Enum { type_name: Some(t), .. } => t.clone(),
+            FieldKind::Enum { type_name: None, size } => {
+                Self::int_type_for_size(*size as u8).to_string()
+            }
+            FieldKind::BitField { size, .. } => Self::uint_type_for_size(*size).to_string(),
+            FieldKind::ClassInstanceArray { type_name, count, .. } => {
+                format!("[{type_name}; {count}]")
+            }
+            FieldKind::TypedArray { element, count } => {
+                format!("[{}; {}]", Self::field_type(element, union_name), count)
+            }
+            FieldKind::Union { .. } => union_name.to_string(),
+            FieldKind::Custom { type_name, array_len: Some(n), .. } => {
+                format!("[{type_name}; {n}]")
+            }
+            FieldKind::Custom { type_name, array_len: None, .. } => type_name.clone(),
+        }
+    }
+
+    /// A `#[repr(C, packed)] pub union` item for a `FieldKind::Union` field.
+    ///
+    /// Emitted as its own item because Rust, unlike C++ and C#, has no anonymous
+    /// unions. Members that are not trivially `Copy` — a generated struct — are
+    /// wrapped in `ManuallyDrop`, which is what Rust requires of a union field
+    /// whose type may implement `Drop`.
+    fn union_item(name: &str, members: &[super::FieldInfo]) -> String {
+        let mut out = String::from("#[repr(C, packed)]\npub union ");
+        out.push_str(name);
+        out.push_str(" {\n");
+        if members.is_empty() {
+            out.push_str("    _empty: [u8; 0],\n");
+        }
+        for m in members {
+            let nested = format!("{name}_{}", m.name);
+            let ty = Self::field_type(&m.kind, &nested);
+            let needs_manually_drop = matches!(
+                m.kind,
+                FieldKind::ClassInstance(_)
+                    | FieldKind::ClassInstanceArray { .. }
+                    | FieldKind::Union { .. }
+                    | FieldKind::Custom { .. }
+            );
+            let ty =
+                if needs_manually_drop { format!("std::mem::ManuallyDrop<{ty}>") } else { ty };
+            let comment = if m.comment.is_empty() {
+                String::new()
+            } else {
+                format!(" // {}", escape_comment(&m.comment))
+            };
+            out.push_str(&format!("    pub {}: {ty},{comment}\n", m.name));
+        }
+        out.push_str("}\n\n");
+        out
     }
 }
 
@@ -107,13 +202,27 @@ impl CodeGenerator for RustCodeGenerator {
             // the `pub struct X` line: appending `// …` there put the opening
             // brace inside the comment, so every class carrying a comment
             // generated a Rust file that does not parse.
+            let fields = resolve_fields(class, project, registry, Language::Rust);
+
+            // Rust has no anonymous unions, so each union field needs a named
+            // item ahead of the struct that refers to it.
+            for f in &fields {
+                if let FieldKind::Union { members } = &f.kind {
+                    out.push_str(&Self::union_item(&format!("{cname}_{}", f.name), members));
+                }
+            }
+
             if !class.comment.is_empty() {
                 out.push_str(&format!("// {}\n", escape_comment(&class.comment)));
             }
-            out.push_str("#[repr(C)]\n");
+            // `packed`, not bare `repr(C)`. These structs describe a layout
+            // that already exists in the target's memory at exactly the offsets
+            // shown — the same layout the C++ generator gets from `#pragma
+            // pack(1)`. Bare `repr(C)` inserts alignment padding, so any class
+            // whose fields are not already naturally aligned would fail the size
+            // assertion emitted just below it.
+            out.push_str("#[repr(C, packed)]\n");
             out.push_str(&format!("pub struct {cname} {{\n"));
-
-            let fields = resolve_fields(class, project, registry);
 
             for f in &fields {
                 let comment_part = if f.comment.is_empty() {
@@ -130,53 +239,8 @@ impl CodeGenerator for RustCodeGenerator {
                     continue;
                 }
 
-                let line = match &f.kind {
-                    FieldKind::Primitive(p) => {
-                        format!("    pub {}: {},{}\n", f.name, Self::prim_type(*p), comment_part)
-                    }
-                    FieldKind::RawBytes(n) => {
-                        format!("    pub {}: [u8; {}],{}\n", f.name, n, comment_part)
-                    }
-                    FieldKind::Pointer(Some(target)) => {
-                        format!("    pub {}: *mut {},{}\n", f.name, target, comment_part)
-                    }
-                    FieldKind::Pointer(None) => {
-                        format!("    pub {}: usize,{}\n", f.name, comment_part)
-                    }
-                    FieldKind::ClassInstance(tname) => {
-                        format!("    pub {}: {},{}\n", f.name, tname, comment_part)
-                    }
-                    FieldKind::Array { count } => {
-                        format!("    pub {}: [u8; {}],{}\n", f.name, count, comment_part)
-                    }
-                    FieldKind::Utf8Text(len) => {
-                        format!("    pub {}: [u8; {}],{}\n", f.name, len, comment_part)
-                    }
-                    FieldKind::Utf16Text(len) => {
-                        // Store as u16 array; len is byte count.
-                        // div_ceil so an odd byte length rounds up rather than
-                        // silently dropping the trailing byte.
-                        let char_count = len.div_ceil(2);
-                        format!(
-                            "    pub {}: [u16; {}],{}\n",
-                            f.name, char_count, comment_part
-                        )
-                    }
-                    FieldKind::Vector { components, width } => {
-                        format!(
-                            "    pub {}: [{}; {}],{}\n",
-                            f.name, width.rust_ty(), components, comment_part
-                        )
-                    }
-                    FieldKind::Matrix { rows, cols, width } => {
-                        // Row-major: the outer array indexes rows.
-                        format!(
-                            "    pub {}: [[{}; {}]; {}],{}\n",
-                            f.name, width.rust_ty(), cols, rows, comment_part
-                        )
-                    }
-                };
-                out.push_str(&line);
+                let ty = Self::field_type(&f.kind, &format!("{cname}_{}", f.name));
+                out.push_str(&format!("    pub {}: {ty},{}\n", f.name, comment_part));
             }
 
             out.push_str("}\n\n");

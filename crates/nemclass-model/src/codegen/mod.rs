@@ -85,7 +85,12 @@ pub(crate) fn emitted_array_len(kind: &FieldKind) -> Option<usize> {
         FieldKind::RawBytes(n) | FieldKind::Array { count: n } => Some(*n),
         FieldKind::Utf8Text(n) => Some(*n),
         FieldKind::Utf16Text(n) => Some(n.div_ceil(2)),
+        FieldKind::Utf32Text(n) => Some(n.div_ceil(4)),
         FieldKind::Vector { components, .. } => Some(*components),
+        FieldKind::TypedArray { count, .. } => Some(*count),
+        FieldKind::ClassInstanceArray { count, .. } => Some(*count),
+        FieldKind::Custom { array_len: Some(n), .. } => Some(*n),
+        FieldKind::Union { members } => Some(members.len()),
         _ => None,
     }
 }
@@ -180,32 +185,53 @@ pub fn resolved_node_size(
     visited: &mut HashSet<uuid::Uuid>,
 ) -> usize {
     let def = node.to_node_def();
-    if def.type_tag == "ClassInstance" {
-        let maybe_uuid = def
-            .attrs
-            .get("class_uuid")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<uuid::Uuid>().ok());
-
-        if let Some(uuid) = maybe_uuid {
-            if visited.contains(&uuid) {
-                // Cycle detected — stop recursing, contribute 0.
-                return 0;
-            }
-            if let Some(target_class) = project.get_class(&uuid) {
-                visited.insert(uuid);
-                let sz = resolved_class_size(target_class, project, visited);
-                visited.remove(&uuid);
-                return sz;
-            }
-            // UUID present but class not in project → unresolvable; contribute 0.
-            return 0;
+    match def.type_tag.as_str() {
+        "ClassInstance" => referenced_class_size(&def, project, visited),
+        "ClassInstanceArray" => {
+            let stride = referenced_class_size(&def, project, visited);
+            let count = def.attrs.get("count").and_then(|v| v.as_integer()).unwrap_or(0) as usize;
+            stride.saturating_mul(count)
         }
-        // Malformed ClassInstance (no class_uuid attr) → 0.
+        // A union is as wide as its widest member — and a member may itself be a
+        // `ClassInstance`, so the width has to be resolved here rather than left
+        // to `UnionNode::memory_size`, which has no project to resolve against.
+        "Union" => node
+            .children()
+            .iter()
+            .map(|c| resolved_node_size(c.as_ref(), project, visited))
+            .max()
+            .unwrap_or(0),
+        // All other node types: trust the model's own memory_size().
+        _ => node.memory_size(),
+    }
+}
+
+/// Byte width of the class a `class_uuid` attribute points at, or 0 when the
+/// reference is missing, malformed, unresolvable, or cyclic.
+fn referenced_class_size(
+    def: &crate::serialize::NodeDef,
+    project: &Project,
+    visited: &mut HashSet<uuid::Uuid>,
+) -> usize {
+    let Some(uuid) = def
+        .attrs
+        .get("class_uuid")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<uuid::Uuid>().ok())
+    else {
+        return 0;
+    };
+    if visited.contains(&uuid) {
+        // Cycle detected — stop recursing, contribute 0.
         return 0;
     }
-    // All other node types: trust the model's own memory_size().
-    node.memory_size()
+    let Some(target_class) = project.get_class(&uuid) else {
+        return 0;
+    };
+    visited.insert(uuid);
+    let sz = resolved_class_size(target_class, project, visited);
+    visited.remove(&uuid);
+    sz
 }
 
 /// A resolved field description produced by walking a `ClassNode`'s children.
@@ -233,12 +259,31 @@ pub(crate) enum FieldKind {
     Array { count: usize },
     /// `char[length]` (UTF-8).
     Utf8Text(usize),
-    /// `wchar_t[length]` (UTF-16, length in bytes → length/2 chars).
+    /// `char16_t[length/2]` (UTF-16, length in bytes).
     Utf16Text(usize),
+    /// `char32_t[length/4]` (UTF-32, length in bytes).
+    Utf32Text(usize),
     /// A `Vector2/3/4` — `components` contiguous floats of `width`.
     Vector { components: usize, width: FloatWidth },
     /// A row-major `Matrix3x3/3x4/4x4` of floats of `width`.
     Matrix { rows: usize, cols: usize, width: FloatWidth },
+    /// `intptr_t`/`uintptr_t` — an integer as wide as a target pointer.
+    NativeInt { signed: bool, size: usize },
+    /// A field displayed through a project enum. `type_name` is the generated
+    /// enum's identifier; `size` is its underlying width, so a generator that
+    /// cannot name the enum still emits something of the right width.
+    Enum { type_name: Option<String>, size: usize },
+    /// A run of bits inside an unsigned integer `size` bytes wide.
+    BitField { size: usize, bits: usize },
+    /// `count` inline copies of a named class, each `stride` bytes.
+    ClassInstanceArray { type_name: String, count: usize, stride: usize },
+    /// `count` elements, each spelled by `element`.
+    TypedArray { element: Box<FieldKind>, count: usize },
+    /// Overlapping members, every one of them at this field's own offset.
+    Union { members: Vec<FieldInfo> },
+    /// A node type that supplied its own spelling through
+    /// [`NodeRegistry::register_codegen`](crate::NodeRegistry::register_codegen).
+    Custom { type_name: String, array_len: Option<usize> },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -267,14 +312,28 @@ pub(crate) fn resolve_fields(
     class_node: &crate::class::ClassNode,
     project: &Project,
     registry: &NodeRegistry,
+    language: Language,
 ) -> Vec<FieldInfo> {
-    let mut fields = Vec::new();
-    let mut offset = 0usize;
     // Visited set shared across the entire walk of this class's children so
     // that a single call to resolve_fields does not double-count recursion guards.
     let mut visited: HashSet<uuid::Uuid> = HashSet::new();
+    resolve_child_list(&class_node.children, project, registry, language, &mut visited)
+}
 
-    for child in &class_node.children {
+/// Walk one list of sibling nodes, accumulating offsets. Shared by the class
+/// body and by `Union` members — the only difference is that a union's caller
+/// resets each member's offset to the union's own.
+fn resolve_child_list(
+    children: &[Box<dyn crate::node::Node>],
+    project: &Project,
+    registry: &NodeRegistry,
+    language: Language,
+    visited: &mut HashSet<uuid::Uuid>,
+) -> Vec<FieldInfo> {
+    let mut fields = Vec::new();
+    let mut offset = 0usize;
+
+    for child in children {
         let def = child.to_node_def();
         let name = sanitize_ident(child.name());
         let comment = child.comment().to_string();
@@ -282,7 +341,7 @@ pub(crate) fn resolve_fields(
         // Resolve the size this child contributes to the running offset.
         // For ClassInstance this MUST go through resolved_node_size so we get
         // the referenced class's real byte width, not the placeholder 0.
-        let contributed_size = resolved_node_size(child.as_ref(), project, &mut visited);
+        let contributed_size = resolved_node_size(child.as_ref(), project, visited);
 
         let kind = match def.type_tag.as_str() {
             "Int8"   => FieldKind::Primitive(PrimKind::Int8),
@@ -364,45 +423,102 @@ pub(crate) fn resolve_fields(
                 }
             }
 
-            "Array" => {
-                let count = def
+            "ClassInstanceArray" => {
+                let target = def
                     .attrs
-                    .get("count")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(0) as usize;
+                    .get("class_uuid")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                    .and_then(|uuid| project.get_class(&uuid));
+                let count = attr_count(&def);
+                match target {
+                    Some(c) => FieldKind::ClassInstanceArray {
+                        type_name: sanitize_ident(&c.name),
+                        count,
+                        // Divide rather than re-resolve: `contributed_size` is
+                        // already `count × stride` from `resolved_node_size`, and
+                        // deriving the stride from it keeps the two in step even
+                        // when the reference is cyclic and both collapse to 0.
+                        stride: contributed_size.checked_div(count).unwrap_or(0),
+                    },
+                    None => FieldKind::RawBytes(contributed_size),
+                }
+            }
+
+            "Array" => {
+                let count = attr_count(&def);
                 let element_size = def
                     .attrs
                     .get("element_size")
                     .and_then(|v| v.as_integer())
                     .unwrap_or(1) as usize;
-                // We don't know the element type from Array alone (it's untyped raw
-                // bytes in our model), so we emit as a u8/byte array of total size.
-                let total = count.saturating_mul(element_size);
-                FieldKind::Array { count: total }
+                let element_tag = def.attrs.get("element_type").and_then(|v| v.as_str());
+                match element_tag.and_then(|tag| scalar_field_kind(tag, element_size)) {
+                    Some(element) => {
+                        FieldKind::TypedArray { element: Box::new(element), count }
+                    }
+                    // Untyped (or an element type with no scalar spelling): emit
+                    // a byte array of the total size, which keeps the layout
+                    // right even though the element type is lost.
+                    None => FieldKind::Array { count: count.saturating_mul(element_size) },
+                }
             }
 
-            "Utf8Text" => {
-                let length = def
+            "Utf8Text" => FieldKind::Utf8Text(attr_length(&def)),
+            // Lengths are in bytes; the generators divide by the code-unit width.
+            "Utf16Text" => FieldKind::Utf16Text(attr_length(&def)),
+            "Utf32Text" => FieldKind::Utf32Text(attr_length(&def)),
+
+            // A pointer to string data: emit as an untyped pointer so the field
+            // width and semantics stay correct.
+            "StrPtr" | "Utf8TextPtr" | "Utf16TextPtr" | "Utf32TextPtr" => {
+                FieldKind::Pointer(None)
+            }
+
+            "NInt" => FieldKind::NativeInt { signed: true, size: contributed_size },
+            "NUInt" => FieldKind::NativeInt { signed: false, size: contributed_size },
+
+            "BitField" => {
+                let bits = def
                     .attrs
-                    .get("length")
+                    .get("bits")
                     .and_then(|v| v.as_integer())
-                    .unwrap_or(0) as usize;
-                FieldKind::Utf8Text(length)
+                    .unwrap_or((contributed_size * 8) as i64) as usize;
+                FieldKind::BitField { size: contributed_size, bits }
             }
 
-            "Utf16Text" => {
-                let length = def
-                    .attrs
-                    .get("length")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(0) as usize;
-                // length is in bytes; each UTF-16 code unit is 2 bytes.
-                FieldKind::Utf16Text(length)
+            "Enum" => {
+                let enum_name = def.attrs.get("enum_name").and_then(|v| v.as_str()).unwrap_or("");
+                // Only name the enum if the project actually declares it — the
+                // generators emit definitions from `project.enums`, so naming one
+                // that is not there would produce source referencing a type that
+                // was never written.
+                let type_name = project
+                    .enums
+                    .iter()
+                    .find(|e| e.name == enum_name)
+                    .map(|e| sanitize_ident(&e.name));
+                FieldKind::Enum { type_name, size: contributed_size }
             }
 
-            // Pointer to a UTF-8 string: an 8-byte `char*` — emit as an untyped
-            // pointer so the field width and semantics stay correct.
-            "StrPtr" => FieldKind::Pointer(None),
+            "Union" => FieldKind::Union {
+                members: resolve_child_list(
+                    child.children(),
+                    project,
+                    registry,
+                    language,
+                    visited,
+                )
+                .into_iter()
+                // Every member of a union starts where the union starts. The
+                // shared walker accumulated offsets as though they were struct
+                // fields, so flatten them back to zero.
+                .map(|mut f| {
+                    f.offset = 0;
+                    f
+                })
+                .collect(),
+            },
 
             // Vector / matrix: the shape is encoded in the tag itself.
             tag if vector_shape(tag).is_some() => {
@@ -414,12 +530,15 @@ pub(crate) fn resolve_fields(
                 FieldKind::Matrix { rows: rows as usize, cols: cols as usize, width }
             }
 
-            // Unknown / Class container nodes embedded as children: emit a
-            // raw-bytes fallback so the total size still advances correctly.
-            _ => {
-                let _ = registry; // registry available if needed in the future
-                FieldKind::RawBytes(contributed_size)
-            }
+            // A plugin type that registered its own spelling, else a raw-bytes
+            // fallback so the total size still advances correctly.
+            _ => match registry.codegen_field(&def, language) {
+                Some(custom) => FieldKind::Custom {
+                    type_name: custom.type_name,
+                    array_len: custom.array_len,
+                },
+                None => FieldKind::RawBytes(contributed_size),
+            },
         };
 
         fields.push(FieldInfo { name, offset, kind, comment });
@@ -427,4 +546,46 @@ pub(crate) fn resolve_fields(
     }
 
     fields
+}
+
+fn attr_count(def: &crate::serialize::NodeDef) -> usize {
+    def.attrs.get("count").and_then(|v| v.as_integer()).unwrap_or(0).max(0) as usize
+}
+
+fn attr_length(def: &crate::serialize::NodeDef) -> usize {
+    def.attrs.get("length").and_then(|v| v.as_integer()).unwrap_or(0).max(0) as usize
+}
+
+/// The field spelling for a scalar type tag, used for typed array elements.
+///
+/// Only types that can stand alone as an array element are listed: a
+/// `ClassInstance` element needs a project lookup, and a container element has
+/// no single spelling, so both fall back to the caller's byte-array form.
+fn scalar_field_kind(tag: &str, element_size: usize) -> Option<FieldKind> {
+    Some(match tag {
+        "Int8" => FieldKind::Primitive(PrimKind::Int8),
+        "Int16" => FieldKind::Primitive(PrimKind::Int16),
+        "Int32" => FieldKind::Primitive(PrimKind::Int32),
+        "Int64" => FieldKind::Primitive(PrimKind::Int64),
+        "UInt8" => FieldKind::Primitive(PrimKind::UInt8),
+        "UInt16" => FieldKind::Primitive(PrimKind::UInt16),
+        "UInt32" => FieldKind::Primitive(PrimKind::UInt32),
+        "UInt64" => FieldKind::Primitive(PrimKind::UInt64),
+        "Float" => FieldKind::Primitive(PrimKind::Float),
+        "Double" => FieldKind::Primitive(PrimKind::Double),
+        "Bool" => FieldKind::Primitive(PrimKind::Bool),
+        "Hex8" => FieldKind::RawBytes(1),
+        "Hex16" => FieldKind::RawBytes(2),
+        "Hex32" => FieldKind::RawBytes(4),
+        "Hex64" => FieldKind::RawBytes(8),
+        "NInt" => FieldKind::NativeInt { signed: true, size: element_size },
+        "NUInt" => FieldKind::NativeInt { signed: false, size: element_size },
+        "Pointer" | "StrPtr" | "Utf8TextPtr" | "Utf16TextPtr" | "Utf32TextPtr"
+        | "FunctionPtr" => FieldKind::Pointer(None),
+        tag if vector_shape(tag).is_some() => {
+            let (components, width) = vector_shape(tag).unwrap();
+            FieldKind::Vector { components: components as usize, width }
+        }
+        _ => return None,
+    })
 }

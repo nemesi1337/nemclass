@@ -58,6 +58,195 @@ impl CSharpCodeGenerator {
             FloatWidth::F64 => "double",
         }
     }
+
+    fn uint_type_for_size(size: usize) -> &'static str {
+        match size {
+            1 => "byte",
+            2 => "ushort",
+            8 => "ulong",
+            _ => "uint",
+        }
+    }
+
+    /// Emit one field at an explicit offset.
+    ///
+    /// Factored out because a union is not a separate construct in
+    /// `LayoutKind.Explicit` — it is simply several fields declared at the same
+    /// offset, so union members go through this same writer with the union's own
+    /// offset.
+    fn emit_field(out: &mut String, f: &super::FieldInfo, offset: usize, indent: &str) {
+        let comment_part = if f.comment.is_empty() {
+            String::new()
+        } else {
+            format!(" // {}", escape_comment(&f.comment))
+        };
+
+        // `fixed byte x[0]` is a hard C# error (CS0842), as is `SizeConst = 0`.
+        // The field contributes no bytes, so record it as a comment and keep the
+        // layout identical.
+        if emitted_array_len(&f.kind) == Some(0) {
+            out.push_str(&format!(
+                "{indent}// {} — 0 bytes at 0x{offset:X}, omitted{comment_part}\n",
+                f.name
+            ));
+            return;
+        }
+
+        // A union's members each get their own declaration at this offset;
+        // nothing is emitted for the union itself.
+        if let FieldKind::Union { members } = &f.kind {
+            out.push_str(&format!(
+                "{indent}// union {} at 0x{offset:X}{comment_part}\n",
+                f.name
+            ));
+            for m in members {
+                Self::emit_field(out, m, offset, indent);
+            }
+            return;
+        }
+
+        let mut decl = |body: String| {
+            out.push_str(&format!("{indent}[FieldOffset(0x{offset:X})]\n"));
+            out.push_str(&format!("{indent}{body}{comment_part}\n"));
+        };
+
+        match &f.kind {
+            FieldKind::Primitive(p) => {
+                decl(format!("public readonly {} {};", Self::prim_type(*p), f.name));
+            }
+            FieldKind::RawBytes(n) | FieldKind::Array { count: n } => {
+                decl(format!("public unsafe fixed byte {}[{}];", f.name, n));
+            }
+            // All pointers become IntPtr in C# (platform-width).
+            FieldKind::Pointer(_) => {
+                decl(format!("public readonly IntPtr {};", f.name));
+            }
+            FieldKind::ClassInstance(tname) => {
+                decl(format!("public {} {};", tname, f.name));
+            }
+            FieldKind::ClassInstanceArray { type_name, count, .. } => {
+                // `fixed` buffers only accept primitives, so an array of structs
+                // has to be spelled out one element per offset. Emitting a single
+                // `fixed` here would not compile.
+                out.push_str(&format!(
+                    "{indent}// {}[{}] — {} inline copies{comment_part}\n",
+                    f.name, count, count
+                ));
+                for i in 0..*count {
+                    let stride = match &f.kind {
+                        FieldKind::ClassInstanceArray { stride, .. } => *stride,
+                        _ => 0,
+                    };
+                    out.push_str(&format!(
+                        "{indent}[FieldOffset(0x{:X})]\n",
+                        offset + i * stride
+                    ));
+                    out.push_str(&format!(
+                        "{indent}public {} {}_{};\n",
+                        type_name, f.name, i
+                    ));
+                }
+            }
+            // A fixed byte array, not a marshalled `string`. `ByValTStr` declares
+            // a *reference* field, and a reference inside an explicit-layout
+            // struct throws `TypeLoadException` at runtime the moment it overlaps
+            // or is misaligned — the type would not even load.
+            FieldKind::Utf8Text(len) => {
+                decl(format!(
+                    "public unsafe fixed byte {}[{}]; // UTF-8",
+                    f.name, len
+                ));
+            }
+            FieldKind::Utf16Text(len) => {
+                // Keep the byte count even so a stray odd length cannot land
+                // half a code unit in the field.
+                let byte_count = len.div_ceil(2) * 2;
+                decl(format!(
+                    "public unsafe fixed byte {}[{}]; // UTF-16 LE",
+                    f.name, byte_count
+                ));
+            }
+            FieldKind::Utf32Text(len) => {
+                let byte_count = len.div_ceil(4) * 4;
+                decl(format!(
+                    "public unsafe fixed byte {}[{}]; // UTF-32 LE",
+                    f.name, byte_count
+                ));
+            }
+            FieldKind::Vector { components, width } => {
+                decl(format!(
+                    "public unsafe fixed {} {}[{}];",
+                    Self::float_type(*width),
+                    f.name,
+                    components
+                ));
+            }
+            FieldKind::Matrix { rows, cols, width } => {
+                // C# `fixed` buffers are one-dimensional, so a matrix is
+                // flattened row-major — index it as `m[row * cols + col]`.
+                decl(format!(
+                    "public unsafe fixed {} {}[{}]; // {}x{} row-major",
+                    Self::float_type(*width),
+                    f.name,
+                    rows * cols,
+                    rows,
+                    cols
+                ));
+            }
+            FieldKind::NativeInt { signed, size } => {
+                let ty = if *signed {
+                    Self::int_type_for_size(*size as u8)
+                } else {
+                    Self::uint_type_for_size(*size)
+                };
+                decl(format!("public readonly {ty} {};", f.name));
+            }
+            FieldKind::Enum { type_name: Some(t), .. } => {
+                decl(format!("public readonly {t} {};", f.name));
+            }
+            FieldKind::Enum { type_name: None, size } => {
+                decl(format!(
+                    "public readonly {} {};",
+                    Self::int_type_for_size(*size as u8),
+                    f.name
+                ));
+            }
+            FieldKind::BitField { size, bits } => {
+                decl(format!(
+                    "public readonly {} {}; // {bits} bits",
+                    Self::uint_type_for_size(*size),
+                    f.name
+                ));
+            }
+            FieldKind::TypedArray { element, count } => match element.as_ref() {
+                FieldKind::Primitive(p) => decl(format!(
+                    "public unsafe fixed {} {}[{}];",
+                    Self::prim_type(*p),
+                    f.name,
+                    count
+                )),
+                // Anything else has no `fixed`-compatible element type; fall back
+                // to the byte span the elements occupy.
+                other => {
+                    let elem_bytes = emitted_array_len(other).unwrap_or(1).max(1);
+                    decl(format!(
+                        "public unsafe fixed byte {}[{}]; // {count} elements",
+                        f.name,
+                        count * elem_bytes
+                    ))
+                }
+            },
+            FieldKind::Custom { type_name, array_len, .. } => match array_len {
+                Some(n) => decl(format!(
+                    "public unsafe fixed {type_name} {}[{}];",
+                    f.name, n
+                )),
+                None => decl(format!("public {type_name} {};", f.name)),
+            },
+            // Handled above.
+            FieldKind::Union { .. } => unreachable!("unions are emitted before this match"),
+        }
+    }
 }
 
 impl CodeGenerator for CSharpCodeGenerator {
@@ -98,113 +287,10 @@ impl CodeGenerator for CSharpCodeGenerator {
             }
             out.push_str("\n{\n");
 
-            let fields = resolve_fields(class, project, registry);
+            let fields = resolve_fields(class, project, registry, Language::CSharp);
 
             for f in &fields {
-                let comment_part = if f.comment.is_empty() {
-                    String::new()
-                } else {
-                    format!(" // {}", escape_comment(&f.comment))
-                };
-
-                // `fixed byte x[0]` is a hard C# error (CS0842), as is
-                // `SizeConst = 0`. The field contributes no bytes, so record it
-                // as a comment and keep the layout identical.
-                if emitted_array_len(&f.kind) == Some(0) {
-                    out.push_str(&format!(
-                        "    // {} — 0 bytes at 0x{:X}, omitted{}\n",
-                        f.name, f.offset, comment_part
-                    ));
-                    continue;
-                }
-
-                match &f.kind {
-                    FieldKind::Primitive(p) => {
-                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
-                        out.push_str(&format!(
-                            "    public readonly {} {};{}\n",
-                            Self::prim_type(*p),
-                            f.name,
-                            comment_part
-                        ));
-                    }
-                    FieldKind::RawBytes(n) => {
-                        // C# unsafe fixed byte array
-                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
-                        out.push_str(&format!(
-                            "    public unsafe fixed byte {}[{}];{}\n",
-                            f.name, n, comment_part
-                        ));
-                    }
-                    FieldKind::Pointer(_) => {
-                        // All pointers become IntPtr in C# (platform-width)
-                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
-                        out.push_str(&format!(
-                            "    public readonly IntPtr {};{}\n",
-                            f.name, comment_part
-                        ));
-                    }
-                    FieldKind::ClassInstance(tname) => {
-                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
-                        out.push_str(&format!(
-                            "    public {} {};{}\n",
-                            tname, f.name, comment_part
-                        ));
-                    }
-                    FieldKind::Array { count } => {
-                        // Emit as unsafe fixed byte array (untyped raw bytes)
-                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
-                        out.push_str(&format!(
-                            "    public unsafe fixed byte {}[{}];{}\n",
-                            f.name, count, comment_part
-                        ));
-                    }
-                    FieldKind::Utf8Text(len) => {
-                        out.push_str(&format!(
-                            "    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = {len})]\n"
-                        ));
-                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
-                        out.push_str(&format!(
-                            "    public readonly string {};{}\n",
-                            f.name, comment_part
-                        ));
-                    }
-                    FieldKind::Utf16Text(len) => {
-                        // Emit as a raw byte array rather than a marshalled string.
-                        // Using ByValTStr under CharSet.Ansi would marshal 1 byte/char
-                        // (half the true width). A fixed byte array is unambiguous,
-                        // matches the C++/Rust treatment, and always compiles.
-                        // div_ceil so an odd byte length rounds up rather than
-                        // silently dropping the trailing byte.
-                        let byte_count = len.div_ceil(2) * 2; // keep even for UTF-16
-                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
-                        out.push_str(&format!(
-                            "    public unsafe fixed byte {}[{}];{} // UTF-16 LE\n",
-                            f.name, byte_count, comment_part
-                        ));
-                    }
-                    FieldKind::Vector { components, width } => {
-                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
-                        out.push_str(&format!(
-                            "    public unsafe fixed {} {}[{}];{}\n",
-                            Self::float_type(*width), f.name, components, comment_part
-                        ));
-                    }
-                    FieldKind::Matrix { rows, cols, width } => {
-                        // C# `fixed` buffers are one-dimensional, so a matrix is
-                        // flattened row-major — index it as `m[row * cols + col]`.
-                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
-                        out.push_str(&format!(
-                            "    public unsafe fixed {} {}[{}];{} // {}x{} row-major\n",
-                            Self::float_type(*width),
-                            f.name,
-                            rows * cols,
-                            comment_part,
-                            rows,
-                            cols
-                        ));
-                    }
-                }
+                Self::emit_field(&mut out, f, f.offset, "    ");
             }
 
             out.push_str("}\n\n");

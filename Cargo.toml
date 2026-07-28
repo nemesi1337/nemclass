@@ -30,6 +30,14 @@ bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 serde = { version = "=1.0.219", features = ["derive"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
+# ReClass.NET `.rcnet` interop (nemclass-model): the file is a ZIP holding one
+# `Data.xml`. quick-xml is used WITHOUT its serde feature and flate2 supplies
+# deflate; the single-entry zip container itself is hand-rolled in
+# `rcnet::zip` rather than pulling a general zip crate, whose serde/time tree
+# would fight the deliberate `serde = "=1.0.219"` pin above. Both versions are
+# already resolved in Cargo.lock transitively, so this adds no new resolution.
+quick-xml = { version = "0.41", default-features = false }
+flate2 = "1"
 thiserror = "2"
 env_logger = "0.11"
 serde_json = "=1.0.140"

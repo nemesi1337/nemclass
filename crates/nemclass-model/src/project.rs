@@ -6,13 +6,48 @@ use crate::class::{children_reference_class, ClassNode};
 use crate::enums::EnumDescription;
 use crate::error::{ModelError, Result};
 use crate::node::registry::NodeRegistry;
+use crate::node::{DEFAULT_POINTER_SIZE, Node};
 use crate::serialize::{ClassDef, EnumDef, EnumValueDef, ProjectFile, ProjectMeta};
+
+/// Push `size` into every pointer-shaped node in a subtree.
+///
+/// Containers do not forward the call themselves — the walk lives here so a new
+/// container type cannot forget to.
+fn apply_pointer_size(nodes: &mut Vec<Box<dyn Node>>, size: usize) {
+    for node in nodes.iter_mut() {
+        node.set_pointer_size(size);
+        if let Some(children) = node.children_mut() {
+            apply_pointer_size(children, size);
+        }
+    }
+}
+
+/// Re-point every `Enum` node in a subtree at its description, or unbind it.
+fn bind_enums_in(nodes: &mut Vec<Box<dyn Node>>, enums: &[EnumDescription]) {
+    for node in nodes.iter_mut() {
+        if let Some(name) = node.enum_binding() {
+            let desc = enums.iter().find(|e| e.name == name);
+            // Look-up borrowed `name` out of `node`; take the match by value
+            // first so the mutable call below is not aliasing it.
+            let desc = desc.cloned();
+            node.bind_enum(desc.as_ref());
+        }
+        if let Some(children) = node.children_mut() {
+            bind_enums_in(children, enums);
+        }
+    }
+}
 
 pub struct Project {
     pub name: String,
     classes: HashMap<Uuid, ClassNode>,
     class_order: Vec<Uuid>,
     pub enums: Vec<EnumDescription>,
+    /// Target pointer width in bytes — 4 for a 32-bit target, 8 for 64-bit.
+    ///
+    /// Private because changing it has to reach every pointer-shaped node in
+    /// the project; go through [`Project::set_pointer_size`].
+    pointer_size: usize,
 }
 
 /// The `project.nemclass` schema version this build writes and can read.
@@ -20,7 +55,12 @@ pub struct Project {
 /// Bump it whenever the on-disk shape changes in a way an older build would
 /// misread. [`Project::from_toml`] refuses a file whose version is higher, so a
 /// future format never loads quietly and wrongly in an old binary.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The version written for a project whose shape an older build still reads
+/// correctly. See [`Project::to_toml`] for when a file is stamped with the
+/// higher [`SCHEMA_VERSION`] instead.
+pub const SCHEMA_VERSION_BASE: u32 = 1;
 
 impl Project {
     pub fn new(name: impl Into<String>) -> Self {
@@ -29,7 +69,33 @@ impl Project {
             classes: HashMap::new(),
             class_order: Vec::new(),
             enums: Vec::new(),
+            pointer_size: DEFAULT_POINTER_SIZE,
         }
+    }
+
+    /// Target pointer width in bytes.
+    pub fn pointer_size(&self) -> usize {
+        self.pointer_size
+    }
+
+    /// Retarget the project to a 32- or 64-bit process.
+    ///
+    /// Every pointer-shaped node has to be told, because `Node::memory_size`
+    /// takes only `&self` — there is no project in scope when the class view
+    /// lays out fields, so the width has to have been pushed down beforehand.
+    /// Anything other than 4 or 8 is rejected: those are the only widths the
+    /// backends and the formula evaluator can address.
+    pub fn set_pointer_size(&mut self, size: usize) -> Result<()> {
+        if size != 4 && size != 8 {
+            return Err(ModelError::DeserializeError(format!(
+                "unsupported pointer size {size} (expected 4 or 8)"
+            )));
+        }
+        self.pointer_size = size;
+        for class in self.classes.values_mut() {
+            apply_pointer_size(&mut class.children, size);
+        }
+        Ok(())
     }
 
     pub fn add_class(&mut self, class: ClassNode) {
@@ -37,7 +103,25 @@ impl Project {
         if !self.classes.contains_key(&uuid) {
             self.class_order.push(uuid);
         }
+        let mut class = class;
+        apply_pointer_size(&mut class.children, self.pointer_size);
+        bind_enums_in(&mut class.children, &self.enums);
         self.classes.insert(uuid, class);
+    }
+
+    /// Re-bind every `Enum` node to the matching project enum.
+    ///
+    /// `EnumNode` caches the description's width and value table so it can
+    /// render without project access; that cache goes stale the moment an enum
+    /// is edited, renamed or removed, so the editor calls this after any change
+    /// to [`Project::enums`]. A node whose description has vanished is unbound
+    /// rather than left showing names that no longer exist.
+    pub fn bind_enums(&mut self) {
+        let enums = std::mem::take(&mut self.enums);
+        for class in self.classes.values_mut() {
+            bind_enums_in(&mut class.children, &enums);
+        }
+        self.enums = enums;
     }
 
     pub fn get_class(&self, uuid: &Uuid) -> Option<&ClassNode> {
@@ -107,10 +191,23 @@ impl Project {
             })
             .collect();
 
+        // A 64-bit project is still schema 1, and an older build opens it and
+        // reads it correctly. A 32-bit one is not: an old build ignores
+        // `pointer_size`, lays every pointer out as 8 bytes and silently shifts
+        // every field after the first one. That is precisely what the version
+        // gate exists to stop, so such a file declares the version that
+        // understands it.
+        let (version, pointer_size) = if self.pointer_size == DEFAULT_POINTER_SIZE {
+            (SCHEMA_VERSION_BASE, None)
+        } else {
+            (SCHEMA_VERSION, Some(self.pointer_size as u8))
+        };
+
         let file = ProjectFile {
             project: ProjectMeta {
                 name: self.name.clone(),
-                version: SCHEMA_VERSION.to_string(),
+                version: version.to_string(),
+                pointer_size,
             },
             enums,
             classes,
@@ -143,6 +240,13 @@ impl Project {
                 "project schema version {v} is newer than this build understands \
                  (max {SCHEMA_VERSION}); upgrade nemclass to open it"
             )));
+        }
+
+        // Set before any class is added: `add_class` pushes the width down into
+        // the class it is given, so a project loaded 32-bit must know that
+        // before the first class arrives, not after.
+        if let Some(size) = file.project.pointer_size {
+            project.set_pointer_size(size as usize)?;
         }
 
         for cdef in file.classes {

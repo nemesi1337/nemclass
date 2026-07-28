@@ -14,6 +14,7 @@ pub mod enums;
 pub mod error;
 pub mod node;
 pub mod project;
+pub mod rcnet;
 pub mod serialize;
 
 pub use address::{MemoryReader, ModuleResolver, parse as parse_address, resolve_formula};
@@ -25,13 +26,18 @@ pub use codegen::{
 };
 pub use enums::EnumDescription;
 pub use error::{ModelError, Result};
-pub use node::registry::NodeRegistry;
+pub use node::bitfield::BitFieldNode;
+pub use node::builtins::{TextEncoding, text_encoding};
+pub use node::enum_node::EnumNode;
+pub use node::registry::{CustomFieldType, NodeRegistry};
+pub use node::union::UnionNode;
 pub use node::vector::{
     FloatWidth, MATRIX_SHAPES, MatrixNode, VECTOR_SHAPES, VectorNode, matrix_shape, vector_shape,
 };
 pub use node::unknown::UnknownNode;
-pub use node::{Node, RenderedValue};
-pub use project::{Project, SCHEMA_VERSION};
+pub use node::{DEFAULT_POINTER_SIZE, Node, RenderedValue};
+pub use project::{Project, SCHEMA_VERSION, SCHEMA_VERSION_BASE};
+pub use rcnet::{ExportReport, ImportReport};
 
 #[cfg(test)]
 mod tests;

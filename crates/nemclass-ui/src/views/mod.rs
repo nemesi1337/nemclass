@@ -4528,15 +4528,16 @@ impl NemclassApp {
                 invalidate(self);
             }
             NodeEditOp::SetPtrTarget { owner, path, target } => {
+                let ptr_size = self.project.pointer_size();
                 if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
-                    let old_name    = vec[idx].name().to_owned();
-                    let old_comment = vec[idx].comment().to_owned();
-                    let new_node = Box::new(PointerNode {
-                        name:              old_name,
-                        comment:           old_comment,
-                        target_class_uuid: target,
-                    });
-                    vec[idx] = new_node;
+                    let mut node = PointerNode::new(vec[idx].name().to_owned());
+                    node.set_comment(vec[idx].comment().to_owned());
+                    node.set_hidden(vec[idx].hidden());
+                    node.target_class_uuid = target;
+                    // A node built outside `Project::add_class` never saw the
+                    // project's target width, so hand it over explicitly.
+                    node.set_pointer_size(ptr_size);
+                    vec[idx] = Box::new(node);
                 }
                 invalidate(self);
             }

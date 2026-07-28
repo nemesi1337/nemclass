@@ -10,3 +10,5 @@ toml.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true
+quick-xml.workspace = true
+flate2.workspace = true

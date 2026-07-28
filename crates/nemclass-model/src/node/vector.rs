@@ -166,6 +166,7 @@ fn matrix_tag(rows: u8, cols: u8, width: FloatWidth) -> &'static str {
 pub struct VectorNode {
     pub name: String,
     pub comment: String,
+    pub hidden: bool,
     components: u8,
     width: FloatWidth,
 }
@@ -176,6 +177,7 @@ impl VectorNode {
         Self {
             name: name.into(),
             comment: String::new(),
+            hidden: false,
             components: components.clamp(2, 4),
             width,
         }
@@ -201,18 +203,7 @@ impl Node for VectorNode {
     fn type_tag(&self) -> &'static str {
         vector_tag(self.components, self.width)
     }
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn set_name(&mut self, n: String) {
-        self.name = n;
-    }
-    fn comment(&self) -> &str {
-        &self.comment
-    }
-    fn set_comment(&mut self, c: String) {
-        self.comment = c;
-    }
+    crate::node_common_accessors!();
     fn memory_size(&self) -> usize {
         self.components as usize * self.width.size()
     }
@@ -239,13 +230,13 @@ impl Node for VectorNode {
     }
 
     fn to_node_def(&self) -> NodeDef {
-        NodeDef {
-            type_tag: self.type_tag().to_string(),
-            name: self.name.clone(),
-            comment: self.comment.clone(),
-            attrs: std::collections::BTreeMap::new(),
-            nodes: Vec::new(),
-        }
+        crate::node::builtins::node_def(
+            self.type_tag(),
+            &self.name,
+            &self.comment,
+            self.hidden,
+            crate::node::builtins::Attrs::new(),
+        )
     }
 }
 
@@ -260,6 +251,7 @@ impl Node for VectorNode {
 pub struct MatrixNode {
     pub name: String,
     pub comment: String,
+    pub hidden: bool,
     rows: u8,
     cols: u8,
     width: FloatWidth,
@@ -272,7 +264,7 @@ impl MatrixNode {
             (3, 3) | (3, 4) | (4, 4) => (rows, cols),
             _ => (4, 4),
         };
-        Self { name: name.into(), comment: String::new(), rows, cols, width }
+        Self { name: name.into(), comment: String::new(), hidden: false, rows, cols, width }
     }
 
     pub fn rows(&self) -> u8 {
@@ -303,18 +295,7 @@ impl Node for MatrixNode {
     fn type_tag(&self) -> &'static str {
         matrix_tag(self.rows, self.cols, self.width)
     }
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn set_name(&mut self, n: String) {
-        self.name = n;
-    }
-    fn comment(&self) -> &str {
-        &self.comment
-    }
-    fn set_comment(&mut self, c: String) {
-        self.comment = c;
-    }
+    crate::node_common_accessors!();
     fn memory_size(&self) -> usize {
         self.rows as usize * self.cols as usize * self.width.size()
     }
@@ -334,13 +315,13 @@ impl Node for MatrixNode {
     }
 
     fn to_node_def(&self) -> NodeDef {
-        NodeDef {
-            type_tag: self.type_tag().to_string(),
-            name: self.name.clone(),
-            comment: self.comment.clone(),
-            attrs: std::collections::BTreeMap::new(),
-            nodes: Vec::new(),
-        }
+        crate::node::builtins::node_def(
+            self.type_tag(),
+            &self.name,
+            &self.comment,
+            self.hidden,
+            crate::node::builtins::Attrs::new(),
+        )
     }
 }
 
