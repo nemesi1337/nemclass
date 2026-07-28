@@ -343,8 +343,11 @@ impl Node for Utf16TextNode {
         let Some(bytes) = read_bytes(buf, base_offset, self.length) else {
             return fallback("Utf16Text", self.length);
         };
-        let u16s: Vec<u16> = bytes.chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        let u16s: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let end = u16s.iter().position(|&c| c == 0).unwrap_or(u16s.len());
         let s = String::from_utf16_lossy(&u16s[..end]);

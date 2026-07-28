@@ -286,7 +286,31 @@ pub fn saved_window_size() -> Option<[f32; 2]> {
 /// Result of a background attach: the pid and display name captured at spawn
 /// time, plus the opened [`Process`] (or an error message). The UI-thread-only
 /// follow-ups (`on_attach`, `OnAttach` event) run when this is ingested.
-type AttachOutcome = (libc::pid_t, String, Result<Process, String>);
+type AttachOutcome = (u64, libc::pid_t, String, Result<Process, String>);
+
+/// How often the attached target is checked for having exited. A syscall per
+/// check, so well below the frame rate but fast enough that the user is not
+/// left interacting with a dead process.
+const LIVENESS_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Whether `pid` is gone.
+///
+/// `kill(pid, 0)` performs the existence/permission check without delivering a
+/// signal. Only `ESRCH` means "no such process" — `EPERM` means it exists but
+/// belongs to someone else, which is emphatically not an exit.
+#[cfg(unix)]
+fn target_has_exited(pid: libc::pid_t) -> bool {
+    // SAFETY: `kill` takes two scalars and delivers nothing for signal 0; it has
+    // no memory-safety preconditions and cannot affect this process's state.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn target_has_exited(_pid: libc::pid_t) -> bool {
+    // No portable check wired up yet; never claim the target died.
+    false
+}
 
 pub struct NemclassApp {
     // Backend / process
@@ -315,6 +339,15 @@ pub struct NemclassApp {
     enumerate_job: BackgroundJob<(String, Result<Vec<ProcessEntry>, String>)>,
     /// In-flight attach (the "Attach" button). Payload: `(pid, name, result)`.
     attach_job: BackgroundJob<AttachOutcome>,
+    /// Bumped by every attach *and* every detach. An in-flight attach whose
+    /// epoch no longer matches is discarded: without this, clicking Attach and
+    /// then Detach before the worker finished re-installed the process and
+    /// re-fired `OnAttach`, silently reattaching the user to a session they had
+    /// just closed. `enumerate_job` already guards its result this way.
+    attach_epoch: u64,
+    /// When the attached target's liveness was last checked. See
+    /// [`NemclassApp::check_target_alive`].
+    last_liveness_check: Option<Instant>,
     /// In-flight script class-address resolve (the "Try resolve (script)" button).
     /// Payload: `(class uuid, resolved address)`. The v8 round-trip blocks, so it
     /// runs on the pool. See [`Self::do_resolve_class_address`].
@@ -595,6 +628,8 @@ impl NemclassApp {
             runtime: Some(BgRuntime::new()),
             enumerate_job: BackgroundJob::default(),
             attach_job: BackgroundJob::default(),
+            attach_epoch: 0,
+            last_liveness_check: None,
             resolve_job: BackgroundJob::default(),
             project,
             node_registry,
@@ -822,17 +857,10 @@ impl NemclassApp {
         let pid = entry.id as libc::pid_t;
         let name = entry.name.clone();
 
-        // Detach first (UI thread; touches panel state the worker can't).
-        if self.process.is_some() {
-            self.emit(Event::OnDetach);
-            self.process = None;
-            self.attached_name = None;
-            self.clear_memory_state();
-            self.memory_viewer.on_detach();
-            self.disassembly_panel.on_detach();
-            self.modules_panel.on_detach();
-        }
-
+        // Resolve everything that can fail *before* tearing down the current
+        // session: this used to detach first, so a bad backend name or a missing
+        // runtime left the user detached from the process they were using with
+        // nothing but an error string.
         let Some(provider) = self.registry.get_arc(&self.selected_backend) else {
             self.last_error = Some(format!("Backend '{}' not found.", self.selected_backend));
             return;
@@ -840,21 +868,25 @@ impl NemclassApp {
         let Some(rt) = self.runtime.as_ref().map(|r| r.handle()) else {
             return;
         };
+
+        // Detach fully (UI thread; touches panel state the worker can't).
+        self.detach_all();
         self.last_error = None;
         self.status_msg = Some(format!(
             "Attaching to {}…",
             if name.is_empty() { format!("pid:{pid}") } else { name.clone() }
         ));
+        let epoch = self.attach_epoch;
         self.attach_job.spawn(&rt, ctx.clone(), move || {
             let result = provider.open(pid).map_err(|e| format!("Attach failed: {e}"));
-            (pid, name, result)
+            (epoch, pid, name, result)
         });
     }
 
     /// Applies a completed attach: wires the opened handle into the panels and
     /// fires `OnAttach`, or surfaces the error. Runs on the UI thread from `logic`.
     fn ingest_attach(&mut self, outcome: AttachOutcome) {
-        let (pid, name, result) = outcome;
+        let (_epoch, pid, name, result) = outcome;
         self.status_msg = None;
         match result {
             Ok(proc) => {
@@ -902,6 +934,10 @@ impl NemclassApp {
         let proc = provider
             .open(pid as libc::pid_t)
             .map_err(|e| format!("open({pid}): {e}"))?;
+
+        // Unbind any previous session first — this path had no teardown at all,
+        // so a second call left every other panel on the old process.
+        self.detach_all();
 
         self.memory_viewer.on_attach(&proc);
         self.disassembly_panel.on_attach(&proc);
@@ -960,7 +996,10 @@ impl NemclassApp {
             }
         }
         if let JobPoll::Done(outcome) = self.attach_job.poll() {
-            self.ingest_attach(outcome);
+            // Drop an attach the user has since cancelled by detaching.
+            if outcome.0 == self.attach_epoch {
+                self.ingest_attach(outcome);
+            }
         }
         if let JobPoll::Done((uuid, resolved)) = self.resolve_job.poll() {
             self.ingest_resolve(uuid, resolved);
@@ -968,25 +1007,85 @@ impl NemclassApp {
     }
 
     fn do_detach(&mut self) {
-        if self.process.is_some() {
-            self.emit(Event::OnDetach);
-            self.process = None;
-            self.attached_name = None;
-            self.clear_memory_state();
-            self.last_error = None;
-            self.scanner_panel.on_detach();
-            self.debugger_panel.on_detach();
-            self.memory_viewer.on_detach();
-            self.disassembly_panel.on_detach();
-            self.modules_panel.on_detach();
-            self.pointer_scan_panel.on_detach();
-            self.spider_panel.on_detach();
-            self.cheat_table_panel.on_detach();
-            // The script scan session is bound to the detached process; drop it.
-            #[cfg(all(feature = "scripting", target_os = "linux"))]
-            {
-                self.script_scanner = None;
-            }
+        self.detach_all();
+        self.last_error = None;
+    }
+
+    /// Detach automatically once the attached target exits.
+    ///
+    /// Nothing used to notice a dead target: the address bar kept showing a
+    /// green "Attached", the class view rendered a buffer of zeros that looked
+    /// like real data, the scanner reported `??`, and the cheat table kept
+    /// firing writes at a recycled pid. ReClass.NET polls and detaches; so do
+    /// we.
+    ///
+    /// Throttled to [`LIVENESS_INTERVAL`] — this runs from the frame loop, and
+    /// the check is a syscall.
+    fn check_target_alive(&mut self) {
+        let Some(proc) = self.process.as_ref() else {
+            self.last_liveness_check = None;
+            return;
+        };
+        let due = self
+            .last_liveness_check
+            .is_none_or(|t| t.elapsed() >= LIVENESS_INTERVAL);
+        if !due {
+            return;
+        }
+        self.last_liveness_check = Some(Instant::now());
+
+        let pid = proc.pid();
+        if !target_has_exited(pid) {
+            return;
+        }
+        let name = self
+            .attached_name
+            .clone()
+            .unwrap_or_else(|| format!("pid:{pid}"));
+        self.detach_all();
+        self.status_msg = None;
+        self.last_error = Some(format!("{name} exited — detached."));
+    }
+
+    /// Unbind **every** panel from the current process.
+    ///
+    /// This must be the only place that tears a session down. `do_attach`
+    /// previously inlined its own shorter version that cleared the memory
+    /// viewer, disassembler and modules panel but not the scanner, debugger,
+    /// pointer scan, spider, cheat table or script scan session. Attaching to a
+    /// second process without pressing Detach first therefore left those five
+    /// panels bound to the *old* process: `Next Scan` silently scanned the dead
+    /// pid, the debugger header reported the new pid while debugging the old
+    /// one, and — worst — the cheat table kept re-writing values captured
+    /// against process A into process B's address space every freeze tick.
+    ///
+    /// Anything that unbinds the process belongs here, not at a call site.
+    fn detach_all(&mut self) {
+        // Bumped unconditionally, *before* the "nothing attached" early return:
+        // the case that matters most is detaching while an attach is still in
+        // flight, and at that moment `self.process` is still `None`. Guarding
+        // the bump behind it would let the in-flight attach land and silently
+        // reattach.
+        self.attach_epoch = self.attach_epoch.wrapping_add(1);
+        if self.process.is_none() {
+            return;
+        }
+        self.emit(Event::OnDetach);
+        self.process = None;
+        self.attached_name = None;
+        self.clear_memory_state();
+        self.scanner_panel.on_detach();
+        self.debugger_panel.on_detach();
+        self.memory_viewer.on_detach();
+        self.disassembly_panel.on_detach();
+        self.modules_panel.on_detach();
+        self.pointer_scan_panel.on_detach();
+        self.spider_panel.on_detach();
+        self.cheat_table_panel.on_detach();
+        // The script scan session is bound to the detached process; drop it.
+        #[cfg(all(feature = "scripting", target_os = "linux"))]
+        {
+            self.script_scanner = None;
         }
     }
 
@@ -1213,10 +1312,7 @@ impl NemclassApp {
             let total_size = self
                 .project
                 .get_class(&uuid)
-                .map(|c| {
-                    let mut visited = std::collections::HashSet::new();
-                    nemclass_model::resolved_class_size(c, &self.project, &mut visited)
-                })
+                .map(|c| nemclass_model::class_size(c, &self.project))
                 .unwrap_or(0);
             self.class_base = None;
             self.mem_buf = vec![0u8; total_size];
@@ -1261,10 +1357,7 @@ impl NemclassApp {
         self.class_base = base;
 
         let total_size = self.project.get_class(&uuid)
-            .map(|c| {
-                let mut visited = std::collections::HashSet::new();
-                nemclass_model::resolved_class_size(c, &self.project, &mut visited)
-            })
+            .map(|c| nemclass_model::class_size(c, &self.project))
             .unwrap_or(0);
 
         let buf = if let (Some(addr), true) = (base, total_size > 0) {
@@ -1354,10 +1447,7 @@ impl NemclassApp {
                 let target_size = self
                     .project
                     .get_class(&t_uuid)
-                    .map(|tc| {
-                        let mut vis = HashSet::new();
-                        nemclass_model::resolved_class_size(tc, &self.project, &mut vis)
-                    })
+                    .map(|tc| nemclass_model::class_size(tc, &self.project))
                     .unwrap_or(0);
 
                 let dbuf = if target_size > 0 {
@@ -1705,6 +1795,7 @@ impl eframe::App for NemclassApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain any background operations that finished since the last frame.
         self.poll_background_jobs();
+        self.check_target_alive();
 
         let needs_snapshot = self.selected_class.is_some()
             && self
@@ -1742,10 +1833,10 @@ impl eframe::App for NemclassApp {
                     .unwrap_or(true);
                 if watch_due {
                     self.last_script_watch = Some(Instant::now());
-                    if let Some(dir) = self.project_dir.as_ref().map(|d| d.join("src")) {
-                        if scan_script_mtimes(&dir) != self.script_mtimes {
-                            self.reload_scripts_dir(&dir, "Auto-reloaded (file changed):");
-                        }
+                    if let Some(dir) = self.project_dir.as_ref().map(|d| d.join("src"))
+                        && scan_script_mtimes(&dir) != self.script_mtimes
+                    {
+                        self.reload_scripts_dir(&dir, "Auto-reloaded (file changed):");
                     }
                 }
             }
@@ -3892,7 +3983,7 @@ impl NemclassApp {
         }
 
         // Apply any deferred structural node edits (ChangeType, Delete, …).
-        let ops: Vec<NodeEditOp> = self.pending_node_edits.drain(..).collect();
+        let ops: Vec<NodeEditOp> = std::mem::take(&mut self.pending_node_edits);
         for op in ops {
             self.apply_node_edit(op);
         }
@@ -4475,8 +4566,12 @@ fn flatten_nodes(
             if let Some(t_uuid) = ci_target {
                 if let Some(tc) = project.get_class(&t_uuid) {
                     if !visited.contains(&t_uuid) {
+                        // Was `&mut HashSet::new()`, discarding the guard built
+                        // one line above — so a cyclic embed recursed on a fresh
+                        // set and this call site disagreed with every other.
                         visited.insert(t_uuid);
-                        let sz = nemclass_model::resolved_class_size(tc, project, &mut HashSet::new());
+                        let sz =
+                            nemclass_model::resolved_class_size(tc, project, visited);
                         visited.remove(&t_uuid);
                         sz
                     } else { 0 }
@@ -5141,6 +5236,35 @@ mod tests {
         assert_eq!(after.name, "after");
         assert_eq!(after.offset, 8, "field after instance must sit at resolved_class_size(B) = 8");
         assert_eq!(after.owner_class, a_uuid);
+    }
+
+    // -----------------------------------------------------------------------
+    // Target liveness
+    // -----------------------------------------------------------------------
+
+    /// The UI never noticed a dead target: it kept showing "Attached", rendered
+    /// a zeroed buffer that looked like real data, and kept firing freeze writes
+    /// at a pid that may since have been recycled.
+    #[test]
+    #[cfg(unix)]
+    fn a_live_process_is_not_reported_as_exited() {
+        let me = std::process::id() as libc::pid_t;
+        assert!(!super::target_has_exited(me), "this process is plainly alive");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_reaped_child_is_reported_as_exited() {
+        // Spawn, wait for it (so it is reaped, not a zombie), then check.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id() as libc::pid_t;
+        child.wait().expect("wait");
+        assert!(
+            super::target_has_exited(pid),
+            "a reaped pid must read as exited"
+        );
     }
 
     // -----------------------------------------------------------------------
