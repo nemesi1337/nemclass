@@ -27,6 +27,7 @@ written in Rust. It combines two capabilities:
 | [scripting-and-plugins.md](scripting-and-plugins.md) | The event bus, host APIs, compile-time plugins, and the (experimental) JS engine. |
 | [code-generation.md](code-generation.md) | Exporting classes to C++ / C# / Rust. |
 | [building-and-testing.md](building-and-testing.md) | Cargo features, the test/clippy gates, and cross-compilation status. |
+| [roadmap.md](roadmap.md) | Where nemclass stands against ReClass.NET / Cheat Engine / PINCE, and the milestones that close the gap. |
 
 ## Crate map
 

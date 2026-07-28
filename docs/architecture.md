@@ -71,7 +71,10 @@ Two optional Cargo features keep the base build lean:
   name. Enabled transitively by `nemclass-ui`. Off by default the crate compiles
   zero of these dependencies.
 - **`scripting`** (on `nemclass-script`) — the rustyscript/v8 JS engine. Heavy
-  to build and **currently does not compile** because of an upstream
-  deno/`swc_config`-vs-`serde` version conflict; it is deferred/experimental.
+  to build (prebuilt v8 download + a long compile), and **on by default for
+  `nemclass-app`**. It builds only because `serde` is pinned below 1.0.220 —
+  the deno/swc tree still references the `serde::__private` facade that
+  1.0.220 removed. See the pin comments in the workspace `Cargo.toml` before
+  bumping `serde`, `toml` or `deno_media_type`.
 
 See [building-and-testing.md](building-and-testing.md) for the full matrix.

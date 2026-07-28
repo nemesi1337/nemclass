@@ -55,7 +55,7 @@ cargo build -p nemclass-core --features symbols # DWARF/PDB symbol resolution
 | Feature | Crate | Effect | Status |
 |---------|-------|--------|--------|
 | `symbols` | `nemclass-core` | DWARF (`addr2line`/`object`, unix) + PDB (`pdb-addr2line`, windows) address→name resolution. | Working; opt-in; enabled by `nemclass-ui`. |
-| `scripting` | `nemclass-script` | rustyscript/v8 JS engine on a worker thread. | **Currently unbuildable** (upstream deno `swc_config`-vs-`serde` conflict); deferred. Do not use `--all-features`. |
+| `scripting` | `nemclass-script` | rustyscript/v8 JS engine on a worker thread. | Working, and **enabled by default for `nemclass-app`**. Builds only with `serde` pinned below 1.0.220 (see the workspace `Cargo.toml`). Heavy: prefer `--features scripting` over `--all-features`. |
 
 ## Tests
 
