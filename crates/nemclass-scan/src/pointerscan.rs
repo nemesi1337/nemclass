@@ -57,7 +57,7 @@ impl Default for PointerScanConfig {
             alignment: 4,
             pointer_size: 8,
             static_ranges: Vec::new(),
-            max_results: 5000,
+            max_results: 10000,
             max_map_entries: 8_000_000,
         }
     }
