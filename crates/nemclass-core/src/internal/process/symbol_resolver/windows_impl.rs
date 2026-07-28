@@ -32,13 +32,35 @@ use crate::Error;
 
 use super::{load_bias, probe_address};
 
-/// Owns the PDB context (self-referential over leaked PDB bytes) and the load
-/// bias (== `module_base`, since PDBs are RVA-addressed).
+/// How far past a function with no recorded end an RVA may still be attributed
+/// to it. Mirrors the unix resolver's bound on zero-sized symbols.
+const MAX_UNSIZED_SLACK: u32 = 0x1000;
+
+/// One function from the PDB, owned. Sorted ascending by `start_rva`.
+struct OwnedFunction {
+    start_rva: u32,
+    /// `None` when the PDB does not record an end.
+    end_rva: Option<u32>,
+    name: String,
+}
+
+/// Owns a function table extracted from the module's PDB, and the load bias
+/// (== `module_base`, since PDBs are RVA-addressed).
+///
+/// The table is materialised at open time rather than keeping a live
+/// `pdb_addr2line::Context`. That `Context` borrows from `ContextPdbData`, which
+/// borrows the PDB bytes, and the previous implementation satisfied the borrow
+/// chain by `Box::leak`ing the parsed PDB — one full leaked PDB per module per
+/// attach, never freed. `Function::name` is already an owned `String`, so
+/// copying the table out costs one pass and lets everything else drop.
+///
+/// Tradeoff: `find_frames` could report the *inlined* frame at an address,
+/// whereas the table reports the containing function. Name-an-address is the
+/// only thing this resolver is used for, so the containing function is the right
+/// answer in the common case; recovering inline attribution would need a
+/// self-referential owner (`ouroboros`/`yoke`) and is deferred.
 pub(super) struct WindowsResolver {
-    // `pdb_addr2line::Context` borrows from `ContextPdbData`, which borrows the
-    // PDB bytes. We leak both into `'static` so the borrow chain is satisfied for
-    // the resolver's lifetime; resolvers are few and long-lived per module.
-    context: pdb_addr2line::Context<'static, 'static>,
+    functions: Vec<OwnedFunction>,
     load_bias: usize,
 }
 
@@ -58,24 +80,35 @@ impl WindowsResolver {
         let pdb = pdb_addr2line::pdb::PDB::open(file)
             .map_err(|e| Error::SymbolInfo(format!("pdb: parse {}: {e}", pdb_path.display())))?;
 
-        // Leak the parsed PDB owner so the borrowed `Context` can be `'static`.
         // `ContextPdbData<'p, 's, S>`: `'p` is the (owned) borrow lifetime, `'s`
-        // the source lifetime, `S` the `pdb::Source` (here `std::fs::File`).
+        // the source lifetime, `S` the `pdb::Source` (here `std::fs::File`). Both
+        // it and the `Context` borrowed from it are dropped at the end of this
+        // function — every name we need is copied out first.
         let pdb_data = pdb_addr2line::ContextPdbData::try_from_pdb(pdb)
             .map_err(|e| Error::SymbolInfo(format!("pdb-addr2line: {e}")))?;
-        let pdb_data: &'static pdb_addr2line::ContextPdbData<'static, 'static, std::fs::File> =
-            Box::leak(Box::new(pdb_data));
 
         let context = pdb_data
             .make_context()
             .map_err(|e| Error::SymbolInfo(format!("pdb-addr2line: make_context: {e}")))?;
+
+        let mut functions: Vec<OwnedFunction> = context
+            .functions()
+            .filter_map(|f| {
+                f.name.map(|name| OwnedFunction {
+                    start_rva: f.start_rva,
+                    end_rva: f.end_rva,
+                    name,
+                })
+            })
+            .collect();
+        functions.sort_unstable_by_key(|f| f.start_rva);
 
         // PDBs address code by RVA (image-base-relative), so min vaddr is 0 and
         // the bias is the module base: probe == addr_abs - module_base == rva.
         let bias = load_bias(module_base, 0);
 
         Ok(WindowsResolver {
-            context,
+            functions,
             load_bias: bias,
         })
     }
@@ -86,9 +119,15 @@ impl WindowsResolver {
         // pdb-addr2line takes a u32 RVA; a >4GiB RVA cannot exist in a PE image.
         let rva = u32::try_from(rva).ok()?;
 
-        let frames = self.context.find_frames(rva).ok()??;
-        // The first frame is the innermost (possibly inlined) function.
-        frames.frames.into_iter().find_map(|f| f.function)
+        // The last function starting at or before the probe, bounded by its
+        // recorded end so an RVA past the final function is reported unknown
+        // rather than confidently mis-named.
+        let idx = self.functions.partition_point(|f| f.start_rva <= rva);
+        let candidate = self.functions.get(idx.checked_sub(1)?)?;
+        let end = candidate
+            .end_rva
+            .unwrap_or_else(|| candidate.start_rva.saturating_add(MAX_UNSIZED_SLACK));
+        (rva < end).then(|| candidate.name.clone())
     }
 }
 

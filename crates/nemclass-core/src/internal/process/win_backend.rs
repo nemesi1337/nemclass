@@ -87,9 +87,70 @@ unsafe impl Sync for SendHandle {}
 /// background `spawn_blocking` worker (the trait now requires `Send + Sync`).
 pub struct WindowsBackend {
     handle: SendHandle,
+    /// Serialises the protect/write/restore window in [`Self::write_buf`]. See
+    /// the comment there: without it, concurrent writers can leave a page
+    /// permanently `PAGE_EXECUTE_READWRITE`.
+    protect_lock: std::sync::Mutex<()>,
 }
 
 impl WindowsBackend {
+    /// One `WriteProcessMemory` call, with no protection games. Returns the
+    /// number of bytes written, or the raw Win32 error when nothing was written.
+    fn raw_write(&self, address: usize, buf: &[u8]) -> crate::Result<usize> {
+        let mut written: usize = 0;
+        // SAFETY: `buf` is a live, readable slice of `buf.len()` bytes matching
+        // `nsize`; `written` is a valid out-pointer. `lpbaseaddress` is only
+        // dereferenced by the kernel in the target; an unmapped range fails (FALSE)
+        // rather than faulting us. `self.handle` is a live handle.
+        let ok = unsafe {
+            WriteProcessMemory(
+                self.handle.0,
+                address as *const c_void,
+                buf.as_ptr() as *const c_void,
+                buf.len(),
+                &mut written,
+            )
+        };
+        if ok == FALSE && written == 0 {
+            return Error::last_win32();
+        }
+        Ok(written)
+    }
+
+    /// Recovers the readable prefix of `[address, address + buf.len())` one page
+    /// at a time after `ReadProcessMemory` refused the whole range with
+    /// `ERROR_PARTIAL_COPY` and reported nothing read.
+    ///
+    /// Returns how many leading bytes were successfully read into `buf`; `0`
+    /// means the very first page is inaccessible.
+    fn read_prefix_pagewise(&self, address: usize, buf: &mut [u8]) -> usize {
+        const PAGE: usize = 4096;
+        let mut done = 0usize;
+        while done < buf.len() {
+            // Step to the next page boundary so each request sits inside one
+            // mapping; the first chunk may be shorter than a page.
+            let next_boundary = (address.saturating_add(done) | (PAGE - 1)) + 1;
+            let chunk = (next_boundary - (address + done)).min(buf.len() - done);
+            let mut read: usize = 0;
+            // SAFETY: identical preconditions to `read_buf`'s call — a live
+            // sub-slice of `buf`, a valid out-pointer, and a target-side address
+            // the kernel validates without dereferencing our memory.
+            let ok = unsafe {
+                ReadProcessMemory(
+                    self.handle.0,
+                    (address + done) as *const c_void,
+                    buf[done..].as_mut_ptr() as *mut c_void,
+                    chunk,
+                    &mut read,
+                )
+            };
+            if ok == FALSE || read == 0 {
+                break;
+            }
+            done += read;
+        }
+        done
+    }
     /// Opens the process `pid` with full read/write access and wraps its handle.
     ///
     /// Fails with [`Error::WinApi`] carrying `GetLastError` when `OpenProcess`
@@ -103,7 +164,10 @@ impl WindowsBackend {
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return Error::last_win32();
         }
-        Ok(WindowsBackend { handle: SendHandle(handle) })
+        Ok(WindowsBackend {
+            handle: SendHandle(handle),
+            protect_lock: std::sync::Mutex::new(()),
+        })
     }
 
     /// The raw process handle, for callers that need further Win32 calls.
@@ -149,16 +213,22 @@ impl MemoryBackend for WindowsBackend {
         // range merely *crosses* a mapping boundary it fails with
         // `ERROR_PARTIAL_COPY`, and — unlike the Linux `process_vm_readv` backend —
         // often reports `read == 0` even though the leading pages were readable.
-        // Normalise that to [`Error::PartialTransfer`] so a boundary-spanning bulk
-        // read behaves like the Linux peer (the typed layer then decides), and
-        // surface any other failure as the raw Win32 error.
+        //
+        // Returning `Err` here broke the contract this trait documents ("returns
+        // the number of bytes read") and that the Linux backend implements. Every
+        // bulk caller (`Scanner::scan_region_first`, `disassemble_range`,
+        // `dissect_regions`, the spider's window read) propagates that `Err`, so
+        // on Windows the *first* range crossing a mapping boundary — the normal
+        // case at the tail of any region — aborted the whole operation instead of
+        // trimming. Recover the readable prefix a page at a time and report it as
+        // a short read, exactly like `process_vm_readv`.
         // SAFETY: `GetLastError` is a thread-local read with no preconditions.
         let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         if last == ERROR_PARTIAL_COPY {
-            return Err(Error::PartialTransfer {
-                requested: buf.len(),
-                actual: read,
-            });
+            if read > 0 {
+                return Ok(read);
+            }
+            return Ok(self.read_prefix_pagewise(address, buf));
         }
         Error::last_win32()
     }
@@ -177,31 +247,37 @@ impl MemoryBackend for WindowsBackend {
             return Ok(0);
         }
 
-        // Port of ReClass.NET's `WriteRemoteMemory.cpp`: temporarily make the
-        // target range `PAGE_EXECUTE_READWRITE` so writes to read-only / code /
-        // copy-on-write pages (patching `.text`, editing RO data) land instead of
-        // failing with `ERROR_NOACCESS`. The original protection is restored by
-        // `_restore` on every exit path (including the early `?` below).
-        let _restore = ProtectionGuard::apply(self.handle.0, address, buf.len(), PAGE_EXECUTE_READWRITE);
-
-        let mut written: usize = 0;
-        // SAFETY: `buf` is a live, readable slice of `buf.len()` bytes matching
-        // `nsize`; `written` is a valid out-pointer. `lpbaseaddress` is only
-        // dereferenced by the kernel in the target; an unmapped range fails (FALSE)
-        // rather than faulting us. `self.handle` is a live handle.
-        let ok = unsafe {
-            WriteProcessMemory(
-                self.handle.0,
-                address as *const c_void,
-                buf.as_ptr() as *const c_void,
-                buf.len(),
-                &mut written,
-            )
-        };
-        if ok == FALSE && written == 0 {
-            return Error::last_win32();
+        // The overwhelmingly common case — a writable data page — needs no
+        // protection change at all, so try the plain write first.
+        match self.raw_write(address, buf) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                // Port of ReClass.NET's `WriteRemoteMemory.cpp`: temporarily make
+                // the range `PAGE_EXECUTE_READWRITE` so writes to read-only /
+                // code / copy-on-write pages (patching `.text`, editing RO data)
+                // land instead of failing with `ERROR_NOACCESS`.
+                //
+                // Deliberately only on the failure path. Doing it unconditionally
+                // cost three syscalls per write — including once per entry per
+                // freeze tick — and, because `MemoryBackend` is `Sync` and this
+                // takes `&self`, two concurrent writes to the same page raced:
+                // the second guard captured the *first* guard's temporary RWX as
+                // the "original" protection and restored the page to RWX
+                // permanently, silently defeating DEP in the target.
+                //
+                // `_protect_lock` serialises the protect/write/restore window
+                // against other writers in this process, so a concurrent writer
+                // can no longer observe the temporary protection as the original.
+                let _protect_lock = self.protect_lock.lock().unwrap_or_else(|p| p.into_inner());
+                let _restore = ProtectionGuard::apply(
+                    self.handle.0,
+                    address,
+                    buf.len(),
+                    PAGE_EXECUTE_READWRITE,
+                );
+                self.raw_write(address, buf).or(Err(e))
+            }
         }
-        Ok(written)
     }
 
     fn write_buf_batch(&self, regions: &[(usize, &[u8])]) -> crate::Result<usize> {

@@ -65,17 +65,35 @@ fn win_basename(path: &str) -> &str {
 /// Wine's *install tree*, so a builtin tool never shadows the real program.
 fn exe_from_maps(pid: u32) -> Option<String> {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    exe_from_maps_text(&maps)
+}
 
+/// The text-only core of [`exe_from_maps`], so the pathname handling is unit
+/// testable without a live `/proc`.
+fn exe_from_maps_text(maps: &str) -> Option<String> {
     let mut exe: Option<String> = None;
     let mut exe_builtin = true;
 
     for line in maps.lines() {
         // maps fields: address perms offset dev inode pathname. Only file-backed
         // mappings carry a pathname (the 6th field, an absolute unix path).
-        let path = match line.split_whitespace().nth(5) {
-            Some(p) if p.starts_with('/') => p,
-            _ => continue,
+        //
+        // Taken from the first '/' to end-of-line, *not* via
+        // `split_whitespace().nth(5)`: a pathname may contain spaces, and Wine
+        // programs routinely live under one ("…/drive_c/Program Files/Game.exe").
+        // Splitting on whitespace truncated that to "…/drive_c/Program", which
+        // fails the `.exe` test, so the process showed up as `wine64-preloader`
+        // instead of its real name. `parse_maps_modules` already does it this way.
+        let path = match line.find('/') {
+            Some(idx) => line[idx..].trim_end(),
+            None => continue,
         };
+        // A replaced-on-disk mapping is suffixed " (deleted)"; strip it so the
+        // `.exe` test still matches, exactly as `parse_maps_modules` does.
+        let path = path
+            .strip_suffix("(deleted)")
+            .map(str::trim_end)
+            .unwrap_or(path);
         let lower = path.to_ascii_lowercase();
         if !lower.ends_with(".exe") {
             continue;
@@ -137,5 +155,37 @@ mod tests {
         // e.g. `wineserver` — a Wine process that runs no Windows program.
         assert_eq!(program_from_cmdline_bytes(b"wineserver\0-p\0"), None);
         assert_eq!(program_from_cmdline_bytes(b""), None);
+    }
+
+    #[test]
+    fn exe_from_maps_handles_a_path_containing_spaces() {
+        // The pathname is the last maps field and may contain spaces —
+        // "Program Files" is the single most common case for a Wine target.
+        // Reading it with `split_whitespace().nth(5)` truncated the path to
+        // "…/drive_c/Program", which fails the `.exe` test, so the process was
+        // reported by its launcher name instead of the game's.
+        let maps = concat!(
+            "7f0000000000-7f0000001000 r--p 00000000 08:02 1  ",
+            "/home/u/.wine/drive_c/Program Files/My Game/Game.exe\n",
+            "7f0000001000-7f0000002000 r-xp 00001000 08:02 2  /usr/lib/wine/ntdll.so\n",
+        );
+        assert_eq!(exe_from_maps_text(maps).as_deref(), Some("Game.exe"));
+    }
+
+    #[test]
+    fn exe_from_maps_prefers_the_drive_program_over_a_wine_builtin() {
+        let maps = concat!(
+            "7f0000000000-7f0000001000 r--p 00000000 08:02 1  /usr/lib/wine/services.exe\n",
+            "7f0000002000-7f0000003000 r--p 00000000 08:02 2  ",
+            "/home/u/.wine/drive_c/Games/Real Game.exe\n",
+        );
+        assert_eq!(exe_from_maps_text(maps).as_deref(), Some("Real Game.exe"));
+    }
+
+    #[test]
+    fn exe_from_maps_strips_a_deleted_suffix() {
+        let maps = "7f0000000000-7f0000001000 r--p 0 08:02 1  \
+                    /home/u/.wine/drive_c/Games/Patched Game.exe (deleted)\n";
+        assert_eq!(exe_from_maps_text(maps).as_deref(), Some("Patched Game.exe"));
     }
 }
