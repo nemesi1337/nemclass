@@ -198,6 +198,18 @@ use serde_json::Value;
 use crate::engine::ScriptEngine;
 use crate::events::{ClassAddressQuery, Event};
 
+/// How many host requests one [`RustyScriptEngine::pump_host_requests`] call
+/// will service. Generous enough that ordinary scripts never notice, small
+/// enough that a runaway producer cannot hold the frame.
+const MAX_HOST_REQUESTS_PER_PUMP: usize = 512;
+
+/// How long [`ScriptResolver::resolve`] waits for the worker before giving up.
+///
+/// The resolver runs on a background job, so a blocked worker does not freeze
+/// the UI — but without a bound, a script wedged in an infinite loop would park
+/// that job's thread forever and no class address would ever resolve again.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The severity of a script [`HostApi::log`] line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -358,7 +370,15 @@ pub struct RustyScriptEngine {
     tx: Sender<Command>,
     /// Drains host-API requests raised by worker-thread JS. The main thread
     /// services this via [`RustyScriptEngine::pump_host_requests`].
-    host_rx: Receiver<HostRequest>,
+    ///
+    /// An `Option` purely so [`Drop`] can close it *before* joining the worker.
+    /// A worker blocked in `HostBridge::call` is waiting on a reply channel
+    /// owned by a request still sitting in this queue; while the receiver lives,
+    /// that reply can never be cancelled, so `Shutdown` sat unread behind the
+    /// blocked call and `join()` hung the whole application on exit. Dropping
+    /// the receiver makes every queued reply channel disconnect and every
+    /// subsequent `send` fail, so the worker unblocks immediately.
+    host_rx: Option<Receiver<HostRequest>>,
     /// Worker join handle (taken on drop to join cleanly).
     worker: Option<JoinHandle<()>>,
 }
@@ -384,7 +404,7 @@ impl RustyScriptEngine {
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 tx,
-                host_rx,
+                host_rx: Some(host_rx),
                 worker: Some(worker),
             }),
             Ok(Err(e)) => {
@@ -398,12 +418,27 @@ impl RustyScriptEngine {
         }
     }
 
-    /// Drains all pending host-API requests and answers them against `host`.
-    /// **Call this every UI frame** — it is how worker-thread JS reaches the live
-    /// main-thread [`HostApi`]. Non-blocking: returns once the queue is empty.
+    /// Answers pending host-API requests against `host`.
+    ///
+    /// **Call this every UI frame** — it is how worker-thread JS reaches the
+    /// live main-thread [`HostApi`]. Non-blocking, and bounded to
+    /// [`MAX_HOST_REQUESTS_PER_PUMP`] requests per call.
+    ///
+    /// The bound matters: `HostRequest::Log` is fire-and-forget over an
+    /// unbounded channel, so a script logging in a loop produced work faster
+    /// than an unbounded `while let` drain could retire it. The frame never
+    /// finished and the queue grew without limit — a script could freeze the UI
+    /// and exhaust memory with `for(;;) nemclass.log("x")`. Anything left over
+    /// is serviced next frame.
     pub fn pump_host_requests(&mut self, host: &mut dyn HostApi) {
-        while let Ok(req) = self.host_rx.try_recv() {
-            service_host_request(req, host);
+        let Some(rx) = self.host_rx.as_ref() else {
+            return;
+        };
+        for _ in 0..MAX_HOST_REQUESTS_PER_PUMP {
+            match rx.try_recv() {
+                Ok(req) => service_host_request(req, host),
+                Err(_) => break,
+            }
         }
     }
 }
@@ -444,7 +479,14 @@ fn service_host_request(req: HostRequest, host: &mut dyn HostApi) {
 
 impl Drop for RustyScriptEngine {
     fn drop(&mut self) {
-        // Best-effort clean shutdown: tell the worker to stop and join it.
+        // Close the host bridge FIRST. If the worker is blocked in
+        // `HostBridge::call` awaiting a reply, nothing will ever answer it now —
+        // the main thread is shutting down and will never pump again — so
+        // `Shutdown` would sit unread behind the blocked call and `join()` would
+        // hang the application on exit. Dropping the receiver disconnects every
+        // queued reply channel and makes further sends fail, so the worker
+        // unblocks with "host bridge closed" and reaches `Shutdown`.
+        self.host_rx = None;
         let _ = self.tx.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -513,7 +555,13 @@ impl ScriptResolver {
         {
             return None;
         }
-        reply_rx.recv().ok().flatten()
+        // Bounded: a JS resolver stuck in a loop would otherwise park this
+        // background thread permanently.
+        match reply_rx.recv_timeout(RESOLVE_TIMEOUT) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+        }
     }
 }
 
@@ -526,7 +574,9 @@ globalThis.nemclass = {
     pattern_scan: (module, pattern) => rustyscript.functions.__host_pattern_scan(module, pattern),
     declare_type: (descriptor) => rustyscript.functions.__host_declare_type(descriptor),
     declare_class: (name, addressFormula) => rustyscript.functions.__host_declare_class(name, addressFormula),
-    log: (msg) => rustyscript.functions.__host_log(String(msg)),
+    log: (msg) => rustyscript.functions.__host_log(String(msg), "info"),
+    warn: (msg) => rustyscript.functions.__host_log(String(msg), "warn"),
+    error: (msg) => rustyscript.functions.__host_log(String(msg), "error"),
     on: (event, handler) => {
         (globalThis.__nemclass_handlers[event] ||= []).push(handler);
     },
@@ -560,7 +610,7 @@ const NEMCLASS_DISPATCH: &str = r#"
 export function __nemclass_dispatch(kind, payload) {
     const handlers = (globalThis.__nemclass_handlers || {})[kind] || [];
     for (const h of handlers) {
-        try { h(payload); } catch (e) { nemclass.log("handler error: " + e); }
+        try { h(payload); } catch (e) { nemclass.error("handler error: " + e); }
     }
     // Global-function fallback: onAttach / onDetach / onProjectLoad / etc.
     const fallback = {
@@ -573,7 +623,7 @@ export function __nemclass_dispatch(kind, payload) {
         Custom: "onCustom",
     }[kind];
     if (fallback && typeof globalThis[fallback] === "function") {
-        try { globalThis[fallback](payload); } catch (e) { nemclass.log("handler error: " + e); }
+        try { globalThis[fallback](payload); } catch (e) { nemclass.error("handler error: " + e); }
     }
 }
 
@@ -927,11 +977,16 @@ fn register_host_fns(runtime: &mut Runtime, bridge: &HostBridge) -> Result<(), S
     runtime
         .register_function("__host_log", move |args: &[Value]| {
             let msg = json_str(args, 0).unwrap_or_default();
+            // Every script log used to arrive as `Info`, including uncaught
+            // handler exceptions — so a script blowing up looked exactly like a
+            // status line. The shim passes a level as argument 1.
+            let level = match json_str(args, 1).unwrap_or_default().as_str() {
+                "error" => LogLevel::Error,
+                "warn" => LogLevel::Warn,
+                _ => LogLevel::Info,
+            };
             // Fire-and-forget; never blocks, so it works even mid-resolve.
-            let _ = b.host_tx.send(HostRequest::Log {
-                level: LogLevel::Info,
-                msg,
-            });
+            let _ = b.host_tx.send(HostRequest::Log { level, msg });
             Ok(Value::Null)
         })
         .map_err(|e| format!("register log: {e}"))?;

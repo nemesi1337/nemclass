@@ -249,4 +249,31 @@ fn engine_dispatch_host_bridge_and_resolver() {
          declared_classes={:?}",
         host.lock().unwrap().declared_classes
     );
+
+    // --- Dropping while the worker is mid-host-call must not hang -------------
+    // `HostBridge::call` blocks on a reply channel owned by a request sitting in
+    // the engine's `host_rx` queue. `Drop` used to send `Shutdown` and join
+    // immediately, but `host_rx` is a plain field dropped only *after*
+    // `Drop::drop` returns — so the blocked call could never be cancelled,
+    // `Shutdown` sat unread behind it, and `join()` hung the application on
+    // exit. (The pump loop above tiptoes around exactly this.)
+    //
+    // Dispatch an event and deliberately do NOT pump, so the worker is parked
+    // inside a host call, then drop from another thread under a watchdog.
+    engine.on_event(&Event::OnAttach {
+        pid: 999,
+        name: Some("game".into()),
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(engine);
+        let _ = done_tx.send(());
+    });
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "dropping the engine while the worker is blocked on an unanswered host \
+         call must not hang"
+    );
 }

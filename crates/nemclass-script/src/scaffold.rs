@@ -358,6 +358,16 @@ interface NemclassHost {{
   /** Log a message through the host (appears in the app's log). */
   log(msg: string): void;
 
+  /** Log a warning through the host. */
+  warn(msg: string): void;
+
+  /**
+   * Log an error through the host. Uncaught exceptions thrown from an event
+   * handler are reported this way, so they no longer look like ordinary status
+   * lines in the log.
+   */
+  error(msg: string): void;
+
 {ns_fields}
   /**
    * Register a handler for a lifecycle/custom event. The handler receives the
