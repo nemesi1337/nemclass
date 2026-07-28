@@ -53,6 +53,7 @@ mod pattern;
 mod pointerscan;
 mod results;
 mod scanner;
+mod spider;
 mod target;
 mod signature;
 mod value_type;
@@ -66,6 +67,10 @@ pub use pointerscan::{
 pub use results::{ScanResult, ScanResults};
 pub use signature::{format_signature, make_signature, SignatureConfig};
 pub use scanner::{NoObserver, ScanError, ScanObserver, ScanProgress, ScanStats, Scanner};
+pub use spider::{
+    spider_refine_with, spider_scan, spider_scan_with, SpiderConfig, SpiderHit, SpiderPath,
+    SpiderScanResult, MAX_DEPTH, MAX_STRUCT_SIZE,
+};
 pub use target::{
     FilterState, MockTarget, Region, RegionFilter, ScanTarget, SectionFilter, WriteTarget,
 };

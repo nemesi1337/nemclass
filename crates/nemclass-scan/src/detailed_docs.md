@@ -26,6 +26,33 @@ works equally against an in-memory `MockTarget`.
 - **`ScanError` / `ScanStats`** — typed failure reasons and per-pass counters.
 - **`FreezeSet`** — periodically re-writes pinned values through a `WriteTarget`.
 - **`BytePattern` / `PatternByte`** — the AOB matcher.
+- **`spider_scan` / `SpiderPath`** — the structure spider (see below).
+
+## The three searches, and which question each answers
+
+| | Question | Direction |
+|---|---|---|
+| `Scanner` | "which addresses hold 100?" | all of memory, structure-blind |
+| `pointer_scan` | "what static chain reaches this address?" | backwards, address → module |
+| `spider_scan` | "where inside this object does 100 live?" | forwards, from one known base |
+
+The **spider** is a combination of the first two. From one known base address it
+walks a hypothetical struct, and at every aligned slot it *simultaneously*
+compares the slot against a needle (value scanner) and follows it as a pointer
+into a child struct one level down (pointer chain). Hits come out as offset
+paths — `[[0x7f2a10 + 0x18] + 0x40] + 0x14` — that parse with
+`nemclass_model::parse_address`, so a hit becomes a live cheat-table address or a
+`ClassNode.address_formula` directly.
+
+`spider_refine_with` then narrows an existing hit list the way Next Scan does:
+re-walk every chain, drop the ones that no longer resolve, and keep only the
+readings that satisfy a fresh comparison. That is the loop that makes the tool
+useful — search `100`, take damage, refine `Changed`.
+
+The search is breadth-first over *unique* struct nodes, so the shortest path to
+each struct wins and the cost stays linear in reachable memory rather than
+exponential in depth. `SpiderConfig::dedupe_nodes = false` restores the
+report-every-route behaviour of the yclass original this was ported from.
 
 ## Example
 

@@ -218,7 +218,19 @@ impl PointerMap {
         let mut out: Vec<PointerPath> = Vec::new();
         let mut truncated = false;
         let mut visited: HashSet<usize> = HashSet::new();
-        self.solve(goal, cfg.max_depth, &mut Vec::new(), cfg, &mut visited, &mut out, &mut truncated);
+        // Sorted once here, not per DFS frame: `solve` recurses thousands of
+        // times and used to re-allocate and re-sort this on every one of them.
+        let statics = cfg.static_ranges_sorted();
+        self.solve(
+            goal,
+            cfg.max_depth,
+            &mut Vec::new(),
+            cfg,
+            &statics,
+            &mut visited,
+            &mut out,
+            &mut truncated,
+        );
         PointerScanResult { paths: out, truncated }
     }
 
@@ -232,6 +244,7 @@ impl PointerMap {
         depth: usize,
         suffix: &mut Vec<usize>,
         cfg: &PointerScanConfig,
+        statics: &[(usize, usize)],
         visited: &mut HashSet<usize>,
         out: &mut Vec<PointerPath>,
         truncated: &mut bool,
@@ -260,7 +273,7 @@ impl PointerMap {
             chain.push(off);
             chain.extend_from_slice(suffix);
 
-            if is_mapped(&cfg.static_ranges_sorted(), addr) {
+            if is_mapped(statics, addr) {
                 out.push(PointerPath { base: addr, offsets: chain });
                 // A static anchor completes the path; don't extend past it.
                 continue;
@@ -268,7 +281,7 @@ impl PointerMap {
 
             // Recurse: `addr` becomes the next goal one level up.
             suffix.insert(0, off);
-            self.solve(addr, depth - 1, suffix, cfg, visited, out, truncated);
+            self.solve(addr, depth - 1, suffix, cfg, statics, visited, out, truncated);
             suffix.remove(0);
         }
 
@@ -307,7 +320,9 @@ pub fn pointer_scan<T: ScanTarget>(
 }
 
 /// Read a little-endian pointer-sized word (1..=8 bytes) into a `usize`.
-fn read_word(bytes: &[u8]) -> usize {
+///
+/// Shared with [`crate::spider`], which harvests candidate pointers the same way.
+pub(crate) fn read_word(bytes: &[u8]) -> usize {
     let mut v = 0usize;
     for (i, &b) in bytes.iter().take(8).enumerate() {
         v |= (b as usize) << (i * 8);
@@ -316,7 +331,12 @@ fn read_word(bytes: &[u8]) -> usize {
 }
 
 /// True if `addr` falls inside any `(base, end)` range (sorted ascending).
-fn is_mapped(ranges: &[(usize, usize)], addr: usize) -> bool {
+///
+/// Shared with [`crate::spider`], which uses it to decide whether a candidate
+/// pointer is worth following. Both callers sort their ranges once up front —
+/// this is a per-slot hot path, so a linear scan over unsorted regions is not an
+/// acceptable substitute.
+pub(crate) fn is_mapped(ranges: &[(usize, usize)], addr: usize) -> bool {
     // Find the last range whose base ≤ addr, then check its end.
     let idx = ranges.partition_point(|&(base, _)| base <= addr);
     idx > 0 && addr < ranges[idx - 1].1
