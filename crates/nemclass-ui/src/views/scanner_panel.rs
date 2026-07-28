@@ -63,16 +63,16 @@ const DEFAULT_LIVE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How many rows to read on the first refresh after a scan, before the table has
 /// reported which rows the viewport actually drew. A generous screenful.
-const LIVE_SEED_ROWS: usize = 64;
+pub(super) const LIVE_SEED_ROWS: usize = 64;
 
 /// Live value differing from the scan-time value (Cheat Engine's red).
-const CHANGED_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 110, 90);
+pub(super) const CHANGED_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 110, 90);
 
 /// An address that could not be read back.
-const UNREADABLE_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 80, 80);
+pub(super) const UNREADABLE_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 80, 80);
 
 /// What the live column knows about one address this frame.
-enum LiveValue<'a> {
+pub(super) enum LiveValue<'a> {
     /// Read succeeded this refresh.
     Read(&'a [u8]),
     /// Read was attempted and failed — the address is gone.
@@ -1225,7 +1225,7 @@ fn parse_opt_hex(text: &str) -> Result<Option<usize>, ()> {
 /// Bridges the scan engine's observer to the job handle: publishes progress and
 /// aborts as soon as the UI's Stop button sets the cancel flag.
 #[cfg(target_os = "linux")]
-fn observer_for(job: &JobHandle) -> impl nemclass_scan::ScanObserver + '_ {
+pub(super) fn observer_for(job: &JobHandle) -> impl nemclass_scan::ScanObserver + '_ {
     move |p: nemclass_scan::ScanProgress| {
         job.set_progress(p.done as u64, p.total as u64);
         !job.is_cancelled()
@@ -1250,7 +1250,7 @@ fn snapshot_results(results: &nemclass_scan::ScanResults) -> Vec<ResultRow> {
 /// Reads the raw bytes of a fixed-width value live from the target. Returns
 /// `None` for variable-width types (Bytes/strings), on a short read, or when
 /// no process is attached.
-fn read_live_bytes(process: Option<&Process>, addr: usize, vt: ScanValueType) -> Option<Vec<u8>> {
+pub(super) fn read_live_bytes(process: Option<&Process>, addr: usize, vt: ScanValueType) -> Option<Vec<u8>> {
     let width = vt.fixed_width()?;
     let process = process?;
     let mut buf = vec![0u8; width];
@@ -1258,7 +1258,7 @@ fn read_live_bytes(process: Option<&Process>, addr: usize, vt: ScanValueType) ->
     (n >= width).then_some(buf)
 }
 
-fn format_value_bytes(bytes: &[u8], vt: ScanValueType) -> String {
+pub(super) fn format_value_bytes(bytes: &[u8], vt: ScanValueType) -> String {
     match vt {
         ScanValueType::I8  if !bytes.is_empty()   => i8::from_le_bytes([bytes[0]]).to_string(),
         ScanValueType::I16 if bytes.len() >= 2 => i16::from_le_bytes(bytes[..2].try_into().unwrap_or_default()).to_string(),
@@ -1283,7 +1283,7 @@ fn format_value_bytes(bytes: &[u8], vt: ScanValueType) -> String {
     }
 }
 
-fn value_type_label(vt: ScanValueType) -> &'static str {
+pub(super) fn value_type_label(vt: ScanValueType) -> &'static str {
     match vt {
         ScanValueType::I8          => "Int8 (i8)",
         ScanValueType::I16         => "Int16 (i16)",
@@ -1301,7 +1301,7 @@ fn value_type_label(vt: ScanValueType) -> &'static str {
     }
 }
 
-fn compare_label(ct: ScanCompareType) -> &'static str {
+pub(super) fn compare_label(ct: ScanCompareType) -> &'static str {
     match ct {
         ScanCompareType::Exact       => "Exact (==)",
         ScanCompareType::NotEqual    => "Not Equal (!=)",
@@ -1318,7 +1318,7 @@ fn compare_label(ct: ScanCompareType) -> &'static str {
     }
 }
 
-const ALL_VALUE_TYPES: &[ScanValueType] = &[
+pub(super) const ALL_VALUE_TYPES: &[ScanValueType] = &[
     ScanValueType::I8,
     ScanValueType::I16,
     ScanValueType::I32,
@@ -1350,7 +1350,7 @@ const FIRST_SCAN_COMPARES: &[ScanCompareType] = &[
 /// available (re-narrowing by value is normal), the change-relative kinds
 /// appear, and `Unknown` disappears — it accepts everything, so on a next scan
 /// it is either a no-op or a wipe. Cheat Engine hides it the same way.
-const NEXT_SCAN_COMPARES: &[ScanCompareType] = &[
+pub(super) const NEXT_SCAN_COMPARES: &[ScanCompareType] = &[
     ScanCompareType::Exact,
     ScanCompareType::NotEqual,
     ScanCompareType::GreaterThan,

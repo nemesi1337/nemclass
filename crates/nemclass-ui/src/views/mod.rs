@@ -29,6 +29,7 @@ mod script_log;
 mod scripts_panel;
 mod host_api_impl;
 mod pointer_scan_panel;
+mod spider_panel;
 pub(crate) mod cheat_table_panel;
 mod tasks;
 
@@ -41,6 +42,7 @@ use script_host::ScriptHost;
 use script_log::{LogKind, ScriptLog, new_script_log};
 use scripts_panel::{ScriptsPanel, ScriptsPanelAction};
 use pointer_scan_panel::{PointerScanPanel, PointerScanAction};
+use spider_panel::{SpiderPanel, SpiderAction};
 use cheat_table_panel::{CheatTablePanel, CheatTablePanelAction};
 
 use std::collections::{HashMap, HashSet};
@@ -417,9 +419,14 @@ pub struct NemclassApp {
 
     // Pointer-scan panel
     pointer_scan_panel: PointerScanPanel,
+    /// Structure spider: find a value inside a known object.
+    spider_panel: SpiderPanel,
     /// Deferred action from the pointer-scan panel; applied after the dock draw
     /// to avoid borrow conflicts with `self.project` / `self.selected_class`.
     pending_pointer_scan_action: Option<PointerScanAction>,
+    /// Spider action deferred out of the tab draw, applied once the dock's
+    /// borrows are released (same reason as the pointer-scan one above).
+    pending_spider_action: Option<SpiderAction>,
 
     // Cheat table panel
     cheat_table_panel: CheatTablePanel,
@@ -613,6 +620,8 @@ impl NemclassApp {
             disassembly_panel: DisassemblyPanel::new(),
             pointer_scan_panel: PointerScanPanel::new(),
             pending_pointer_scan_action: None,
+            spider_panel: SpiderPanel::new(),
+            pending_spider_action: None,
             cheat_table_panel: CheatTablePanel::new(),
             navigator_panel: navigator::NavigatorPanel::new(),
             modules_panel: modules_panel::ModulesPanel::new(),
@@ -927,6 +936,7 @@ impl NemclassApp {
             self.disassembly_panel.on_detach();
             self.modules_panel.on_detach();
             self.pointer_scan_panel.on_detach();
+            self.spider_panel.on_detach();
             self.cheat_table_panel.on_detach();
             // The script scan session is bound to the detached process; drop it.
             #[cfg(all(feature = "scripting", target_os = "linux"))]
@@ -1634,6 +1644,7 @@ impl eframe::App for NemclassApp {
         self.scanner_panel.poll();
         #[cfg(target_os = "linux")]
         self.pointer_scan_panel.poll();
+        self.spider_panel.poll();
         #[cfg(target_os = "linux")]
         self.disassembly_panel.poll();
         self.debugger_panel.tick_events();
@@ -2283,6 +2294,9 @@ impl NemclassApp {
         if let Some(action) = self.pending_pointer_scan_action.take() {
             self.apply_pointer_scan_action(action);
         }
+        if let Some(action) = self.pending_spider_action.take() {
+            self.apply_spider_action(action);
+        }
     }
 
     /// The "View" menu: re-open any dock tab that was closed (adds it to the
@@ -2540,6 +2554,87 @@ impl NemclassApp {
                 self.last_snapshot = None;
             }
             PointerScanAction::Goto(addr) => {
+                self.pending_focus = Some(TabKind::Memory);
+                #[cfg(target_os = "linux")]
+                self.memory_viewer.goto(addr);
+                #[cfg(not(target_os = "linux"))]
+                let _ = addr;
+            }
+        }
+    }
+
+    fn show_spider_tab(&mut self, ui: &mut egui::Ui) {
+        // Cached module list (TTL'd) — used to anchor a hit's formula in a module
+        // image so the path survives a restart. Re-parsing /proc/<pid>/maps every
+        // frame is what this cache exists to avoid.
+        let modules = self.scanner_modules();
+        let rt = self.runtime.as_ref().expect("bg runtime").handle();
+
+        self.spider_panel.set_live_interval(self.snapshot_interval);
+        let action = self.spider_panel.show(ui, self.process.as_ref(), &modules, &rt);
+
+        // Stash for application after the dock draw closes all borrows.
+        match action {
+            SpiderAction::None => {}
+            other => {
+                self.pending_spider_action = Some(other);
+            }
+        }
+    }
+
+    /// Apply a [`SpiderAction`] deferred from the spider tab draw.
+    ///
+    /// The address-list and freeze routes store the *formula*, not a resolved
+    /// literal, so the entry re-walks its pointer chain every tick and keeps
+    /// working after the target relocates — which is the whole point of a spider
+    /// result over a bare address.
+    fn apply_spider_action(&mut self, action: SpiderAction) {
+        match action {
+            SpiderAction::None => {}
+            SpiderAction::AddToTable { formula, tag } => {
+                self.cheat_table_panel.table_mut().push(nemclass_model::CheatEntry {
+                    description: formula.clone(),
+                    address: formula,
+                    value_type: tag.to_string(),
+                    frozen: false,
+                    frozen_value: String::new(),
+                    group: String::new(),
+                });
+            }
+            SpiderAction::Freeze { formula, tag, value } => {
+                // Freezing is owned by the address list, so there stays exactly
+                // one write-back loop. Toggle an existing row rather than
+                // stacking duplicates for the same path.
+                let table = self.cheat_table_panel.table_mut();
+                match table.entries.iter_mut().find(|e| e.address == formula) {
+                    Some(existing) => {
+                        existing.frozen = !existing.frozen;
+                        existing.frozen_value =
+                            if existing.frozen { value } else { String::new() };
+                    }
+                    None => table.push(nemclass_model::CheatEntry {
+                        description: formula.clone(),
+                        address: formula,
+                        value_type: tag.to_string(),
+                        frozen: true,
+                        frozen_value: value,
+                        group: String::new(),
+                    }),
+                }
+            }
+            SpiderAction::CreateClass { name, formula } => {
+                let mut cls = blank_class(&self.project);
+                if !name.is_empty() {
+                    cls.name = name;
+                }
+                cls.address_formula = formula;
+                let uuid = cls.uuid;
+                self.project.add_class(cls);
+                self.selected_class = Some(uuid);
+                self.clear_memory_state();
+                self.last_snapshot = None;
+            }
+            SpiderAction::Goto(addr) => {
                 self.pending_focus = Some(TabKind::Memory);
                 #[cfg(target_os = "linux")]
                 self.memory_viewer.goto(addr);
@@ -3423,6 +3518,18 @@ impl NemclassApp {
                 if let Some(addr) = target_addr {
                     self.pointer_scan_panel.set_goal(addr);
                     self.pending_focus = Some(TabKind::PointerScan);
+                }
+                ui.close();
+            }
+            // The inverse search: the pointer scan asks what *reaches* this
+            // address, the spider asks what lives *inside* the object it names.
+            if ui.add_enabled(
+                enabled,
+                egui::Button::new("Spider from this address"),
+            ).on_hover_text("Search inside this object for a value").clicked() {
+                if let Some(addr) = target_addr {
+                    self.spider_panel.set_root(addr);
+                    self.pending_focus = Some(TabKind::Spider);
                 }
                 ui.close();
             }

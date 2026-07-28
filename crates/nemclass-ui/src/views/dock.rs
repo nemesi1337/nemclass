@@ -42,6 +42,8 @@ pub enum TabKind {
     Scripts,
     /// Pointer-chain scanner (ASLR-stable path finder).
     PointerScan,
+    /// Structure spider: find a value *inside* a known object.
+    Spider,
 }
 
 impl TabKind {
@@ -57,11 +59,12 @@ impl TabKind {
             TabKind::Debugger => "Debugger",
             TabKind::Scripts => "Scripts",
             TabKind::PointerScan => "Pointer scan",
+            TabKind::Spider => "Spider",
         }
     }
 
     /// Every tab kind, for building the "View" menu that re-opens closed panels.
-    pub const ALL: [TabKind; 9] = [
+    pub const ALL: [TabKind; 10] = [
         TabKind::ClassView,
         TabKind::Navigator,
         TabKind::Modules,
@@ -71,6 +74,7 @@ impl TabKind {
         TabKind::Debugger,
         TabKind::Scripts,
         TabKind::PointerScan,
+        TabKind::Spider,
     ];
 }
 
@@ -93,7 +97,13 @@ pub fn default_layout() -> DockState<TabKind> {
     surface.split_below(
         disasm,
         0.6,
-        vec![TabKind::Scanner, TabKind::PointerScan, TabKind::Debugger, TabKind::Scripts],
+        vec![
+            TabKind::Scanner,
+            TabKind::PointerScan,
+            TabKind::Spider,
+            TabKind::Debugger,
+            TabKind::Scripts,
+        ],
     );
 
     state
@@ -123,6 +133,7 @@ impl TabViewer for DockViewer<'_> {
             TabKind::Debugger => self.app.show_debugger_tab(ui),
             TabKind::Scripts => self.app.show_scripts_tab(ui),
             TabKind::PointerScan => self.app.show_pointer_scan_tab(ui),
+            TabKind::Spider => self.app.show_spider_tab(ui),
         }
     }
 
