@@ -37,6 +37,7 @@ pub(crate) mod mod_test_helpers {
 use std::collections::HashSet;
 
 use crate::node::registry::NodeRegistry;
+use crate::node::vector::{FloatWidth, matrix_shape, vector_shape};
 use crate::project::Project;
 
 /// Target language for code generation.
@@ -168,6 +169,10 @@ pub(crate) enum FieldKind {
     Utf8Text(usize),
     /// `wchar_t[length]` (UTF-16, length in bytes → length/2 chars).
     Utf16Text(usize),
+    /// A `Vector2/3/4` — `components` contiguous floats of `width`.
+    Vector { components: usize, width: FloatWidth },
+    /// A row-major `Matrix3x3/3x4/4x4` of floats of `width`.
+    Matrix { rows: usize, cols: usize, width: FloatWidth },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -332,6 +337,16 @@ pub(crate) fn resolve_fields(
             // Pointer to a UTF-8 string: an 8-byte `char*` — emit as an untyped
             // pointer so the field width and semantics stay correct.
             "StrPtr" => FieldKind::Pointer(None),
+
+            // Vector / matrix: the shape is encoded in the tag itself.
+            tag if vector_shape(tag).is_some() => {
+                let (components, width) = vector_shape(tag).unwrap();
+                FieldKind::Vector { components: components as usize, width }
+            }
+            tag if matrix_shape(tag).is_some() => {
+                let (rows, cols, width) = matrix_shape(tag).unwrap();
+                FieldKind::Matrix { rows: rows as usize, cols: cols as usize, width }
+            }
 
             // Unknown / Class container nodes embedded as children: emit a
             // raw-bytes fallback so the total size still advances correctly.

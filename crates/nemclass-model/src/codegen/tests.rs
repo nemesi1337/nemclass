@@ -528,3 +528,45 @@ fn mutual_class_instance_cycle_terminates() {
         assert!(out.contains("CyclicB"), "missing CyclicB: {out}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Vector / matrix nodes
+// ---------------------------------------------------------------------------
+
+/// Vector and matrix nodes must emit a correctly-sized array in every language,
+/// and — because they are the first multi-component leaf nodes — must advance the
+/// running field offset by their full byte width.
+#[test]
+fn vector_and_matrix_fields_emit_arrays_and_advance_offsets() {
+    use crate::node::vector::{FloatWidth, MatrixNode, VectorNode};
+
+    let reg = registry();
+    let mut proj = Project::new("P");
+
+    let mut cls = ClassNode::with_uuid(Uuid::new_v4(), "Transform");
+    cls.children.push(Box::new(VectorNode::new("origin", 3, FloatWidth::F32))); // 0x00, 12 B
+    cls.children.push(Box::new(VectorNode::new("scale", 4, FloatWidth::F64))); // 0x0C, 32 B
+    cls.children.push(Box::new(MatrixNode::new("view", 4, 4, FloatWidth::F32))); // 0x2C, 64 B
+    cls.children.push(Box::new(Int32Node::new("tail"))); // 0x6C
+    proj.add_class(cls);
+
+    let cpp = generate(Language::Cpp, &proj, &reg);
+    assert!(cpp.contains("float origin[3];"), "{cpp}");
+    assert!(cpp.contains("double scale[4];"), "{cpp}");
+    assert!(cpp.contains("float view[4][4];"), "{cpp}");
+    // 12 + 32 + 64 = 108 = 0x6C, then +4 = 0x70 total.
+    assert!(cpp.contains("int32_t tail; //0x006C"), "{cpp}");
+    assert!(cpp.contains("//Size: 0x0070"), "{cpp}");
+
+    let rs = generate(Language::Rust, &proj, &reg);
+    assert!(rs.contains("pub origin: [f32; 3],"), "{rs}");
+    assert!(rs.contains("pub scale: [f64; 4],"), "{rs}");
+    assert!(rs.contains("pub view: [[f32; 4]; 4],"), "{rs}");
+
+    let cs = generate(Language::CSharp, &proj, &reg);
+    assert!(cs.contains("public unsafe fixed float origin[3];"), "{cs}");
+    assert!(cs.contains("public unsafe fixed double scale[4];"), "{cs}");
+    // C# fixed buffers are 1-D, so the matrix flattens to rows*cols.
+    assert!(cs.contains("public unsafe fixed float view[16];"), "{cs}");
+    assert!(cs.contains("[FieldOffset(0x6C)]"), "{cs}");
+}

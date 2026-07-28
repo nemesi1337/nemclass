@@ -206,6 +206,51 @@ fn register_builtins(reg: &mut NodeRegistry) {
     // StrPtrNode — an 8-byte pointer to a NUL-terminated UTF-8 string.
     reg_simple!("StrPtr", StrPtrNode);
 
+    // Vector / matrix nodes. The shape lives in the type tag (see
+    // `node::vector`), so each tag gets its own ctor/deserializer pair rather
+    // than reading `components`/`rows` out of `NodeDef::attrs`.
+    {
+        use crate::node::vector::{FloatWidth, MatrixNode, VectorNode};
+
+        macro_rules! reg_vector {
+            ($tag:literal, $comps:expr, $width:expr) => {{
+                fn ctor() -> Box<dyn Node> { Box::new(VectorNode::new("", $comps, $width)) }
+                fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
+                    let mut n = VectorNode::new(def.name, $comps, $width);
+                    n.comment = def.comment;
+                    Ok(Box::new(n))
+                }
+                reg.register($tag, ctor, de);
+            }};
+        }
+
+        macro_rules! reg_matrix {
+            ($tag:literal, $rows:expr, $cols:expr, $width:expr) => {{
+                fn ctor() -> Box<dyn Node> { Box::new(MatrixNode::new("", $rows, $cols, $width)) }
+                fn de(def: NodeDef, _reg: &NodeRegistry) -> Result<Box<dyn Node>> {
+                    let mut n = MatrixNode::new(def.name, $rows, $cols, $width);
+                    n.comment = def.comment;
+                    Ok(Box::new(n))
+                }
+                reg.register($tag, ctor, de);
+            }};
+        }
+
+        reg_vector!("Vector2",  2, FloatWidth::F32);
+        reg_vector!("Vector3",  3, FloatWidth::F32);
+        reg_vector!("Vector4",  4, FloatWidth::F32);
+        reg_vector!("Vector2d", 2, FloatWidth::F64);
+        reg_vector!("Vector3d", 3, FloatWidth::F64);
+        reg_vector!("Vector4d", 4, FloatWidth::F64);
+
+        reg_matrix!("Matrix3x3",  3, 3, FloatWidth::F32);
+        reg_matrix!("Matrix3x4",  3, 4, FloatWidth::F32);
+        reg_matrix!("Matrix4x4",  4, 4, FloatWidth::F32);
+        reg_matrix!("Matrix3x3d", 3, 3, FloatWidth::F64);
+        reg_matrix!("Matrix3x4d", 3, 4, FloatWidth::F64);
+        reg_matrix!("Matrix4x4d", 4, 4, FloatWidth::F64);
+    }
+
     // VTableNode (container) — recursive via registry; children are VMethodNodes
     {
         use crate::node::vtable::VTableNode;

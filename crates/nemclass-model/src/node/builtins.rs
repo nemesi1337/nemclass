@@ -149,7 +149,11 @@ impl Node for PointerNode {
             return fallback("Pointer", 8);
         };
         let v = pod_read_unaligned::<u64>(bytes);
-        RenderedValue { value: format!("0x{v:016X}"), type_tag: "Pointer", memory_size: 8 }
+        // 12 hex digits, not 16: that covers the whole 47-bit user-space range
+        // on x86-64 and keeps the value column narrow enough to show in full.
+        // `{:012X}` is a *minimum* width, so a kernel pointer still prints all
+        // 16 digits rather than being truncated.
+        RenderedValue { value: format!("0x{v:012X}"), type_tag: "Pointer", memory_size: 8 }
     }
     fn pointer_target_class(&self) -> Option<Uuid> { self.target_class_uuid }
     fn set_pointer_target(&mut self, target: Uuid) -> bool {

@@ -151,6 +151,19 @@ impl CodeGenerator for RustCodeGenerator {
                             f.name, char_count, comment_part
                         )
                     }
+                    FieldKind::Vector { components, width } => {
+                        format!(
+                            "    pub {}: [{}; {}],{}\n",
+                            f.name, width.rust_ty(), components, comment_part
+                        )
+                    }
+                    FieldKind::Matrix { rows, cols, width } => {
+                        // Row-major: the outer array indexes rows.
+                        format!(
+                            "    pub {}: [[{}; {}]; {}],{}\n",
+                            f.name, width.rust_ty(), cols, rows, comment_part
+                        )
+                    }
                 };
                 out.push_str(&line);
             }

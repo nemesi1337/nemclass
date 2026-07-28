@@ -23,6 +23,9 @@ pub use codegen::{CodeGenerator, Language, generate as generate_code, resolved_c
 pub use enums::EnumDescription;
 pub use error::{ModelError, Result};
 pub use node::registry::NodeRegistry;
+pub use node::vector::{
+    FloatWidth, MATRIX_SHAPES, MatrixNode, VECTOR_SHAPES, VectorNode, matrix_shape, vector_shape,
+};
 pub use node::{Node, RenderedValue};
 pub use project::Project;
 

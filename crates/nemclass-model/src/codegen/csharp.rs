@@ -16,6 +16,7 @@
 
 use super::{CodeGenerator, FieldKind, Language, PrimKind, resolve_fields, sanitize_ident};
 use crate::node::registry::NodeRegistry;
+use crate::node::vector::FloatWidth;
 use crate::project::Project;
 // Note: C# generator does not currently emit a sizeof assertion (C# structs with
 // `unsafe fixed` arrays require an `unsafe` context for Marshal.SizeOf). The
@@ -46,6 +47,13 @@ impl CSharpCodeGenerator {
             2 => "short",
             8 => "long",
             _ => "int",
+        }
+    }
+
+    fn float_type(w: FloatWidth) -> &'static str {
+        match w {
+            FloatWidth::F32 => "float",
+            FloatWidth::F64 => "double",
         }
     }
 }
@@ -160,6 +168,27 @@ impl CodeGenerator for CSharpCodeGenerator {
                         out.push_str(&format!(
                             "    public unsafe fixed byte {}[{}];{} // UTF-16 LE\n",
                             f.name, byte_count, comment_part
+                        ));
+                    }
+                    FieldKind::Vector { components, width } => {
+                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
+                        out.push_str(&format!(
+                            "    public unsafe fixed {} {}[{}];{}\n",
+                            Self::float_type(*width), f.name, components, comment_part
+                        ));
+                    }
+                    FieldKind::Matrix { rows, cols, width } => {
+                        // C# `fixed` buffers are one-dimensional, so a matrix is
+                        // flattened row-major — index it as `m[row * cols + col]`.
+                        out.push_str(&format!("    [FieldOffset(0x{:X})]\n", f.offset));
+                        out.push_str(&format!(
+                            "    public unsafe fixed {} {}[{}];{} // {}x{} row-major\n",
+                            Self::float_type(*width),
+                            f.name,
+                            rows * cols,
+                            comment_part,
+                            rows,
+                            cols
                         ));
                     }
                 }

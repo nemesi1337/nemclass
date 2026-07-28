@@ -1,6 +1,7 @@
 pub mod builtins;
 pub mod function;
 pub mod registry;
+pub mod vector;
 pub mod vtable;
 
 use uuid::Uuid;

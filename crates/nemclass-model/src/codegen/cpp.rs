@@ -136,6 +136,18 @@ impl CodeGenerator for CppCodeGenerator {
                         let char_count = len.div_ceil(2);
                         format!("    wchar_t {}[{}];{}\n", f.name, char_count, offset_comment)
                     }
+                    FieldKind::Vector { components, width } => {
+                        format!(
+                            "    {} {}[{}];{}\n",
+                            width.c_ty(), f.name, components, offset_comment
+                        )
+                    }
+                    FieldKind::Matrix { rows, cols, width } => {
+                        format!(
+                            "    {} {}[{}][{}];{}\n",
+                            width.c_ty(), f.name, rows, cols, offset_comment
+                        )
+                    }
                 };
                 out.push_str(&line);
             }
