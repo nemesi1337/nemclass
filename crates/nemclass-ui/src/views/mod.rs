@@ -927,6 +927,12 @@ impl NemclassApp {
         self.dock_state = Some(DockState::new(vec![TabKind::Disassembly]));
     }
 
+    /// Debug/screenshot hook: navigate the disassembler to `addr` — the path a
+    /// "Disassemble here" click takes, which must keep the code around it.
+    pub fn debug_goto_disasm(&mut self, addr: usize) {
+        self.disassembly_panel.goto(addr);
+    }
+
     /// Debug/screenshot hook: maximize the Navigator tab.
     pub fn debug_solo_navigator(&mut self) {
         self.dock_state = Some(DockState::new(vec![TabKind::Navigator]));

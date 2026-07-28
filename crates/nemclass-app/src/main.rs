@@ -9,6 +9,10 @@
 //! few frames, captures the framebuffer to a binary PPM, and exits. It doubles
 //! as a render verification (proves the dock layout builds and draws without
 //! panicking) and a way to produce a visual of the current UI.
+//!
+//! With `--attach <pid|self>` it captures a live view: `--module <substr>`
+//! browses that module, `--goto <hex>` navigates to an address, and `--dissect`
+//! runs a cross-reference scan and shows the Navigator instead.
 
 // On Windows release builds, suppress the console window that would otherwise
 // flash when the app starts.  On non-Windows this attribute is silently ignored.
@@ -65,6 +69,9 @@ struct ScreenshotConfig {
     backend: String,
     /// Module name substring to disassemble after attaching.
     module: Option<String>,
+    /// Address to navigate the disassembler to after attaching (hex, `0x`
+    /// optional) — captures the "go to address" view with its context.
+    goto: Option<usize>,
     /// Run a dissect and show the Navigator (rather than the disassembler).
     dissect: bool,
 }
@@ -90,6 +97,10 @@ impl ScreenshotConfig {
         });
         let backend = flag("--backend").unwrap_or_else(|| "linux-native".to_string());
         let module = flag("--module");
+        let goto = flag("--goto").and_then(|s| {
+            let s = s.trim_start_matches("0x").trim_start_matches("0X");
+            usize::from_str_radix(s, 16).ok()
+        });
         let dissect = args.iter().any(|a| a == "--dissect");
         Some(Self {
             path,
@@ -97,6 +108,7 @@ impl ScreenshotConfig {
             attach_pid,
             backend,
             module,
+            goto,
             dissect,
         })
     }
@@ -139,6 +151,9 @@ impl eframe::App for ScreenshotHarness {
                     self.inner.debug_dissect();
                     self.inner.debug_solo_navigator();
                 } else {
+                    if let Some(addr) = self.cfg.goto {
+                        self.inner.debug_goto_disasm(addr);
+                    }
                     self.inner.debug_solo_disasm();
                 }
             }

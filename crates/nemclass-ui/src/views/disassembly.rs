@@ -1,13 +1,22 @@
 //! Disassembly panel — a navigable disassembly for the attached process.
 //!
-//! Two modes:
-//! - **Function**: decode a single function from an entry point (stops at the
-//!   first `ret`/`int3`). This is what "Disassemble here" and the address bar do.
-//! - **Linear** (module): a continuous, *scrollable* disassembly of a module's
-//!   executable code. Decoding starts at the module's real `.text` regions (not
-//!   the ELF header) and grows incrementally as the user scrolls toward the
-//!   bottom — "infinite scroll" over the whole code, virtualized so even a
-//!   multi-megabyte module stays smooth.
+//! The listing is always *linear*: a continuous, scrollable run of instructions
+//! over the target's executable memory. Decoding starts at real `.text` regions
+//! (never an ELF header) and grows incrementally as the user scrolls toward the
+//! bottom — "infinite scroll" over the whole code, virtualized so even a
+//! multi-megabyte module stays smooth.
+//!
+//! Which code is browsable comes from the Modules panel's selection, plus any
+//! region pulled in on demand by navigation: following a call into an unselected
+//! module, or jumping to an address elsewhere, extends the browsable set instead
+//! of dead-ending.
+//!
+//! Navigating (address bar, "Disassemble here", a followed branch, the
+//! Navigator) **keeps the code around the target**. If the address is already
+//! decoded the listing is only scrolled; otherwise the session is rebuilt from a
+//! *back-synced* start a few hundred bytes earlier, so the instructions before
+//! and after the target are both on screen. The sync matters because x86 is
+//! variable-length — see [`nemclass_core::sync_backward_start`].
 //!
 //! Call/jump targets are clickable (and follow with SPACE); a right-click menu
 //! copies bytes, follows targets, sets the class base, adds an address node, or
@@ -30,19 +39,40 @@ use super::tasks::{BackgroundJob, Poll as JobPoll};
 use nemclass_core::Process;
 #[cfg(target_os = "linux")]
 use nemclass_core::{
-    DissectResult, FlowKind, InstructionData, ModuleInfoWithName, disassemble_function,
-    disassemble_range, dissect_regions, module_exec_regions,
+    DissectResult, FlowKind, InstructionData, ModuleInfoWithName, disassemble_range,
+    dissect_regions, module_exec_regions, sync_backward_start,
 };
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Default maximum bytes to read for a single function disassembly.
-const DEFAULT_MAX_BYTES: usize = 4096;
-
 /// Navigation history depth cap.
 const HISTORY_CAP: usize = 64;
+
+/// Bytes of code decoded *before* a navigation target, so the listing shows what
+/// leads up to it instead of starting abruptly at the address. Kept small enough
+/// that the back-sync search (up to this many candidate starts) stays sub-frame,
+/// while still yielding a screenful of preceding instructions.
+#[cfg(target_os = "linux")]
+const BACK_CONTEXT_BYTES: u64 = 512;
+
+/// The longest an x86 instruction can be.
+#[cfg(target_os = "linux")]
+const MAX_INSN_BYTES: usize = 15;
+
+/// Chunks decoded eagerly when re-centring, so the target itself is on screen in
+/// the same frame. Bounded — the infinite scroll takes over from there.
+#[cfg(target_os = "linux")]
+const RECENTER_MAX_CHUNKS: usize = 4;
+
+/// Span browsed around an address that belongs to no loaded module (JIT code, an
+/// anonymous executable mapping): there is no module span to clip to, so the
+/// session is bounded by hand. Reads past the mapping simply come up short.
+#[cfg(target_os = "linux")]
+const ADHOC_REGION_BACK: u64 = 4 * 1024;
+#[cfg(target_os = "linux")]
+const ADHOC_REGION_FORWARD: u64 = 64 * 1024;
 
 /// Bytes decoded per "extend" step in linear mode. The session grows
 /// incrementally as the user scrolls toward the bottom.
@@ -58,27 +88,6 @@ const LINEAR_EXTEND_ROWS: usize = 400;
 /// huge module); the user re-navigates to see beyond it.
 #[cfg(target_os = "linux")]
 const LINEAR_MAX_INSNS: usize = 400_000;
-
-// ---------------------------------------------------------------------------
-// Mode / cache
-// ---------------------------------------------------------------------------
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisasmMode {
-    /// Single-function view: decode from the entry point, stop at `ret`/`int3`.
-    Function,
-    /// Module view: continuous, scrollable linear disassembly of the code.
-    Linear,
-}
-
-/// Cached single-function disassembly (Function mode).
-#[cfg(target_os = "linux")]
-struct DisasmCache {
-    addr: usize,
-    instructions: Vec<InstructionData>,
-    entry_symbol: Option<String>,
-}
 
 // ---------------------------------------------------------------------------
 // DisassemblyPanel
@@ -101,11 +110,10 @@ pub struct DisassemblyPanel {
     /// ascending indices into `modules`. Driven by the Modules panel.
     #[cfg(target_os = "linux")]
     selected_modules: Vec<usize>,
-    #[cfg(target_os = "linux")]
-    mode: DisasmMode,
-    /// Executable `(start, end)` regions of the module being browsed, sorted.
-    /// Linear decoding walks these and skips non-executable gaps (ELF headers,
-    /// data) so the view starts at real code, not zero padding.
+    /// Browsable executable `(start, end)` regions, sorted and non-overlapping.
+    /// Seeded from the selected modules and extended on demand when navigation
+    /// lands outside them. Linear decoding walks these and skips non-executable
+    /// gaps (ELF headers, data) so the view shows real code, not zero padding.
     #[cfg(target_os = "linux")]
     linear_regions: Vec<(u64, u64)>,
     /// Instructions decoded so far this linear session — grows as the user
@@ -136,14 +144,17 @@ pub struct DisassemblyPanel {
     #[cfg(target_os = "linux")]
     dissect_epoch: u64,
 
-    // ── function-mode cache ───────────────────────────────────────────────
+    /// Symbol at the current focus address, for the "This is: …" label.
     #[cfg(target_os = "linux")]
-    cache: Option<DisasmCache>,
+    entry_symbol: Option<String>,
 
-    max_bytes: usize,
     pub status_msg: Option<String>,
 
     // ── per-frame deferred state ──────────────────────────────────────────
+    /// Address to bring into view; resolved at the top of the next draw, where
+    /// the `Process` needed to decode around it is in hand.
+    #[cfg(target_os = "linux")]
+    pending_focus: Option<usize>,
     pending_navigate: Option<usize>,
     selected_row: Option<usize>,
     /// When set, the table scrolls this row into view next frame.
@@ -179,8 +190,6 @@ impl DisassemblyPanel {
             #[cfg(target_os = "linux")]
             selected_modules: Vec::new(),
             #[cfg(target_os = "linux")]
-            mode: DisasmMode::Function,
-            #[cfg(target_os = "linux")]
             linear_regions: Vec::new(),
             #[cfg(target_os = "linux")]
             linear_insns: Vec::new(),
@@ -197,9 +206,10 @@ impl DisassemblyPanel {
             #[cfg(target_os = "linux")]
             dissect_epoch: 0,
             #[cfg(target_os = "linux")]
-            cache: None,
-            max_bytes: DEFAULT_MAX_BYTES,
+            entry_symbol: None,
             status_msg: None,
+            #[cfg(target_os = "linux")]
+            pending_focus: None,
             pending_navigate: None,
             selected_row: None,
             scroll_to_row: None,
@@ -304,7 +314,6 @@ impl DisassemblyPanel {
     #[cfg(target_os = "linux")]
     fn reset_state(&mut self) {
         self.selected_modules.clear();
-        self.mode = DisasmMode::Function;
         self.linear_regions.clear();
         self.linear_insns.clear();
         self.linear_next = None;
@@ -313,9 +322,10 @@ impl DisassemblyPanel {
         // Discard any in-flight dissect so a stale result can't land post-detach.
         self.dissect_job = BackgroundJob::default();
         self.pending_dissect = false;
-        self.cache = None;
+        self.entry_symbol = None;
         self.selected_row = None;
         self.scroll_to_row = None;
+        self.pending_focus = None;
         self.pending_signature = None;
         self.last_signature = None;
     }
@@ -324,12 +334,9 @@ impl DisassemblyPanel {
     // Public navigation API (called from other panels)
     // -----------------------------------------------------------------------
 
-    /// Navigate to `addr` in single-function mode (used by "Disassemble here").
+    /// Navigate to `addr`, keeping the code around it (used by "Disassemble
+    /// here", the Navigator, and the memory viewer).
     pub fn goto(&mut self, addr: usize) {
-        #[cfg(target_os = "linux")]
-        {
-            self.mode = DisasmMode::Function;
-        }
         if self.address != 0 && self.address != addr {
             self.push_back(self.address);
         }
@@ -355,30 +362,20 @@ impl DisassemblyPanel {
         self.forward.push(addr);
     }
 
-    /// Move the focus address, updating the view: in Function mode this triggers
-    /// a re-decode of the function; in Linear mode it scrolls to the address if
-    /// already decoded, else restarts the linear session there.
+    /// Move the focus address. The view update itself needs the `Process` (to
+    /// decode around the address), so it is deferred to the next draw via
+    /// [`Self::focus_now`].
     fn set_focus(&mut self, addr: usize) {
         self.address = addr;
         self.address_input = format!("{addr:#018x}");
         self.address_error = None;
         self.selected_row = None;
+        // A decode error from wherever we were is stale now.
+        self.status_msg = None;
 
         #[cfg(target_os = "linux")]
-        match self.mode {
-            DisasmMode::Function => {
-                if self.cache.as_ref().map(|c| c.addr) != Some(addr) {
-                    self.cache = None;
-                }
-            }
-            DisasmMode::Linear => {
-                if let Some(idx) = self.linear_index_of(addr as u64) {
-                    self.scroll_to_row = Some(idx);
-                } else {
-                    self.linear_reset(addr as u64);
-                    self.scroll_to_row = Some(0);
-                }
-            }
+        {
+            self.pending_focus = Some(addr);
         }
     }
 
@@ -413,24 +410,10 @@ impl DisassemblyPanel {
             s.parse::<usize>().map_err(|e| e.to_string())
         };
         match result {
+            // Go navigates *within* the listing, keeping the surrounding
+            // disassembly. An address outside the browsed regions is not an
+            // error — the region is discovered on demand (see `ensure_region_for`).
             Ok(addr) => {
-                // In linear mode, Go navigates *within* the listing (keeping the
-                // surrounding disassembly) rather than collapsing to a single
-                // function — but only for addresses inside a selected code region.
-                #[cfg(target_os = "linux")]
-                if self.mode == DisasmMode::Linear {
-                    if self.region_of(addr as u64).is_some() {
-                        self.address_error = None;
-                        self.navigate(addr);
-                    } else {
-                        self.address_error = Some(format!(
-                            "Address {addr:#x} is not in a selected module's code region"
-                        ));
-                    }
-                    return;
-                }
-                // Function mode (the default before any module is selected):
-                // decode the single function at `addr`.
                 self.address_error = None;
                 self.navigate(addr);
             }
@@ -442,10 +425,10 @@ impl DisassemblyPanel {
     // Linear-mode engine (Linux-only)
     // -----------------------------------------------------------------------
 
-    /// Enter linear mode over `indices` (into `modules`): union every selected
-    /// module's executable regions into one address-sorted list and start decoding
-    /// at the first one (real `.text`, never an ELF header). The Modules panel
-    /// calls this whenever its checkbox selection changes.
+    /// Browse `indices` (into `modules`): union every selected module's
+    /// executable regions into one address-sorted list and start decoding at the
+    /// first one (real `.text`, never an ELF header). The Modules panel calls
+    /// this whenever its checkbox selection changes.
     #[cfg(target_os = "linux")]
     pub fn set_selected_modules(&mut self, indices: &[usize], process: &Process) {
         self.selected_modules = indices.to_vec();
@@ -456,7 +439,9 @@ impl DisassemblyPanel {
         self.dissect = None;
         self.dissect_status = None;
 
-        // Union the executable regions of every selected module, sorted by start.
+        // Union the executable regions of every selected module. Regions
+        // discovered by earlier navigation are dropped: the selection defines
+        // the browsable set afresh.
         let pid = process.pid();
         let mut regions: Vec<(u64, u64)> = Vec::new();
         for &idx in &self.selected_modules {
@@ -464,35 +449,125 @@ impl DisassemblyPanel {
                 regions.extend(module_exec_regions(pid, m.base, m.size).unwrap_or_default());
             }
         }
-        regions.sort_unstable_by_key(|r| r.0);
+        merge_regions(&mut regions);
         self.linear_regions = regions;
+
+        // The previous session's instructions are no longer in the browsed set.
+        self.linear_insns.clear();
+        self.linear_next = None;
+        self.selected_row = None;
 
         // No modules selected → clear the view and leave a hint.
         if self.linear_regions.is_empty() {
-            self.mode = DisasmMode::Linear;
-            self.linear_insns.clear();
-            self.linear_next = None;
-            self.selected_row = None;
             return;
         }
-
-        self.mode = DisasmMode::Linear;
 
         if self.address != 0 {
             self.push_back(self.address);
         }
         self.forward.clear();
 
-        let start = self.linear_regions[0].0;
-        self.address = start as usize;
+        // Decode immediately so the view is populated this frame.
+        let start = self.linear_regions[0].0 as usize;
+        self.address = start;
         self.address_input = format!("{start:#018x}");
         self.address_error = None;
-        self.selected_row = None;
-        self.linear_reset(start);
-        self.scroll_to_row = Some(0);
+        self.focus_now(process, start);
+    }
 
-        // Decode the first chunk immediately so the view is populated this frame.
-        self.extend_linear(process);
+    /// Brings `addr` into view, **keeping the code around it**.
+    ///
+    /// Already decoded in this session → the listing is untouched and merely
+    /// scrolled, so everything before and after stays put. Otherwise the session
+    /// restarts from a back-synced start (see [`Self::back_context_start`]) far
+    /// enough ahead of `addr` that the instructions leading up to it are decoded
+    /// too, and enough chunks are pulled to put `addr` itself on screen now.
+    #[cfg(target_os = "linux")]
+    fn focus_now(&mut self, process: &Process, addr: usize) {
+        self.entry_symbol = process.resolve_symbol(addr).unwrap_or(None);
+
+        // Mark where we landed: with context on both sides the target is no
+        // longer simply the top row.
+        if let Some(idx) = self.linear_index_of(addr as u64) {
+            self.scroll_to_row = Some(idx);
+            self.selected_row = Some(idx);
+            return;
+        }
+
+        self.ensure_region_for(process, addr as u64);
+        let start = self.back_context_start(process, addr as u64);
+        self.linear_reset(start);
+        for _ in 0..RECENTER_MAX_CHUNKS {
+            self.extend_linear(process);
+            if self.linear_next.is_none() || self.linear_index_of(addr as u64).is_some() {
+                break;
+            }
+        }
+        // A decode that never reached `addr` (unreadable code, a desync) still
+        // shows the window we did get, from the top.
+        let row = self.linear_index_of(addr as u64);
+        self.scroll_to_row = Some(row.unwrap_or(0));
+        self.selected_row = row;
+    }
+
+    /// Where to start decoding so the listing shows real code *before* `addr`.
+    ///
+    /// x86 is variable-length, so a window that simply begins `BACK_CONTEXT_BYTES`
+    /// earlier would print garbage until it happened to re-sync. This reads that
+    /// window and asks the decoder which start actually steps onto `addr`; if
+    /// none does (or the bytes are unreadable), it falls back to `addr` itself —
+    /// no preceding context beats invented context.
+    #[cfg(target_os = "linux")]
+    fn back_context_start(&self, process: &Process, addr: u64) -> u64 {
+        // Never reach behind the region: that is unmapped or non-code.
+        let floor = self.region_of(addr).map_or(0, |(s, _)| s);
+        let lo = addr.saturating_sub(BACK_CONTEXT_BYTES).max(floor);
+        if lo >= addr {
+            return addr;
+        }
+        let len = (addr - lo) as usize;
+        // Over-read by one maximum-length instruction so the one *covering* the
+        // address (a hand-typed address is often mid-instruction) decodes whole.
+        let mut buf = vec![0u8; len + MAX_INSN_BYTES];
+        match process.read_buf(lo as usize, &mut buf) {
+            // Anything shorter than the run up to `addr` means the bytes next to
+            // it are missing, so nothing can sync onto it.
+            Ok(n) if n >= len => sync_backward_start(&buf[..n], lo, addr).unwrap_or(addr),
+            _ => addr,
+        }
+    }
+
+    /// Makes sure `addr` falls inside a browsable region, discovering one if it
+    /// does not — following a call into an unselected module, or jumping to an
+    /// address outside the selection, should widen the view rather than fail.
+    #[cfg(target_os = "linux")]
+    fn ensure_region_for(&mut self, process: &Process, addr: u64) {
+        if self.region_of(addr).is_some() {
+            return;
+        }
+
+        let a = addr as usize;
+        let owner = self
+            .modules
+            .iter()
+            .find(|m| a >= m.base && a < m.base + m.size)
+            .map(|m| (m.base, m.size));
+        let mut added = match owner {
+            Some((base, size)) => module_exec_regions(process.pid(), base, size).unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        // Not in any module's executable mapping (JIT, anonymous exec memory, or
+        // a module whose maps we could not read): browse a bounded window.
+        if !added.iter().any(|(s, e)| addr >= *s && addr < *e) {
+            added.push((
+                addr.saturating_sub(ADHOC_REGION_BACK),
+                addr.saturating_add(ADHOC_REGION_FORWARD),
+            ));
+        }
+
+        self.linear_regions.append(&mut added);
+        merge_regions(&mut self.linear_regions);
     }
 
     /// The executable region containing `addr`, if any.
@@ -658,35 +733,6 @@ impl DisassemblyPanel {
     }
 
     // -----------------------------------------------------------------------
-    // Function-mode decode
-    // -----------------------------------------------------------------------
-
-    #[cfg(target_os = "linux")]
-    fn ensure_function_disasm(&mut self, process: &Process) {
-        if self.mode != DisasmMode::Function || self.address == 0 {
-            return;
-        }
-        if self.cache.as_ref().map(|c| c.addr) == Some(self.address) {
-            return;
-        }
-        match disassemble_function(process, self.address as u64, self.max_bytes) {
-            Ok(d) => {
-                let entry_symbol = process.resolve_symbol(self.address).unwrap_or(None);
-                self.cache = Some(DisasmCache {
-                    addr: self.address,
-                    instructions: d.instructions,
-                    entry_symbol,
-                });
-                self.status_msg = None;
-            }
-            Err(e) => {
-                self.cache = None;
-                self.status_msg = Some(format!("Disassembly failed: {e}"));
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Draw
     // -----------------------------------------------------------------------
 
@@ -724,7 +770,11 @@ impl DisassemblyPanel {
         };
         let process: &Process = &proc_arc;
 
-        self.ensure_function_disasm(process);
+        // Resolve a navigation requested last frame (or by another panel) before
+        // drawing, so the target and its surroundings are on screen this frame.
+        if let Some(addr) = self.pending_focus.take() {
+            self.focus_now(process, addr);
+        }
         self.show_top_bar(ui, process);
         ui.separator();
         self.handle_keyboard(ui);
@@ -762,6 +812,10 @@ impl DisassemblyPanel {
         if let Some(target) = self.pending_navigate.take() {
             self.navigate(target);
         }
+        // A focus queued during this frame is applied at the top of the next one.
+        if self.pending_focus.is_some() {
+            ui.ctx().request_repaint();
+        }
     }
 
     /// Keyboard: BACKSPACE = back, arrows move the selection, SPACE follows the
@@ -780,10 +834,10 @@ impl DisassemblyPanel {
             )
         });
 
-        let active_len = self.active_len();
+        let active_len = self.linear_insns.len();
         let space_target = self
             .selected_row
-            .and_then(|r| self.active_get(r))
+            .and_then(|r| self.linear_insns.get(r))
             .and_then(|ins| ins.target);
 
         if backspace {
@@ -810,23 +864,6 @@ impl DisassemblyPanel {
         }
     }
 
-    /// Number of instructions in the currently-active list (linear or function).
-    #[cfg(target_os = "linux")]
-    fn active_len(&self) -> usize {
-        match self.mode {
-            DisasmMode::Linear => self.linear_insns.len(),
-            DisasmMode::Function => self.cache.as_ref().map_or(0, |c| c.instructions.len()),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn active_get(&self, idx: usize) -> Option<&InstructionData> {
-        match self.mode {
-            DisasmMode::Linear => self.linear_insns.get(idx),
-            DisasmMode::Function => self.cache.as_ref().and_then(|c| c.instructions.get(idx)),
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Top bar
     // -----------------------------------------------------------------------
@@ -845,7 +882,7 @@ impl DisassemblyPanel {
             });
             ui.weak("— pick modules in the Modules panel");
 
-            let can_dissect = self.mode == DisasmMode::Linear && !self.selected_modules.is_empty();
+            let can_dissect = !self.selected_modules.is_empty();
             if ui
                 .add_enabled(can_dissect, egui::Button::new("Dissect"))
                 .on_hover_text(
@@ -857,7 +894,7 @@ impl DisassemblyPanel {
                 dissect_clicked = true;
             }
 
-            if self.mode == DisasmMode::Linear {
+            if !self.linear_insns.is_empty() {
                 let n = self.linear_insns.len();
                 let more = if self.linear_next.is_some() { "+" } else { "" };
                 ui.separator();
@@ -901,7 +938,7 @@ impl DisassemblyPanel {
             if let Some(err) = &self.address_error {
                 ui.colored_label(Color32::RED, err);
             }
-            if let Some(sym) = self.cache.as_ref().and_then(|c| c.entry_symbol.as_deref()) {
+            if let Some(sym) = self.entry_symbol.as_deref() {
                 ui.separator();
                 ui.colored_label(Color32::from_rgb(100, 200, 100), format!("This is: {sym}"));
             }
@@ -920,8 +957,6 @@ impl DisassemblyPanel {
 
     #[cfg(target_os = "linux")]
     fn show_table(&mut self, ui: &mut egui::Ui, process: &Process) {
-        let is_linear = self.mode == DisasmMode::Linear;
-
         // Actions collected during the (borrow-free-of-self) table draw.
         let mut nav_target: Option<usize> = None;
         let mut new_selection: Option<usize> = None;
@@ -930,30 +965,23 @@ impl DisassemblyPanel {
         let mut copy_text: Option<String> = None;
         let mut pending_sig_addr: Option<usize> = None;
         let mut max_visible: usize = 0;
-        let len = self.active_len();
+        let len = self.linear_insns.len();
 
         {
             // Disjoint field borrows: `insns`/`dissect` (shared) coexist with the
             // `scroll_to_row.take()` (mut, different field) because they are all
             // direct field paths.
-            let insns: &[InstructionData] = match self.mode {
-                DisasmMode::Linear => &self.linear_insns,
-                DisasmMode::Function => self
-                    .cache
-                    .as_ref()
-                    .map(|c| c.instructions.as_slice())
-                    .unwrap_or(&[]),
-            };
+            let insns: &[InstructionData] = &self.linear_insns;
             let dissect = self.dissect.as_ref();
             let modules: &[ModuleInfoWithName] = &self.modules;
             let selected_row = self.selected_row;
             let scroll_to = self.scroll_to_row.take();
 
             if insns.is_empty() {
-                if is_linear {
-                    ui.weak("Decoding…");
-                } else if self.address == 0 {
+                if self.linear_regions.is_empty() {
                     ui.label("Select modules in the Modules panel, or enter an address, to disassemble.");
+                } else if self.linear_next.is_some() {
+                    ui.weak("Decoding…");
                 } else {
                     ui.label("No instructions decoded.");
                 }
@@ -1206,14 +1234,12 @@ impl DisassemblyPanel {
             }
             if ok {
                 self.status_msg = Some(format!("Wrote {l} NOP byte(s) at {addr:#x}"));
-                // Re-decode the patched bytes.
-                match self.mode {
-                    DisasmMode::Function => self.cache = None,
-                    DisasmMode::Linear => {
-                        let focus = self.address as u64;
-                        self.linear_reset(focus);
-                    }
-                }
+                // Drop the session so the focus rebuilds it from the patched
+                // bytes (a plain re-focus would just scroll the stale listing).
+                self.linear_insns.clear();
+                self.linear_next = None;
+                self.pending_focus = Some(self.address);
+                ui.ctx().request_repaint();
             } else {
                 self.status_msg = Some(format!("NOP write failed at {addr:#x}"));
             }
@@ -1256,10 +1282,7 @@ impl DisassemblyPanel {
         }
 
         // ── infinite scroll: decode more as the viewport nears the end ─────
-        if is_linear
-            && self.linear_next.is_some()
-            && (len == 0 || max_visible + LINEAR_EXTEND_ROWS >= len)
-        {
+        if self.linear_next.is_some() && (len == 0 || max_visible + LINEAR_EXTEND_ROWS >= len) {
             self.extend_linear(process);
             ui.ctx().request_repaint();
         }
@@ -1317,6 +1340,23 @@ fn merge_dissect(into: &mut DissectResult, from: DissectResult) {
     into.string_previews.extend(from.string_previews);
 }
 
+/// Sorts `regions` by start and coalesces touching/overlapping ones, so the
+/// browsable set stays a partition: `region_of` then has exactly one answer and
+/// the linear walk cannot decode the same bytes twice at a seam.
+#[cfg(target_os = "linux")]
+fn merge_regions(regions: &mut Vec<(u64, u64)>) {
+    regions.retain(|(s, e)| s < e);
+    regions.sort_unstable_by_key(|(s, _)| *s);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(regions.len());
+    for (start, end) in regions.drain(..) {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    *regions = merged;
+}
+
 /// Basename of the module containing `addr`, if any. Binary-searches the
 /// base-sorted `modules` slice so the Module table column is cheap per row.
 #[cfg(target_os = "linux")]
@@ -1343,5 +1383,80 @@ fn flow_color(kind: FlowKind, default: Color32) -> Color32 {
 impl Default for DisassemblyPanel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Navigation keeps the code *around* the target — the property that "go to
+/// address" / "Disassemble here" used to lose by collapsing the listing to a
+/// single function starting at the address.
+#[cfg(all(test, target_os = "linux"))]
+mod navigation_tests {
+    use super::*;
+    use nemclass_core::MockMemoryBackend;
+
+    const BASE: usize = 0x1_0000;
+    const TARGET: usize = BASE + 0x800;
+
+    /// A page of `nop`s with a recognisable 3-byte instruction at [`TARGET`],
+    /// served at [`BASE`]. There is no `/proc/1/maps` we can read, so the panel
+    /// falls back to its ad-hoc browsing window — the same path a JIT address
+    /// takes.
+    fn panel_focused_on_target() -> (DisassemblyPanel, Process) {
+        let mut bytes = vec![0x90u8; 0x1000];
+        bytes[0x800..0x803].copy_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+        let process = Process::from_backend_for_test(1, Box::new(MockMemoryBackend::new(BASE, bytes)));
+
+        let mut panel = DisassemblyPanel::new();
+        panel.goto(TARGET);
+        let addr = panel.pending_focus.take().expect("goto queues a focus");
+        panel.focus_now(&process, addr);
+        (panel, process)
+    }
+
+    #[test]
+    fn navigating_to_an_address_decodes_the_code_before_it() {
+        let (panel, _process) = panel_focused_on_target();
+
+        let idx = panel
+            .linear_index_of(TARGET as u64)
+            .expect("the target itself should be decoded");
+
+        assert!(idx > 0, "expected preceding context, target is the first row");
+        assert_eq!(
+            panel.scroll_to_row,
+            Some(idx),
+            "the target row is what gets scrolled into view"
+        );
+
+        // The context is *sequential*: the row above ends exactly where the
+        // target begins (a desynced back-window would not line up).
+        let prev = &panel.linear_insns[idx - 1];
+        assert_eq!(prev.address + prev.length as u64, TARGET as u64);
+
+        // …and the code after the target is there too, not cut off at a `ret`.
+        assert!(
+            panel.linear_insns.len() > idx + 1,
+            "expected instructions after the target"
+        );
+    }
+
+    #[test]
+    fn navigating_within_the_listing_keeps_it_intact() {
+        let (mut panel, process) = panel_focused_on_target();
+        let first = panel.linear_insns[0].address;
+        let count = panel.linear_insns.len();
+
+        // A second hop to an address already on screen must scroll, not re-decode:
+        // re-decoding is what threw away the surrounding disassembly.
+        panel.goto(TARGET + 0x20);
+        let addr = panel.pending_focus.take().expect("goto queues a focus");
+        panel.focus_now(&process, addr);
+
+        assert_eq!(panel.linear_insns[0].address, first, "listing was rebuilt");
+        assert_eq!(panel.linear_insns.len(), count, "listing was rebuilt");
+        assert_eq!(
+            panel.scroll_to_row,
+            panel.linear_index_of((TARGET + 0x20) as u64)
+        );
     }
 }
