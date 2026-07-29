@@ -29,6 +29,7 @@ mod script_host;
 mod script_log;
 mod scripts_panel;
 mod host_api_impl;
+mod node_edit;
 mod pointer_scan_panel;
 mod spider_panel;
 pub(crate) mod cheat_table_panel;
@@ -46,6 +47,9 @@ use scripts_panel::{ScriptsPanel, ScriptsPanelAction};
 use pointer_scan_panel::{PointerScanPanel, PointerScanAction};
 use spider_panel::{SpiderPanel, SpiderAction};
 use cheat_table_panel::{CheatTablePanel, CheatTablePanelAction};
+use node_edit::{
+    EditHistory, NodeEditOp, NodeRef, Selection, TYPE_GROUPS,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -120,6 +124,9 @@ struct NodeSnapshot {
     /// Component width for vector/matrix nodes; `None` for everything else.
     /// Carried so the UI can write an edited component back at the right size.
     float_width: Option<FloatWidth>,
+    /// The node's `hidden` flag — the row is still drawn, but dimmed, so a
+    /// hidden field can be found and unhidden.
+    hidden: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,22 +189,39 @@ enum ViewRow {
 // Node edit operations (deferred to after the table-draw closure)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-enum NodeEditOp {
-    ChangeType   { owner: Uuid, path: Vec<usize>, new_tag: &'static str },
-    Delete       { owner: Uuid, path: Vec<usize> },
-    /// Remove `count` consecutive nodes starting at `path` (the toolbar's
-    /// "Delete N fields"). Stops early at the end of the sibling list.
-    DeleteRange  { owner: Uuid, path: Vec<usize>, count: usize },
-    AddBytes     { owner: Uuid, path: Vec<usize>, count: usize },
-    InsertBytes  { owner: Uuid, path: Vec<usize>, count: usize },
-    /// Append `count` bytes of Hex filler at the end of the class body. Used by
-    /// the toolbar when no row is selected, so "Add 64" works on a fresh class.
-    AppendBytes  { owner: Uuid, count: usize },
-    SetName      { owner: Uuid, path: Vec<usize>, name: String },
-    SetComment   { owner: Uuid, path: Vec<usize>, comment: String },
-    SetPtrTarget { owner: Uuid, path: Vec<usize>, target: Option<Uuid> },
-    SetInstance  { owner: Uuid, path: Vec<usize>, target: Uuid },
+// ---------------------------------------------------------------------------
+// Toolbar actions
+// ---------------------------------------------------------------------------
+
+/// A class-toolbar button press, collected inside the layout closures and acted
+/// on once they have released the borrow on `self`.
+#[derive(Clone, Copy)]
+enum ToolbarAction {
+    Undo,
+    Redo,
+    Copy,
+    Cut,
+    Paste,
+    Hide,
+    Unhide,
+    DeleteSelection,
+    SelectAll,
+    ExtractClass,
+}
+
+/// A destructive project action held back until the user says what to do about
+/// unsaved changes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingDiscard {
+    New,
+    Open,
+}
+
+/// The "make a class out of these fields" prompt.
+struct ExtractClassState {
+    owner: Uuid,
+    paths: Vec<Vec<usize>>,
+    name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +409,29 @@ pub struct NemclassApp {
     /// The class-view row the user last clicked, as `(owner class, local path)`.
     /// This is what the class toolbar's Add/Insert/Delete/type buttons act on;
     /// with nothing selected they fall back to appending at the end of the class.
-    selected_node: Option<(Uuid, Vec<usize>)>,
+    /// Which class-view rows are selected. Replaces a single `Option`: every
+    /// ReClass "…Node(s)" action is plural, and changing eight rows to `Int32`
+    /// at once is the workflow the tool exists for.
+    selection: Selection,
+    /// The rows the class view drew last frame, in display order. Shift-click
+    /// and the arrow keys range over *this*, not over sibling indices, so a
+    /// range spanning an expanded container selects what the user can see.
+    visible_order: Vec<NodeRef>,
+    /// Whole-project snapshots for undo/redo.
+    history: EditHistory,
+    /// Nodes copied out of a class, ready to paste.
+    node_clipboard: Vec<nemclass_model::serialize::NodeDef>,
+    /// Set by every edit, cleared by a save. Drives the title-bar marker and
+    /// the prompt before New/Open discards work.
+    project_dirty: bool,
+    /// Substring filter for the class view; empty shows every row.
+    class_search: String,
+    /// Open "new class from selection" prompt, if any.
+    extract_class_dialog: Option<ExtractClassState>,
+    /// Whether the project's enum editor window is open.
+    enum_editor_open: bool,
+    /// A New/Open the user asked for while the project had unsaved changes.
+    pending_discard: Option<PendingDiscard>,
     /// Code-generator panel state (language choice + last generated output).
     generator_panel: GeneratorPanel,
 
@@ -653,7 +699,15 @@ impl NemclassApp {
             collapsed: HashSet::new(),
             expanded_ptrs: HashSet::new(),
             edit_state: None,
-            selected_node: None,
+            selection: Selection::default(),
+            visible_order: Vec::new(),
+            history: EditHistory::default(),
+            node_clipboard: Vec::new(),
+            project_dirty: false,
+            class_search: String::new(),
+            extract_class_dialog: None,
+            enum_editor_open: false,
+            pending_discard: None,
             generator_panel: GeneratorPanel::default(),
             dissect_len_text: "0x100".to_owned(),
             #[cfg(target_os = "linux")]
@@ -1222,6 +1276,11 @@ impl NemclassApp {
         self.clear_memory_state();
         self.last_snapshot = None;
         self.collapsed.clear();
+        self.selection.clear();
+        // A different project's history is not this project's history, and
+        // undoing into it would restore classes that no longer exist.
+        self.history.clear();
+        self.project_dirty = false;
 
         // Drop script-registered hotkeys/freezes from the previous project so
         // handlers referencing stale ids don't fire against the new one.
@@ -1286,6 +1345,7 @@ impl NemclassApp {
             save_project_to(&dir, &self.project, &self.node_registry)
                 .map_err(|e| format!("Save failed: {e}"))?;
             self.status_msg = Some(format!("Saved to {}", dir.display()));
+            self.project_dirty = false;
             Ok(())
         } else {
             // No project dir yet — route to the native Save As picker.
@@ -1304,6 +1364,7 @@ impl NemclassApp {
         let dir_display = dir.display().to_string();
         self.project_dir = Some(dir);
         self.status_msg = Some(format!("Saved to {dir_display}"));
+        self.project_dirty = false;
         Ok(())
     }
 
@@ -2013,6 +2074,13 @@ impl eframe::App for NemclassApp {
         self.show_class_picker(ui.ctx());
         self.show_add_bytes_dialog(ui.ctx());
         self.show_class_rename_modal(ui.ctx());
+        self.show_extract_class_dialog(ui.ctx());
+        self.show_enum_editor(ui.ctx());
+        self.show_unsaved_changes_prompt(ui.ctx());
+        // After the dialogs: a modal that has keyboard focus must get the
+        // keystroke, and `typing_in_a_text_field` only reports focus once the
+        // widget has been drawn this frame.
+        self.handle_class_view_keys(ui.ctx());
     }
 }
 
@@ -2028,13 +2096,16 @@ impl NemclassApp {
     fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             // Project name / path indicator.
+            // A leading dot is the conventional "there are unsaved changes"
+            // marker; without one the only way to know was to remember.
+            let marker = if self.project_dirty { "\u{2022} " } else { "" };
             let title = match &self.project_dir {
                 Some(dir) => format!(
-                    "{} — {}",
+                    "{marker}{} — {}",
                     self.project.name,
                     dir.display()
                 ),
-                None => format!("{} (unsaved)", self.project.name),
+                None => format!("{marker}{} (unsaved)", self.project.name),
             };
             ui.strong(&title);
 
@@ -2046,6 +2117,8 @@ impl NemclassApp {
             let mut do_open = false;
             let mut do_save = false;
             let mut do_save_as = false;
+            let mut do_import_rcnet = false;
+            let mut do_export_rcnet = false;
             let mut open_recent: Option<PathBuf> = None;
 
             ui.menu_button("File", |ui| {
@@ -2065,6 +2138,23 @@ impl NemclassApp {
                     do_save_as = true;
                     ui.close();
                 }
+                ui.separator();
+                if ui
+                    .button("Import ReClass.NET (.rcnet)…")
+                    .on_hover_text("Open a project saved by ReClass.NET")
+                    .clicked()
+                {
+                    do_import_rcnet = true;
+                    ui.close();
+                }
+                if ui
+                    .button("Export ReClass.NET (.rcnet)…")
+                    .on_hover_text("Write this project in ReClass.NET's format")
+                    .clicked()
+                {
+                    do_export_rcnet = true;
+                    ui.close();
+                }
                 // Recent projects submenu.
                 if !self.settings.recent_projects.is_empty() {
                     ui.separator();
@@ -2082,6 +2172,26 @@ impl NemclassApp {
             // View menu: toggle dock panels on/off and reset the layout.
             ui.menu_button("View", |ui| self.show_view_menu(ui));
 
+            ui.menu_button("Project", |ui| {
+                if ui.button("Enums…").clicked() {
+                    self.enum_editor_open = true;
+                    ui.close();
+                }
+                ui.separator();
+                let ptr_size = self.project.pointer_size();
+                ui.label("Target pointer width");
+                let mut chosen = ptr_size;
+                ui.radio_value(&mut chosen, 8, "64-bit");
+                ui.radio_value(&mut chosen, 4, "32-bit");
+                if chosen != ptr_size {
+                    self.record_undo();
+                    if let Err(e) = self.project.set_pointer_size(chosen) {
+                        self.last_error = Some(e.to_string());
+                    }
+                    self.invalidate_class_view();
+                }
+            });
+
             // Apply the collected file action after the closures release `self`.
             if do_new {
                 self.pick_new_project();
@@ -2093,6 +2203,10 @@ impl NemclassApp {
                 }
             } else if do_save_as {
                 self.pick_save_as();
+            } else if do_import_rcnet {
+                self.pick_import_rcnet();
+            } else if do_export_rcnet {
+                self.pick_export_rcnet();
             } else if let Some(dir) = open_recent {
                 self.open_project_path(dir);
             }
@@ -2121,7 +2235,18 @@ impl NemclassApp {
     }
 
     /// New Project: pick a target directory, scaffold + load it there.
+    ///
+    /// Guarded on unsaved changes — this used to discard the open project
+    /// silently.
     fn pick_new_project(&mut self) {
+        if self.project_dirty {
+            self.pending_discard = Some(PendingDiscard::New);
+            return;
+        }
+        self.pick_new_project_now();
+    }
+
+    fn pick_new_project_now(&mut self) {
         if let Some(dir) = rfd::FileDialog::new()
             .set_title("New Project — choose a directory")
             .set_directory(self.dialog_start_dir())
@@ -2137,6 +2262,14 @@ impl NemclassApp {
     /// Open Project: pick a `project.nemclass` file (or, failing a filtered
     /// pick, a directory) and load it.
     fn pick_open_project(&mut self) {
+        if self.project_dirty {
+            self.pending_discard = Some(PendingDiscard::Open);
+            return;
+        }
+        self.pick_open_project_now();
+    }
+
+    fn pick_open_project_now(&mut self) {
         let picked = rfd::FileDialog::new()
             .set_title("Open Project — select project.nemclass")
             .set_directory(self.dialog_start_dir())
@@ -2196,6 +2329,7 @@ impl NemclassApp {
         // its borrow on `self` (the pattern used throughout this file).
         let mut do_resolve = false;
         let mut formula_changed = false;
+        let mut comment_changed = false;
         let resolved_active = self.script_resolved_base.is_some();
         let attached = self.process.is_some();
 
@@ -2240,6 +2374,19 @@ impl NemclassApp {
                     if ui.text_edit_singleline(&mut class.address_formula).changed() {
                         formula_changed = true;
                     }
+                    ui.strong("Comment:");
+                    // The field round-tripped through the project file and into
+                    // generated source, but nothing in the UI ever wrote it.
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut class.comment)
+                                .desired_width(160.0)
+                                .hint_text("class comment"),
+                        )
+                        .changed()
+                    {
+                        comment_changed = true;
+                    }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2250,7 +2397,11 @@ impl NemclassApp {
             });
         });
 
+        if comment_changed {
+            self.mark_project_dirty();
+        }
         if formula_changed {
+            self.mark_project_dirty();
             self.last_snapshot = None;
             self.class_base = None;
             // Editing the formula re-takes control from any script-resolved base.
@@ -2447,6 +2598,7 @@ impl NemclassApp {
             // Create an empty, auto-named class container; rename via double-click,
             // delete via the trash button (both below).
             if ui.button("+ Add class").on_hover_text("Create an empty class").clicked() {
+                self.record_undo();
                 let cls = blank_class(&self.project);
                 let uuid = cls.uuid;
                 self.project.add_class(cls);
@@ -2501,6 +2653,7 @@ impl NemclassApp {
         // Apply deferred class deletion (guarded against removing a class another
         // class still references) and open the rename modal.
         if let Some(uuid) = to_delete {
+            self.record_undo();
             match self.project.remove_class(&uuid) {
                 Ok(_) => {
                     if self.selected_class == Some(uuid) {
@@ -3208,6 +3361,10 @@ impl NemclassApp {
     fn accept_auto_dissect(&mut self) {
         let Some(preview) = self.dissect_preview.take() else { return; };
 
+        // Recorded first: accepting a dissect replaces the whole class body,
+        // which was previously irreversible.
+        self.record_undo();
+
         let mut live_nodes: Vec<Box<dyn Node>> = Vec::with_capacity(preview.defs.len());
         for def in preview.defs {
             match self.node_registry.deserialize_node(def) {
@@ -3330,19 +3487,22 @@ impl NemclassApp {
     // Central panel (memory table)
     // -----------------------------------------------------------------------
 
-    /// The class-view field toolbar: bulk add/insert/delete of bytes, plus
-    /// one-click type changes — the ReClass/yclass "top header".
+    /// The class-view field toolbar: bulk add/insert/delete of bytes, type
+    /// changes, clipboard and history — the ReClass/yclass "top header".
     ///
-    /// Everything here acts on [`Self::selected_node`] (click a row to set it).
-    /// With nothing selected, `Add` still works and appends to the end of the
-    /// class, so a brand-new empty class can be filled from here.
+    /// Everything acts on [`Self::selection`], which may hold many rows. With
+    /// nothing selected, `Add` still works and appends to the end of the class,
+    /// so a brand-new empty class can be filled from here.
     fn show_class_toolbar(&mut self, ui: &mut egui::Ui) {
         let Some(class_uuid) = self.selected_class else { return };
-        let selected = self.selected_node.clone();
-        let has_sel = selected.is_some();
+        let anchor = self.selection.anchor().cloned();
+        let has_sel = !self.selection.is_empty();
+        let sel_count = self.selection.len();
 
         // Collected inside the closures, applied once they release `self`.
-        let mut op: Option<NodeEditOp> = None;
+        let mut single_op: Option<NodeEditOp> = None;
+        let mut bulk_tag: Option<&'static str> = None;
+        let mut action: Option<ToolbarAction> = None;
 
         /// One-click type button, coloured by family like ReClass/yclass.
         fn type_button(
@@ -3364,11 +3524,28 @@ impl NemclassApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
 
+            if ui
+                .add_enabled(self.history.can_undo(), egui::Button::new("↶"))
+                .on_hover_text("Undo (Ctrl+Z)")
+                .clicked()
+            {
+                action = Some(ToolbarAction::Undo);
+            }
+            if ui
+                .add_enabled(self.history.can_redo(), egui::Button::new("↷"))
+                .on_hover_text("Redo (Ctrl+Shift+Z)")
+                .clicked()
+            {
+                action = Some(ToolbarAction::Redo);
+            }
+
+            ui.separator();
+
             ui.menu_button("Add", |ui| {
                 ui.set_width(76.0);
                 for n in [8usize, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
                     if ui.button(n.to_string()).clicked() {
-                        op = Some(match &selected {
+                        single_op = Some(match &anchor {
                             Some((owner, path)) => NodeEditOp::AddBytes {
                                 owner: *owner,
                                 path: path.clone(),
@@ -3392,8 +3569,8 @@ impl NemclassApp {
                 ui.set_width(76.0);
                 for n in [1usize, 2, 4, 8, 16, 64, 256, 1024] {
                     if ui.add_enabled(has_sel, egui::Button::new(n.to_string())).clicked() {
-                        if let Some((owner, path)) = &selected {
-                            op = Some(NodeEditOp::InsertBytes {
+                        if let Some((owner, path)) = &anchor {
+                            single_op = Some(NodeEditOp::InsertBytes {
                                 owner: *owner,
                                 path: path.clone(),
                                 count: n,
@@ -3410,11 +3587,19 @@ impl NemclassApp {
             .on_hover_text("Insert N bytes before the selected field");
 
             ui.menu_button("Delete", |ui| {
-                ui.set_width(76.0);
+                ui.set_width(96.0);
+                if ui
+                    .add_enabled(has_sel, egui::Button::new(format!("Selected ({sel_count})")))
+                    .clicked()
+                {
+                    action = Some(ToolbarAction::DeleteSelection);
+                    ui.close();
+                }
+                ui.separator();
                 for n in [1usize, 2, 4, 16, 64, 256, 1024] {
                     if ui.add_enabled(has_sel, egui::Button::new(n.to_string())).clicked() {
-                        if let Some((owner, path)) = &selected {
-                            op = Some(NodeEditOp::DeleteRange {
+                        if let Some((owner, path)) = &anchor {
+                            single_op = Some(NodeEditOp::DeleteRange {
                                 owner: *owner,
                                 path: path.clone(),
                                 count: n,
@@ -3428,21 +3613,16 @@ impl NemclassApp {
                 }
             })
             .response
-            .on_hover_text("Delete N fields starting at the selected one");
+            .on_hover_text("Delete the selection, or N fields from the selected one");
 
             ui.separator();
 
             // Type-change buttons. Each family gets one fill colour so the row
-            // is scannable at a glance.
+            // is scannable at a glance. Every one applies to the whole
+            // selection, not just the anchor.
             let mut change = |ui: &mut egui::Ui, label: &str, tag: &'static str, fill| {
-                if type_button(ui, label, fill, has_sel)
-                    && let Some((owner, path)) = &selected
-                {
-                    op = Some(NodeEditOp::ChangeType {
-                        owner: *owner,
-                        path: path.clone(),
-                        new_tag: tag,
-                    });
+                if type_button(ui, label, fill, has_sel) {
+                    bulk_tag = Some(tag);
                 }
             };
 
@@ -3474,60 +3654,130 @@ impl NemclassApp {
             change(ui, "H64", "Hex64", GRAY);
             ui.separator();
             change(ui, "Ptr", "Pointer", BROWN);
-            change(ui, "Str", "StrPtr", BROWN);
+            change(ui, "Str", "Utf8TextPtr", BROWN);
             ui.separator();
 
-            // Vector and matrix kinds carry a shape, so they get submenus
-            // rather than one button each.
-            ui.menu_button("Vec", |ui| {
-                ui.set_width(96.0);
-                for (tag, components, width) in VECTOR_SHAPES {
-                    let label = format!("Vec{components} {}", width.rust_ty());
-                    if ui.add_enabled(has_sel, egui::Button::new(label)).clicked() {
-                        if let Some((owner, path)) = &selected {
-                            op = Some(NodeEditOp::ChangeType {
+            // Everything else lives under one menu, grouped by family. Before
+            // this the menu offered scalars, vectors and matrices only, so
+            // Array, the text types, VTable and Function existed in the model
+            // and in saved projects but were unreachable from the UI.
+            ui.menu_button("Type ▸", |ui| {
+                ui.set_width(190.0);
+                for group in TYPE_GROUPS {
+                    ui.menu_button(format!("{} ▸", group.label), |ui| {
+                        for (label, tag) in group.types {
+                            if ui.add_enabled(has_sel, egui::Button::new(*label)).clicked() {
+                                bulk_tag = Some(tag);
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+                ui.menu_button("Vector ▸", |ui| {
+                    for (tag, components, width) in VECTOR_SHAPES {
+                        let label = format!("Vec{components} {}", width.rust_ty());
+                        if ui.add_enabled(has_sel, egui::Button::new(label)).clicked() {
+                            bulk_tag = Some(tag);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Matrix ▸", |ui| {
+                    for (tag, rows, cols, width) in MATRIX_SHAPES {
+                        let label = format!("Mat{rows}x{cols} {}", width.rust_ty());
+                        if ui.add_enabled(has_sel, egui::Button::new(label)).clicked() {
+                            bulk_tag = Some(tag);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+                if ui.add_enabled(has_sel, egui::Button::new("Class instance…")).clicked() {
+                    if let Some((owner, path)) = &anchor {
+                        self.class_picker = Some(ClassPickerState {
+                            filter: String::new(),
+                            purpose: PickerPurpose::ChangeToInstance {
                                 owner: *owner,
                                 path: path.clone(),
-                                new_tag: tag,
-                            });
-                        }
-                        ui.close();
+                            },
+                        });
                     }
+                    ui.close();
                 }
                 if !has_sel {
                     ui.weak("select a field first");
                 }
             });
 
-            ui.menu_button("Mat", |ui| {
-                ui.set_width(112.0);
-                for (tag, rows, cols, width) in MATRIX_SHAPES {
-                    let label = format!("Mat{rows}x{cols} {}", width.rust_ty());
-                    if ui.add_enabled(has_sel, egui::Button::new(label)).clicked() {
-                        if let Some((owner, path)) = &selected {
-                            op = Some(NodeEditOp::ChangeType {
-                                owner: *owner,
-                                path: path.clone(),
-                                new_tag: tag,
-                            });
-                        }
-                        ui.close();
-                    }
+            ui.separator();
+
+            ui.menu_button("Edit ▸", |ui| {
+                ui.set_width(200.0);
+                if ui.add_enabled(has_sel, egui::Button::new("Copy\t\tCtrl+C")).clicked() {
+                    action = Some(ToolbarAction::Copy);
+                    ui.close();
                 }
-                if !has_sel {
-                    ui.weak("select a field first");
+                if ui.add_enabled(has_sel, egui::Button::new("Cut\t\tCtrl+X")).clicked() {
+                    action = Some(ToolbarAction::Cut);
+                    ui.close();
+                }
+                let can_paste = !self.node_clipboard.is_empty();
+                if ui.add_enabled(can_paste, egui::Button::new("Paste\t\tCtrl+V")).clicked() {
+                    action = Some(ToolbarAction::Paste);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add_enabled(has_sel, egui::Button::new("Hide")).clicked() {
+                    action = Some(ToolbarAction::Hide);
+                    ui.close();
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Unhide")).clicked() {
+                    action = Some(ToolbarAction::Unhide);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Make class from selection…"))
+                    .clicked()
+                {
+                    action = Some(ToolbarAction::ExtractClass);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Select all\tCtrl+A").clicked() {
+                    action = Some(ToolbarAction::SelectAll);
+                    ui.close();
                 }
             });
+
+            ui.separator();
+            ui.label("🔍");
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.class_search)
+                    .desired_width(110.0)
+                    .hint_text("filter fields"),
+            );
+            if search.changed() && !self.class_search.is_empty() {
+                // A filtered-out row must not stay selected: the next bulk
+                // action would hit a field the user can no longer see.
+                self.selection.clear();
+            }
 
             // Selection indicator — without it, the disabled buttons above look
             // broken rather than "nothing is selected".
             ui.separator();
-            match &selected {
-                Some((owner, path)) => {
-                    let name = self
-                        .node_snapshots
-                        .iter()
-                        .find(|s| s.owner_class == *owner && s.local_path == *path)
+            match sel_count {
+                0 => {
+                    ui.weak("click a field to select it");
+                }
+                1 => {
+                    let name = anchor
+                        .as_ref()
+                        .and_then(|(owner, path)| {
+                            self.node_snapshots
+                                .iter()
+                                .find(|s| s.owner_class == *owner && s.local_path == *path)
+                        })
                         .map(|s| {
                             if s.name.is_empty() {
                                 format!("<{}>", s.type_tag)
@@ -3538,19 +3788,163 @@ impl NemclassApp {
                         .unwrap_or_else(|| "(field)".to_owned());
                     ui.label(format!("→ {name}"));
                 }
-                None => {
-                    ui.weak("click a field to select it");
+                n => {
+                    ui.label(format!("→ {n} fields"));
                 }
             }
         });
 
-        if let Some(op) = op {
-            // A range delete can invalidate the selected path, so drop the
-            // selection rather than leaving it pointing at a shifted field.
-            if matches!(op, NodeEditOp::DeleteRange { .. }) {
-                self.selected_node = None;
+        if let Some(tag) = bulk_tag {
+            self.apply_to_selection(move |owner, path| NodeEditOp::ChangeType {
+                owner,
+                path,
+                new_tag: tag,
+            });
+        }
+
+        if let Some(action) = action {
+            match action {
+                ToolbarAction::Undo => self.undo(),
+                ToolbarAction::Redo => self.redo(),
+                ToolbarAction::Copy => self.copy_selection(),
+                ToolbarAction::Cut => self.cut_selection(),
+                ToolbarAction::Paste => self.paste_clipboard(),
+                ToolbarAction::Hide => self.set_selection_hidden(true),
+                ToolbarAction::Unhide => self.set_selection_hidden(false),
+                ToolbarAction::DeleteSelection => self.delete_selection(),
+                ToolbarAction::SelectAll => {
+                    let order = self.visible_order.clone();
+                    self.selection.select_all(&order);
+                }
+                ToolbarAction::ExtractClass => self.begin_extract_class(),
             }
+        }
+
+        if let Some(op) = single_op {
             self.apply_node_edit(op);
+        }
+    }
+
+    /// Open the "name the new class" prompt for the current selection.
+    fn begin_extract_class(&mut self) {
+        let Some(owner) = self.selected_class else { return };
+        let paths = self.selection.paths_descending(owner);
+        if paths.is_empty() {
+            return;
+        }
+        self.extract_class_dialog = Some(ExtractClassState {
+            owner,
+            paths,
+            name: "NewClass".to_string(),
+        });
+    }
+
+    /// The "make a class out of these fields" prompt.
+    fn show_extract_class_dialog(&mut self, ctx: &egui::Context) {
+        let Some(state) = &mut self.extract_class_dialog else { return };
+        let mut confirm = false;
+        let mut cancel = false;
+        let count = state.paths.len();
+
+        egui::Window::new("New class from selection")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Move {count} field(s) into a new class."));
+                ui.add_space(4.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut state.name).hint_text("class name"),
+                );
+                resp.request_focus();
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    confirm = true;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if confirm {
+            let state = self.extract_class_dialog.take().unwrap();
+            self.selection.clear();
+            self.apply_node_edit(NodeEditOp::ExtractClass {
+                owner: state.owner,
+                paths: state.paths,
+                name: state.name,
+            });
+        } else if cancel {
+            self.extract_class_dialog = None;
+        }
+    }
+
+    /// Keyboard shortcuts for the class view.
+    ///
+    /// Guarded on text focus throughout: a Delete pressed while renaming a
+    /// field belongs to the text box, not to the class.
+    fn handle_class_view_keys(&mut self, ctx: &egui::Context) {
+        if typing_in_a_text_field(ctx) || self.selected_class.is_none() {
+            return;
+        }
+
+        let (delete, up, down, shift, ctrl, copy, cut, paste, select_all, undo, redo, escape) =
+            ctx.input_mut(|i| {
+                (
+                    i.key_pressed(egui::Key::Delete),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.modifiers.shift,
+                    i.modifiers.command,
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::X),
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
+                    i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)
+                        || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y),
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+
+        if undo {
+            self.undo();
+        }
+        if redo {
+            self.redo();
+        }
+        if copy {
+            self.copy_selection();
+        }
+        if cut {
+            self.cut_selection();
+        }
+        if paste {
+            self.paste_clipboard();
+        }
+        if select_all {
+            let order = self.visible_order.clone();
+            self.selection.select_all(&order);
+        }
+        if delete {
+            self.delete_selection();
+        }
+        if escape {
+            self.selection.clear();
+        }
+        // Ctrl is the clipboard/history modifier; an arrow with it held is not
+        // a selection move.
+        if (up || down) && !ctrl {
+            let order = self.visible_order.clone();
+            self.selection.step(&order, if up { -1 } else { 1 }, shift);
         }
     }
 
@@ -3609,12 +4003,48 @@ impl NemclassApp {
         // `build_visible_rows`; after each expanded VTable/Function/FunctionPtr
         // we inject live child rows from the cache.  This leaves the static
         // flatten/collapse logic completely untouched.
-        let view_rows = build_augmented_rows(
+        let mut view_rows = build_augmented_rows(
             &self.node_snapshots,
             &self.collapsed,
             #[cfg(target_os = "linux")]
             &self.live_cache,
         );
+
+        // The search box filters rather than jumps: a `TableBuilder` body is
+        // virtualized, so "scroll to the next match" would have to drive the
+        // scroll offset by row index, while a filter needs nothing but this.
+        // Only snapshot rows are matched — live vtable/disassembly children
+        // belong to whichever parent survived.
+        if !self.class_search.trim().is_empty() {
+            let needle = self.class_search.trim().to_lowercase();
+            view_rows.retain(|row| match row {
+                ViewRow::Snap(i) => {
+                    let snap = &self.node_snapshots[*i];
+                    snap.name.to_lowercase().contains(&needle)
+                        || snap.type_tag.to_lowercase().contains(&needle)
+                        || snap.comment.to_lowercase().contains(&needle)
+                        || snap.rendered.value.to_lowercase().contains(&needle)
+                        || format!("{:x}", snap.offset).contains(&needle)
+                }
+                _ => false,
+            });
+        }
+
+        // Record what is on screen, in order: shift-click and the arrow keys
+        // range over the *visible* rows, and a selection pointing at a row that
+        // is no longer drawn would let a bulk action hit something invisible.
+        self.visible_order = view_rows
+            .iter()
+            .filter_map(|row| match row {
+                ViewRow::Snap(i) => {
+                    let snap = &self.node_snapshots[*i];
+                    Some((snap.owner_class, snap.local_path.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let visible_order = self.visible_order.clone();
+        self.selection.retain_visible(&visible_order);
 
         // Rows are a fixed height, so it must clear the *tallest* widget a row
         // can host — the collapse arrow and the inline text edit are both taller
@@ -3634,7 +4064,11 @@ impl NemclassApp {
 
         // Row the user clicked this frame, applied after the body closure ends.
         let mut clicked_row: Option<(Uuid, Vec<usize>)> = None;
-        let selected_node = self.selected_node.clone();
+        let selection = self.selection.clone();
+        // Read once: `ctx.input` inside the body closure would be a second
+        // borrow of the context the table already holds.
+        let (ctrl_held, shift_held) =
+            ui.input(|i| (i.modifiers.command, i.modifiers.shift));
 
         // Column widths matter more than they look: a resizable `TableBuilder`
         // hands each column its width in order and gives the last one whatever
@@ -3684,6 +4118,7 @@ impl NemclassApp {
                             let snap_local_path = snap.local_path.clone();
                             let components     = snap.components.clone();
                             let float_width    = snap.float_width;
+                            let hidden         = snap.hidden;
 
                             // For live-expandable nodes, we treat them as
                             // containers (has_children for collapse toggle) even
@@ -3700,16 +4135,30 @@ impl NemclassApp {
                             let is_vector = vector_shape(type_tag).is_some();
 
                             row.set_selected(
-                                selected_node.as_ref().is_some_and(|(o, p)| {
-                                    *o == snap_owner && *p == snap_local_path
-                                }),
+                                selection.contains(snap_owner, &snap_local_path),
                             );
 
                             let (_, r) = row.col(|ui| { mono_cell(ui, format!("0x{address:012X}")); });
                             let mut row_clicked = r.clicked();
                             let (_, r) = row.col(|ui| { mono_cell(ui, format!("+{offset:#06X}")); });
                             row_clicked |= r.clicked();
-                            let (_, r) = row.col(|ui| { text_cell(ui, type_tag); });
+                            // A hidden field keeps its row rather than
+                            // collapsing to a placeholder the way ReClass does:
+                            // the row is how you select it to unhide it again.
+                            let (_, r) = row.col(|ui| {
+                                if hidden {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{type_tag} (hidden)"))
+                                                .weak()
+                                                .italics(),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                } else {
+                                    text_cell(ui, type_tag)
+                                };
+                            });
                             row_clicked |= r.clicked();
                             if row_clicked {
                                 clicked_row = Some((snap_owner, snap_local_path.clone()));
@@ -4030,11 +4479,17 @@ impl NemclassApp {
         // Clicking a row makes it the toolbar's target; clicking the selected
         // row again clears the selection (so "Add bytes" goes back to appending).
         if let Some(hit) = clicked_row {
-            self.selected_node = if self.selected_node.as_ref() == Some(&hit) {
-                None
+            if shift_held {
+                self.selection.extend_to(hit, &visible_order);
+            } else if ctrl_held {
+                self.selection.toggle(hit);
+            } else if self.selection.len() == 1 && self.selection.contains(hit.0, &hit.1) {
+                // Clicking the only selected row again clears it, so "Add
+                // bytes" goes back to appending at the end of the class.
+                self.selection.clear();
             } else {
-                Some(hit)
-            };
+                self.selection.set_single(hit);
+            }
         }
 
         // Apply any pending disasm navigation collected during the draw phase.
@@ -4049,11 +4504,9 @@ impl NemclassApp {
             self.follow_pointer(addr, target_uuid);
         }
 
-        // Apply any deferred structural node edits (ChangeType, Delete, …).
-        let ops: Vec<NodeEditOp> = std::mem::take(&mut self.pending_node_edits);
-        for op in ops {
-            self.apply_node_edit(op);
-        }
+        // Apply any deferred structural node edits (ChangeType, Delete, …) as a
+        // single undo step — a multi-row change is one user action.
+        self.flush_pending_node_edits();
     }
 
     /// Opens a pointer's target: if the `PointerNode` names a target class, select
@@ -4099,37 +4552,35 @@ impl NemclassApp {
         value: &str,
         pointer_target: Option<Uuid>,
     ) {
-        ui.menu_button("Change type ▸", |ui| {
-            for &(label, tag) in &[
-                ("Hex 8",    "Hex8"),    ("Hex 16",  "Hex16"),
-                ("Hex 32",   "Hex32"),   ("Hex 64",  "Hex64"),
-                ("Int 8",    "Int8"),    ("Int 16",  "Int16"),
-                ("Int 32",   "Int32"),   ("Int 64",  "Int64"),
-                ("UInt 8",   "UInt8"),   ("UInt 16", "UInt16"),
-                ("UInt 32",  "UInt32"),  ("UInt 64", "UInt64"),
-                ("Float",    "Float"),   ("Double",  "Double"),
-                ("Bool",     "Bool"),    ("Pointer", "Pointer"),
-                ("Str Pointer", "StrPtr"),
-            ] {
-                if ui.button(label).clicked() {
-                    self.pending_node_edits.push(NodeEditOp::ChangeType {
-                        owner: snap_owner,
-                        path: snap_local_path.clone(),
-                        new_tag: tag,
-                    });
-                    ui.close();
-                }
+        // Right-clicking outside the selection acts on the row under the
+        // cursor; right-clicking inside it acts on the whole selection, which
+        // is what every list-with-multi-select does.
+        let in_selection = self.selection.contains(snap_owner, &snap_local_path);
+        if !in_selection {
+            self.selection.set_single((snap_owner, snap_local_path.clone()));
+        }
+        let count = self.selection.len().max(1);
+        let plural = if count > 1 { format!(" ({count})") } else { String::new() };
+
+        let mut bulk_tag: Option<&'static str> = None;
+
+        ui.menu_button(format!("Change type{plural} ▸"), |ui| {
+            for group in TYPE_GROUPS {
+                ui.menu_button(format!("{} ▸", group.label), |ui| {
+                    for (label, tag) in group.types {
+                        if ui.button(*label).clicked() {
+                            bulk_tag = Some(tag);
+                            ui.close();
+                        }
+                    }
+                });
             }
 
             ui.separator();
             ui.menu_button("Vector ▸", |ui| {
                 for (tag, components, width) in VECTOR_SHAPES {
                     if ui.button(format!("Vec{components} {}", width.rust_ty())).clicked() {
-                        self.pending_node_edits.push(NodeEditOp::ChangeType {
-                            owner: snap_owner,
-                            path: snap_local_path.clone(),
-                            new_tag: tag,
-                        });
+                        bulk_tag = Some(tag);
                         ui.close();
                     }
                 }
@@ -4137,11 +4588,7 @@ impl NemclassApp {
             ui.menu_button("Matrix ▸", |ui| {
                 for (tag, rows, cols, width) in MATRIX_SHAPES {
                     if ui.button(format!("Mat{rows}x{cols} {}", width.rust_ty())).clicked() {
-                        self.pending_node_edits.push(NodeEditOp::ChangeType {
-                            owner: snap_owner,
-                            path: snap_local_path.clone(),
-                            new_tag: tag,
-                        });
+                        bulk_tag = Some(tag);
                         ui.close();
                     }
                 }
@@ -4201,12 +4648,44 @@ impl NemclassApp {
             });
             ui.close();
         }
+
         ui.separator();
-        if ui.button("Delete").clicked() {
-            self.pending_node_edits.push(NodeEditOp::Delete {
-                owner: snap_owner,
-                path: snap_local_path.clone(),
-            });
+        if ui.button(format!("Copy{plural}\tCtrl+C")).clicked() {
+            self.copy_selection();
+            ui.close();
+        }
+        if ui.button(format!("Cut{plural}\tCtrl+X")).clicked() {
+            self.cut_selection();
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                !self.node_clipboard.is_empty(),
+                egui::Button::new("Paste\tCtrl+V"),
+            )
+            .clicked()
+        {
+            self.paste_clipboard();
+            ui.close();
+        }
+
+        ui.separator();
+        if ui.button(format!("Hide{plural}")).clicked() {
+            self.set_selection_hidden(true);
+            ui.close();
+        }
+        if ui.button(format!("Unhide{plural}")).clicked() {
+            self.set_selection_hidden(false);
+            ui.close();
+        }
+        if ui.button(format!("Make class from selection{plural}…")).clicked() {
+            self.begin_extract_class();
+            ui.close();
+        }
+
+        ui.separator();
+        if ui.button(format!("Delete{plural}\tDel")).clicked() {
+            self.delete_selection();
             ui.close();
         }
 
@@ -4247,6 +4726,14 @@ impl NemclassApp {
                 }
                 ui.close();
             }
+        }
+
+        if let Some(tag) = bulk_tag {
+            self.apply_to_selection(move |owner, path| NodeEditOp::ChangeType {
+                owner,
+                path,
+                new_tag: tag,
+            });
         }
     }
 
@@ -4440,119 +4927,306 @@ impl NemclassApp {
             && let Some((uuid, name)) = self.class_rename.take()
         {
             let name = name.trim().to_string();
-            if !name.is_empty()
-                && let Some(c) = self.project.get_class_mut(&uuid)
-            {
-                c.name = name;
+            if !name.is_empty() {
+                self.record_undo();
+                if let Some(c) = self.project.get_class_mut(&uuid) {
+                    c.name = name;
+                }
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Apply node edits
+    // ReClass.NET interop
     // -----------------------------------------------------------------------
 
-    fn apply_node_edit(&mut self, op: NodeEditOp) {
-        use nemclass_model::node::builtins::{ClassInstanceNode, PointerNode};
+    /// Import a `.rcnet`, replacing the open project.
+    fn pick_import_rcnet(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import ReClass.NET project")
+            .set_directory(self.dialog_start_dir())
+            .add_filter("ReClass.NET project", &["rcnet"])
+            .pick_file()
+        else {
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.last_error = Some(format!("Could not read {}: {e}", path.display()));
+                return;
+            }
+        };
+        match nemclass_model::rcnet::import(&bytes, &self.node_registry) {
+            Ok((mut project, report)) => {
+                // The archive carries no project name, so take the file's.
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    project.name = stem.to_string();
+                }
+                let class_count = project.classes_in_order().count();
+                // No directory: an imported project has not been saved as a
+                // nemclass project yet, and pointing `project_dir` at the
+                // `.rcnet`'s folder would make the next Save write a
+                // `project.nemclass` beside it without being asked.
+                self.replace_project(project, None);
+                self.project_dirty = true;
+                self.status_msg = Some(format!(
+                    "Imported {class_count} class(es) from {}",
+                    path.display()
+                ));
+                self.report_interop_notes("Import", &report.notes);
+            }
+            Err(e) => self.last_error = Some(format!("Import failed: {e}")),
+        }
+    }
 
-        let invalidate = |app: &mut NemclassApp| {
-            app.node_snapshots.clear();
-            app.mem_buf.clear();
-            app.edit_state = None;
-            app.last_snapshot = None;
+    /// Export the open project as a `.rcnet`.
+    fn pick_export_rcnet(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export ReClass.NET project")
+            .set_directory(self.dialog_start_dir())
+            .set_file_name(format!("{}.rcnet", self.project.name))
+            .add_filter("ReClass.NET project", &["rcnet"])
+            .save_file()
+        else {
+            return;
+        };
+        match nemclass_model::rcnet::export(&self.project) {
+            Ok((bytes, report)) => match std::fs::write(&path, bytes) {
+                Ok(()) => {
+                    self.status_msg = Some(format!("Exported to {}", path.display()));
+                    self.report_interop_notes("Export", &report.notes);
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("Could not write {}: {e}", path.display()))
+                }
+            },
+            Err(e) => self.last_error = Some(format!("Export failed: {e}")),
+        }
+    }
+
+    /// Surface what an import or export had to approximate.
+    ///
+    /// These are not errors, but they are not nothing either: a silently
+    /// downgraded field is exactly the kind of loss a user finds out about much
+    /// later, so they go to the error channel where they persist on screen.
+    fn report_interop_notes(&mut self, what: &str, notes: &[String]) {
+        if notes.is_empty() {
+            return;
+        }
+        let shown: Vec<&str> = notes.iter().take(8).map(String::as_str).collect();
+        let mut msg = format!("{what} was not lossless:\n  {}", shown.join("\n  "));
+        if notes.len() > shown.len() {
+            msg.push_str(&format!("\n  …and {} more", notes.len() - shown.len()));
+        }
+        self.last_error = Some(msg);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unsaved-changes prompt
+    // -----------------------------------------------------------------------
+
+    fn show_unsaved_changes_prompt(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_discard else { return };
+        let what = match pending {
+            PendingDiscard::New => "start a new project",
+            PendingDiscard::Open => "open another project",
         };
 
-        match op {
-            NodeEditOp::ChangeType { owner, path, new_tag } => {
-                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
-                    let old_name    = vec[idx].name().to_owned();
-                    let old_comment = vec[idx].comment().to_owned();
-                    if let Some(mut new_node) = self.node_registry.construct(new_tag) {
-                        new_node.set_name(old_name);
-                        new_node.set_comment(old_comment);
-                        vec[idx] = new_node;
+        #[derive(Clone, Copy)]
+        enum Choice {
+            Save,
+            Discard,
+            Cancel,
+        }
+        let mut choice: Option<Choice> = None;
+
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("'{}' has unsaved changes.", self.project.name));
+                ui.label(format!("Save before you {what}?"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        choice = Some(Choice::Save);
                     }
-                }
-                invalidate(self);
-            }
-            NodeEditOp::Delete { owner, path } => {
-                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
-                    vec.remove(idx);
-                }
-                invalidate(self);
-            }
-            NodeEditOp::DeleteRange { owner, path, count } => {
-                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
-                    // Clamp to the end of the sibling list: "delete 1024 fields"
-                    // on a 12-field class removes the 12, not nothing.
-                    let end = idx.saturating_add(count).min(vec.len());
-                    vec.drain(idx..end);
-                }
-                invalidate(self);
-            }
-            NodeEditOp::AppendBytes { owner, count } => {
-                if let Some(class) = self.project.get_class_mut(&owner) {
-                    class.children.extend(hex_fill(count));
-                }
-                invalidate(self);
-            }
-            NodeEditOp::AddBytes { owner, path, count } => {
-                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
-                    let insert_at = idx + 1;
-                    let fill = hex_fill(count);
-                    for (j, node) in fill.into_iter().enumerate() {
-                        vec.insert(insert_at + j, node);
+                    if ui.button("Discard").clicked() {
+                        choice = Some(Choice::Discard);
                     }
-                }
-                invalidate(self);
-            }
-            NodeEditOp::InsertBytes { owner, path, count } => {
-                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
-                    let fill = hex_fill(count);
-                    for (j, node) in fill.into_iter().enumerate() {
-                        vec.insert(idx + j, node);
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(Choice::Cancel);
                     }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    choice = Some(Choice::Cancel);
                 }
-                invalidate(self);
-            }
-            NodeEditOp::SetName { owner, path, name } => {
-                if let Some(node) = resolve_node_mut(&mut self.project, owner, &path) {
-                    node.set_name(name);
+            });
+
+        let Some(choice) = choice else { return };
+        self.pending_discard = None;
+        match choice {
+            Choice::Cancel => {}
+            Choice::Save => {
+                if let Err(e) = self.exec_save() {
+                    self.last_error = Some(e);
+                    return;
                 }
-                invalidate(self);
-            }
-            NodeEditOp::SetComment { owner, path, comment } => {
-                if let Some(node) = resolve_node_mut(&mut self.project, owner, &path) {
-                    node.set_comment(comment);
+                // `exec_save` routes to Save As when there is no project
+                // directory, and the user may have cancelled that — in which
+                // case the work is still unsaved and proceeding would lose it.
+                if self.project_dirty {
+                    return;
                 }
-                invalidate(self);
+                self.run_pending_discard(pending);
             }
-            NodeEditOp::SetPtrTarget { owner, path, target } => {
-                let ptr_size = self.project.pointer_size();
-                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
-                    let mut node = PointerNode::new(vec[idx].name().to_owned());
-                    node.set_comment(vec[idx].comment().to_owned());
-                    node.set_hidden(vec[idx].hidden());
-                    node.target_class_uuid = target;
-                    // A node built outside `Project::add_class` never saw the
-                    // project's target width, so hand it over explicitly.
-                    node.set_pointer_size(ptr_size);
-                    vec[idx] = Box::new(node);
-                }
-                invalidate(self);
-            }
-            NodeEditOp::SetInstance { owner, path, target } => {
-                if let Some((vec, idx)) = resolve_parent_vec_mut(&mut self.project, owner, &path) {
-                    let old_name    = vec[idx].name().to_owned();
-                    let old_comment = vec[idx].comment().to_owned();
-                    let mut new_node = Box::new(ClassInstanceNode::new(old_name, target));
-                    new_node.set_comment(old_comment);
-                    vec[idx] = new_node;
-                }
-                invalidate(self);
-            }
+            Choice::Discard => self.run_pending_discard(pending),
         }
     }
+
+    fn run_pending_discard(&mut self, pending: PendingDiscard) {
+        // Cleared first: the pickers re-check the flag, and a dialog that
+        // reopened itself would be unescapable.
+        self.project_dirty = false;
+        match pending {
+            PendingDiscard::New => self.pick_new_project_now(),
+            PendingDiscard::Open => self.pick_open_project_now(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Enum editor
+    // -----------------------------------------------------------------------
+
+    /// Edit `project.enums`.
+    ///
+    /// The descriptions round-tripped through the project file and were reachable
+    /// from the scripting API, but had no UI at all — so an `Enum` field could be
+    /// placed and never given anything to resolve against.
+    fn show_enum_editor(&mut self, ctx: &egui::Context) {
+        if !self.enum_editor_open {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        let mut remove_enum: Option<usize> = None;
+        let mut add_enum = false;
+
+        egui::Window::new("Enums")
+            .open(&mut open)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                if self.project.enums.is_empty() {
+                    ui.weak("No enums yet.");
+                }
+                for (i, desc) in self.project.enums.iter_mut().enumerate() {
+                    ui.push_id(i, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Name");
+                            if ui.text_edit_singleline(&mut desc.name).changed() {
+                                changed = true;
+                            }
+                            egui::ComboBox::from_label("width")
+                                .selected_text(format!("{} byte(s)", desc.size))
+                                .show_ui(ui, |ui| {
+                                    for size in [1u8, 2, 4, 8] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut desc.size,
+                                                size,
+                                                format!("{size}"),
+                                            )
+                                            .clicked()
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            if ui.checkbox(&mut desc.use_flags, "flags").changed() {
+                                changed = true;
+                            }
+                            if ui.button("🗑").on_hover_text("Remove this enum").clicked() {
+                                remove_enum = Some(i);
+                            }
+                        });
+
+                        let mut remove_value: Option<usize> = None;
+                        ui.indent("values", |ui| {
+                            for (j, (name, value)) in desc.values.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(name)
+                                                .desired_width(160.0),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                    ui.label("=");
+                                    let mut text = value.to_string();
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut text)
+                                                .desired_width(90.0),
+                                        )
+                                        .changed()
+                                    {
+                                        // Reject rather than clamp: silently
+                                        // turning a typo into 0 would give the
+                                        // enumerator a value nobody chose.
+                                        if let Ok(v) = text.trim().parse::<i64>() {
+                                            *value = v;
+                                            changed = true;
+                                        }
+                                    }
+                                    if ui.button("✖").clicked() {
+                                        remove_value = Some(j);
+                                    }
+                                });
+                            }
+                            if ui.button("+ value").clicked() {
+                                let next = desc.values.len() as i64;
+                                desc.values.push((format!("Value{next}"), next));
+                                changed = true;
+                            }
+                        });
+                        if let Some(j) = remove_value {
+                            desc.values.remove(j);
+                            changed = true;
+                        }
+                        ui.separator();
+                    });
+                }
+                if ui.button("+ enum").clicked() {
+                    add_enum = true;
+                }
+            });
+
+        if let Some(i) = remove_enum {
+            self.record_undo();
+            self.project.enums.remove(i);
+            changed = true;
+        }
+        if add_enum {
+            self.record_undo();
+            let n = self.project.enums.len();
+            self.project.enums.push(nemclass_model::EnumDescription::new(format!("Enum{n}")));
+            changed = true;
+        }
+        if changed {
+            // Every `Enum` node caches its description's width and value table
+            // so it can render without project access; that cache is stale the
+            // moment anything here moves.
+            self.project.bind_enums();
+            self.mark_project_dirty();
+            self.invalidate_class_view();
+        }
+        self.enum_editor_open = open;
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -4669,6 +5343,7 @@ fn flatten_nodes(
             local_path: local_path.clone(),
             components,
             float_width,
+            hidden: node.hidden(),
         });
 
         // Static children (unchanged).
@@ -4935,35 +5610,6 @@ fn hex_fill(count: usize) -> Vec<Box<dyn Node>> {
     nodes
 }
 
-/// Walk `project` to find the parent `Vec<Box<dyn Node>>` and the last index
-/// for `local_path`. Returns `None` if path is empty, owner not found, or any
-/// index is out of bounds.
-fn resolve_parent_vec_mut<'a>(
-    project: &'a mut Project,
-    owner: Uuid,
-    local_path: &[usize],
-) -> Option<(&'a mut Vec<Box<dyn Node>>, usize)> {
-    if local_path.is_empty() { return None; }
-    let class = project.get_class_mut(&owner)?;
-    let (last, prefix) = local_path.split_last()?;
-    let mut vec: &mut Vec<Box<dyn Node>> = &mut class.children;
-    for &idx in prefix {
-        let node = vec.get_mut(idx)?;
-        vec = node.children_mut()?;
-    }
-    if *last < vec.len() { Some((vec, *last)) } else { None }
-}
-
-/// Resolve the node itself (mutable) at `local_path` inside `owner`.
-fn resolve_node_mut<'a>(
-    project: &'a mut Project,
-    owner: Uuid,
-    local_path: &[usize],
-) -> Option<&'a mut Box<dyn Node>> {
-    let (vec, idx) = resolve_parent_vec_mut(project, owner, local_path)?;
-    vec.get_mut(idx)
-}
-
 // ---------------------------------------------------------------------------
 // Write-back
 // ---------------------------------------------------------------------------
@@ -5190,6 +5836,7 @@ fn blank_class(project: &Project) -> ClassNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::node_edit::resolve_parent_vec_mut;
     use nemclass_model::node::builtins::Int32Node;
     use nemclass_model::{ClassNode, NodeRegistry, Project};
 
@@ -5623,5 +6270,280 @@ mod tests {
         let children = &project.get_class(&uuid).unwrap().children;
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name(), "f0");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Class-view editing, against a real app instance
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    use nemclass_model::node::builtins::{Float32Node, Int32Node};
+
+    /// An app with one class of four `Int32` fields named a/b/c/d.
+    fn app_with_four_fields() -> (NemclassApp, Uuid) {
+        let mut app = NemclassApp::new();
+        let mut project = Project::new("test");
+        let mut class = ClassNode::new("Entity");
+        for name in ["a", "b", "c", "d"] {
+            class.children.push(Box::new(Int32Node::new(name)));
+        }
+        let uuid = class.uuid;
+        project.add_class(class);
+        app.replace_project(project, None);
+        app.selected_class = Some(uuid);
+        (app, uuid)
+    }
+
+    fn field_names(app: &NemclassApp, uuid: Uuid) -> Vec<String> {
+        app.project
+            .get_class(&uuid)
+            .unwrap()
+            .children
+            .iter()
+            .map(|n| n.name().to_string())
+            .collect()
+    }
+
+    fn field_tags(app: &NemclassApp, uuid: Uuid) -> Vec<&'static str> {
+        app.project
+            .get_class(&uuid)
+            .unwrap()
+            .children
+            .iter()
+            .map(|n| n.type_tag())
+            .collect()
+    }
+
+    fn select(app: &mut NemclassApp, uuid: Uuid, indices: &[usize]) {
+        app.selection.clear();
+        for &i in indices {
+            app.selection.toggle((uuid, vec![i]));
+        }
+    }
+
+    #[test]
+    fn changing_the_type_of_a_multi_row_selection_changes_every_row() {
+        let (mut app, uuid) = app_with_four_fields();
+        select(&mut app, uuid, &[0, 2, 3]);
+        app.apply_to_selection(|owner, path| NodeEditOp::ChangeType {
+            owner,
+            path,
+            new_tag: "Float",
+        });
+        app.flush_pending_node_edits();
+        assert_eq!(field_tags(&app, uuid), ["Float", "Int32", "Float", "Float"]);
+        // Names survive a type change — the field is the same field.
+        assert_eq!(field_names(&app, uuid), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn deleting_several_rows_removes_exactly_those_rows() {
+        let (mut app, uuid) = app_with_four_fields();
+        // Non-adjacent, and in an order that would go wrong front-to-back:
+        // removing index 0 first shifts 2 to 1 and 3 to 2.
+        select(&mut app, uuid, &[0, 2]);
+        app.delete_selection();
+        app.flush_pending_node_edits();
+        assert_eq!(field_names(&app, uuid), ["b", "d"]);
+    }
+
+    #[test]
+    fn a_multi_row_edit_undoes_as_one_step() {
+        let (mut app, uuid) = app_with_four_fields();
+        select(&mut app, uuid, &[0, 1, 2, 3]);
+        app.apply_to_selection(|owner, path| NodeEditOp::ChangeType {
+            owner,
+            path,
+            new_tag: "Float",
+        });
+        app.flush_pending_node_edits();
+        assert_eq!(field_tags(&app, uuid), ["Float"; 4]);
+
+        app.undo();
+        assert_eq!(
+            field_tags(&app, uuid),
+            ["Int32"; 4],
+            "one undo restores all four, not one"
+        );
+        app.redo();
+        assert_eq!(field_tags(&app, uuid), ["Float"; 4]);
+    }
+
+    #[test]
+    fn deleting_a_whole_class_body_is_undoable() {
+        let (mut app, uuid) = app_with_four_fields();
+        app.apply_node_edit(NodeEditOp::DeleteRange {
+            owner: uuid,
+            path: vec![0],
+            count: 1024,
+        });
+        assert!(field_names(&app, uuid).is_empty());
+        app.undo();
+        assert_eq!(field_names(&app, uuid), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn copy_and_paste_duplicates_the_fields_after_the_anchor() {
+        let (mut app, uuid) = app_with_four_fields();
+        select(&mut app, uuid, &[0, 1]);
+        app.copy_selection();
+        // Paste lands after the anchor, which `toggle` left on the last click.
+        select(&mut app, uuid, &[3]);
+        app.paste_clipboard();
+        app.flush_pending_node_edits();
+        assert_eq!(field_names(&app, uuid), ["a", "b", "c", "d", "a", "b"]);
+    }
+
+    #[test]
+    fn cut_removes_the_originals_and_keeps_them_for_pasting() {
+        let (mut app, uuid) = app_with_four_fields();
+        select(&mut app, uuid, &[1]);
+        app.cut_selection();
+        app.flush_pending_node_edits();
+        assert_eq!(field_names(&app, uuid), ["a", "c", "d"]);
+        select(&mut app, uuid, &[2]);
+        app.paste_clipboard();
+        app.flush_pending_node_edits();
+        assert_eq!(field_names(&app, uuid), ["a", "c", "d", "b"]);
+    }
+
+    #[test]
+    fn pasting_with_nothing_selected_appends_to_the_end_of_the_class() {
+        let (mut app, uuid) = app_with_four_fields();
+        select(&mut app, uuid, &[0]);
+        app.copy_selection();
+        app.selection.clear();
+        app.paste_clipboard();
+        app.flush_pending_node_edits();
+        assert_eq!(field_names(&app, uuid), ["a", "b", "c", "d", "a"]);
+    }
+
+    #[test]
+    fn extracting_a_contiguous_run_leaves_one_class_instance_behind() {
+        let (mut app, uuid) = app_with_four_fields();
+        select(&mut app, uuid, &[1, 2]);
+        app.apply_node_edit(NodeEditOp::ExtractClass {
+            owner: uuid,
+            paths: vec![vec![1], vec![2]],
+            name: "Inner".to_string(),
+        });
+
+        assert_eq!(field_names(&app, uuid), ["a", "inner", "d"]);
+        assert_eq!(field_tags(&app, uuid), ["Int32", "ClassInstance", "Int32"]);
+
+        let inner = app
+            .project
+            .classes_in_order()
+            .find(|c| c.name == "Inner")
+            .expect("the new class exists");
+        assert_eq!(
+            inner.children.iter().map(|n| n.name()).collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+    }
+
+    #[test]
+    fn extracting_a_gapped_selection_is_refused_rather_than_silently_reordering() {
+        let (mut app, uuid) = app_with_four_fields();
+        app.apply_node_edit(NodeEditOp::ExtractClass {
+            owner: uuid,
+            paths: vec![vec![0], vec![2]],
+            name: "Inner".to_string(),
+        });
+        assert_eq!(
+            field_names(&app, uuid),
+            ["a", "b", "c", "d"],
+            "the class is untouched"
+        );
+        assert!(
+            app.last_error.as_deref().is_some_and(|e| e.contains("contiguous")),
+            "the refusal is explained: {:?}",
+            app.last_error
+        );
+    }
+
+    #[test]
+    fn hiding_a_field_is_a_model_change_that_survives_a_save() {
+        let (mut app, uuid) = app_with_four_fields();
+        select(&mut app, uuid, &[1]);
+        app.set_selection_hidden(true);
+        app.flush_pending_node_edits();
+        assert!(app.project.get_class(&uuid).unwrap().children[1].hidden());
+
+        let toml = app.project.to_toml(&app.node_registry).unwrap();
+        let reloaded = Project::from_toml(&toml, &app.node_registry).unwrap();
+        assert!(reloaded.get_class(&uuid).unwrap().children[1].hidden());
+        assert!(!reloaded.get_class(&uuid).unwrap().children[0].hidden());
+    }
+
+    #[test]
+    fn an_edit_marks_the_project_dirty_and_a_save_clears_it() {
+        let (mut app, uuid) = app_with_four_fields();
+        assert!(!app.project_dirty, "a freshly loaded project is clean");
+        app.apply_node_edit(NodeEditOp::SetName {
+            owner: uuid,
+            path: vec![0],
+            name: "renamed".to_string(),
+        });
+        assert!(app.project_dirty);
+
+        let dir = std::env::temp_dir().join(format!("nemclass-dirty-{}", uuid.simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.project_dir = Some(dir.clone());
+        app.exec_save().unwrap();
+        assert!(!app.project_dirty, "saving clears the marker");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_type_change_carries_the_projects_pointer_width_onto_the_new_node() {
+        let (mut app, uuid) = app_with_four_fields();
+        app.project.set_pointer_size(4).unwrap();
+        select(&mut app, uuid, &[0]);
+        app.apply_to_selection(|owner, path| NodeEditOp::ChangeType {
+            owner,
+            path,
+            new_tag: "Pointer",
+        });
+        app.flush_pending_node_edits();
+        // Built by the registry, which has no project — without the explicit
+        // hand-off the node would default to 8 and shift every later field.
+        assert_eq!(app.project.get_class(&uuid).unwrap().children[0].memory_size(), 4);
+    }
+
+    #[test]
+    fn pasted_nodes_also_take_the_projects_pointer_width() {
+        let mut app = NemclassApp::new();
+        let mut project = Project::new("test");
+        let mut class = ClassNode::new("Entity");
+        class.children.push(Box::new(Float32Node::new("f")));
+        let uuid = class.uuid;
+        project.add_class(class);
+        project.set_pointer_size(4).unwrap();
+        app.replace_project(project, None);
+        app.selected_class = Some(uuid);
+
+        app.apply_node_edit(NodeEditOp::ChangeType {
+            owner: uuid,
+            path: vec![0],
+            new_tag: "Pointer",
+        });
+        select(&mut app, uuid, &[0]);
+        app.copy_selection();
+        app.paste_clipboard();
+        app.flush_pending_node_edits();
+
+        let sizes: Vec<usize> = app
+            .project
+            .get_class(&uuid)
+            .unwrap()
+            .children
+            .iter()
+            .map(|n| n.memory_size())
+            .collect();
+        assert_eq!(sizes, [4, 4]);
     }
 }
