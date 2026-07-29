@@ -34,6 +34,51 @@ pub enum CheatTablePanelAction {
     GotoAddr(usize),
 }
 
+impl CheatTablePanel {
+    /// Import a Cheat Engine `.CT`, replacing the current table.
+    ///
+    /// The community's entire cheat-table corpus is in that format and none of
+    /// it could be opened here. What does not map — auto-assembler scripts,
+    /// Lua, bitfield entries — is reported rather than dropped in silence.
+    fn import_ce_table(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import Cheat Engine table")
+            .add_filter("Cheat Engine table", &["CT", "ct"])
+            .pick_file()
+        else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status_msg = Some(format!("Could not read {}: {e}", path.display()));
+                return;
+            }
+        };
+        match CheatTable::from_ce_xml(&text) {
+            Ok((mut table, notes)) => {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    table.name = stem.to_string();
+                }
+                let count = table.entries.len();
+                self.set_table(table);
+                self.status_msg = Some(if notes.is_empty() {
+                    format!("Imported {count} entry(s)")
+                } else {
+                    let shown: Vec<&str> = notes.iter().take(4).map(String::as_str).collect();
+                    let more = notes.len().saturating_sub(shown.len());
+                    let tail = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+                    format!(
+                        "Imported {count} entry(s); not converted: {}{tail}",
+                        shown.join("; ")
+                    )
+                });
+            }
+            Err(e) => self.status_msg = Some(format!("Import failed: {e}")),
+        }
+    }
+}
+
 pub struct CheatTablePanel {
     table: CheatTable,
     last_freeze: Option<Instant>,
@@ -256,6 +301,13 @@ impl CheatTablePanel {
                     self.status_msg =
                         Some("No project directory — save the project first.".into());
                 }
+            }
+            if ui
+                .button("Import .CT…")
+                .on_hover_text("Open a Cheat Engine table")
+                .clicked()
+            {
+                self.import_ce_table();
             }
             ui.separator();
             ui.weak("(Ctrl+F: freeze all)");

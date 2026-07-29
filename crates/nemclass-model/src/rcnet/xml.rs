@@ -21,12 +21,23 @@ const MAX_DEPTH: usize = 100;
 pub struct Element {
     pub name: String,
     pub attrs: BTreeMap<String, String>,
+    /// The element's own character data, unescaped.
+    ///
+    /// `.rcnet` puts every value in an attribute and never uses this; Cheat
+    /// Engine's `.CT` puts every value here and uses almost no attributes, so
+    /// the same reader has to carry both.
+    pub text: String,
     pub children: Vec<Element>,
 }
 
 impl Element {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), attrs: BTreeMap::new(), children: Vec::new() }
+        Self {
+            name: name.into(),
+            attrs: BTreeMap::new(),
+            text: String::new(),
+            children: Vec::new(),
+        }
     }
 
     pub fn attr(&self, key: &str) -> Option<&str> {
@@ -85,8 +96,16 @@ impl Element {
             out.push_str(&escape(value.as_str()));
             out.push('"');
         }
-        if self.children.is_empty() {
+        if self.children.is_empty() && self.text.is_empty() {
             out.push_str(" />\n");
+            return;
+        }
+        if self.children.is_empty() {
+            out.push('>');
+            out.push_str(&escape(self.text.as_str()));
+            out.push_str("</");
+            out.push_str(&self.name);
+            out.push_str(">\n");
             return;
         }
         out.push_str(">\n");
@@ -150,9 +169,23 @@ pub fn parse(xml: &str) -> Result<Element> {
                     None => root = Some(done),
                 }
             }
+            Event::Text(ref t) => {
+                if let Some(current) = stack.last_mut()
+                    && let Ok(decoded) = t.decode()
+                {
+                    current.text.push_str(decoded.as_ref());
+                }
+            }
+            Event::CData(ref t) => {
+                if let Some(current) = stack.last_mut()
+                    && let Ok(text) = std::str::from_utf8(t.as_ref())
+                {
+                    current.text.push_str(text);
+                }
+            }
             Event::Eof => break,
-            // Text, comments, CDATA and processing instructions carry nothing
-            // this format uses — every value is an attribute.
+            // Comments and processing instructions carry nothing either format
+            // uses.
             _ => {}
         }
         buf.clear();

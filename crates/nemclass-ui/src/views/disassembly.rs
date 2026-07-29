@@ -94,6 +94,17 @@ const LINEAR_MAX_INSNS: usize = 400_000;
 // ---------------------------------------------------------------------------
 
 pub struct DisassemblyPanel {
+    // ── patches ───────────────────────────────────────────────────────────
+    /// Every byte patch made this session, with the bytes it replaced.
+    ///
+    /// NOP-out was the only patch, it was irreversible, and nothing recorded
+    /// it — so a mistake could only be undone by restarting the target.
+    patches: nemclass_model::PatchSet,
+    /// Hex the user typed into the "patch bytes" prompt, and where it goes.
+    patch_prompt: Option<(usize, usize, String)>,
+    /// Whether the patch list is expanded.
+    patches_open: bool,
+
     // ── navigation ────────────────────────────────────────────────────────
     /// Current focus address (function entry, or the address the user jumped to
     /// in linear mode).
@@ -183,6 +194,9 @@ pub enum DisasmAction {
 impl DisassemblyPanel {
     pub fn new() -> Self {
         Self {
+            patches: nemclass_model::PatchSet::new(),
+            patch_prompt: None,
+            patches_open: false,
             address: 0,
             address_input: String::new(),
             address_error: None,
@@ -754,6 +768,208 @@ impl DisassemblyPanel {
         self.show_linux(ui, process, rt);
     }
 
+    /// Write `bytes` at `addr`, recording the patch so it can be reverted.
+    #[cfg(target_os = "linux")]
+    fn apply_patch(&mut self, process: &Process, addr: usize, bytes: &[u8], what: &str) {
+        // Read the originals *before* writing: they are what a revert restores,
+        // and after the write they are gone.
+        let mut original = vec![0u8; bytes.len()];
+        let read = process.read_buf(addr, &mut original).unwrap_or(0);
+        if read < bytes.len() {
+            self.status_msg =
+                Some(format!("Could not read the bytes at {addr:#x} — nothing was written."));
+            return;
+        }
+
+        match process.write_buf(addr, bytes) {
+            Ok(n) if n == bytes.len() => {}
+            Ok(n) => {
+                self.status_msg = Some(format!(
+                    "Only {n} of {} byte(s) written at {addr:#x} — the page may be read-only.",
+                    bytes.len()
+                ));
+                return;
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("Write failed at {addr:#x}: {e}"));
+                return;
+            }
+        }
+
+        let mut patch = nemclass_model::Patch::new(addr, &original, bytes);
+        patch.description = what.to_string();
+        patch.applied = true;
+        // Anchored to its module where there is one, so the set can be
+        // re-applied after a restart moves everything.
+        if let Some(m) = self.modules.iter().find(|m| addr >= m.base && addr < m.base + m.size) {
+            patch = patch.anchored(m.name.clone(), m.base);
+        }
+        self.patches.record(patch);
+        self.patches_open = true;
+        self.status_msg = Some(format!("{what}: {} byte(s) at {addr:#x}", bytes.len()));
+        self.invalidate_listing();
+    }
+
+    /// Drop the decoded session so the next focus re-reads the patched bytes.
+    ///
+    /// A plain re-focus would only scroll the stale listing, so a patched
+    /// instruction kept showing its old mnemonic.
+    #[cfg(target_os = "linux")]
+    fn invalidate_listing(&mut self) {
+        self.linear_insns.clear();
+        self.linear_next = None;
+        self.pending_focus = Some(self.address);
+    }
+
+    /// The recorded patches, with revert and re-apply.
+    #[cfg(target_os = "linux")]
+    fn show_patch_list(&mut self, ui: &mut egui::Ui, process: &Process) {
+        if self.patches.is_empty() {
+            return;
+        }
+        let mut toggle: Option<usize> = None;
+        let mut forget: Option<usize> = None;
+        let mut goto: Option<usize> = None;
+
+        egui::CollapsingHeader::new(format!("Patches ({})", self.patches.len()))
+            .id_salt("disasm_patches")
+            .default_open(self.patches_open)
+            .show(ui, |ui| {
+                for (i, patch) in self.patches.patches.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("{:#x}", patch.address)).monospace(),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            goto = Some(patch.address);
+                        }
+                        let label = if patch.applied { "Revert" } else { "Re-apply" };
+                        if ui.small_button(label).clicked() {
+                            toggle = Some(i);
+                        }
+                        if ui.small_button("Forget").on_hover_text(
+                            "Drop the record. The bytes in the target are left as they are.",
+                        ).clicked() {
+                            forget = Some(i);
+                        }
+                        ui.weak(&patch.description);
+                        ui.weak(
+                            RichText::new(format!("{} → {}", patch.original, patch.patched))
+                                .monospace(),
+                        );
+                    });
+                }
+            });
+
+        if let Some(addr) = goto {
+            self.pending_navigate = Some(addr);
+        }
+        if let Some(i) = forget {
+            self.patches.remove(i);
+        }
+        if let Some(i) = toggle {
+            let Some(patch) = self.patches.patches.get(i) else { return };
+            let address = patch.address;
+            let want_applied = !patch.applied;
+            let bytes = if want_applied { patch.patched_bytes() } else { patch.original_bytes() };
+            let bytes = match bytes {
+                Ok(b) => b,
+                Err(e) => {
+                    self.status_msg = Some(format!("Patch {i} is corrupt: {e}"));
+                    return;
+                }
+            };
+            match process.write_buf(address, &bytes) {
+                Ok(n) if n == bytes.len() => {
+                    if let Some(p) = self.patches.get_mut(i) {
+                        p.applied = want_applied;
+                    }
+                    self.status_msg = Some(format!(
+                        "{} {address:#x}",
+                        if want_applied { "Re-applied" } else { "Reverted" }
+                    ));
+                    self.invalidate_listing();
+                }
+                Ok(n) => {
+                    self.status_msg = Some(format!(
+                        "Only {n} of {} byte(s) written at {address:#x} — the patch record is \
+                         unchanged.",
+                        bytes.len()
+                    ));
+                }
+                Err(e) => self.status_msg = Some(format!("Write failed at {address:#x}: {e}")),
+            }
+        }
+    }
+
+    /// The "type the bytes to write" prompt.
+    #[cfg(target_os = "linux")]
+    fn show_patch_prompt(&mut self, ctx: &egui::Context, process: &Process) {
+        let Some((addr, len, _)) = self.patch_prompt.clone() else { return };
+        let mut confirm = false;
+        let mut cancel = false;
+
+        egui::Window::new("Patch bytes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Write over {len} byte(s) at {addr:#x}:"));
+                if let Some((_, _, text)) = self.patch_prompt.as_mut() {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(240.0)
+                            .hint_text("90 90 90"),
+                    );
+                    resp.request_focus();
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirm = true;
+                    }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Write").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if cancel {
+            self.patch_prompt = None;
+            return;
+        }
+        if !confirm {
+            return;
+        }
+        let Some((addr, _, text)) = self.patch_prompt.take() else { return };
+        let parsed: Result<Vec<u8>, _> = text
+            .split_whitespace()
+            .map(|t| u8::from_str_radix(t, 16))
+            .collect();
+        match parsed {
+            Ok(bytes) if !bytes.is_empty() => {
+                self.apply_patch(process, addr, &bytes, "Patch");
+            }
+            Ok(_) => self.status_msg = Some("No bytes were given.".into()),
+            Err(_) => {
+                self.status_msg =
+                    Some(format!("'{text}' is not a list of hex bytes — expected e.g. 90 90."));
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn show_linux(
         &mut self,
@@ -776,6 +992,8 @@ impl DisassemblyPanel {
         }
         self.show_top_bar(ui, process);
         ui.separator();
+        self.show_patch_list(ui, process);
+        self.show_patch_prompt(ui.ctx(), process);
         self.handle_keyboard(ui);
         self.show_table(ui, process);
 
@@ -960,6 +1178,7 @@ impl DisassemblyPanel {
         let mut nav_target: Option<usize> = None;
         let mut new_selection: Option<usize> = None;
         let mut nop_target: Option<(usize, usize)> = None;
+        let mut patch_prompt_target: Option<(usize, usize)> = None;
         let mut queued_action: Option<DisasmAction> = None;
         let mut copy_text: Option<String> = None;
         let mut pending_sig_addr: Option<usize> = None;
@@ -1199,6 +1418,17 @@ impl DisassemblyPanel {
                                     nop_target = Some((addr as usize, length));
                                     ui.close();
                                 }
+                                if ui
+                                    .button(
+                                        RichText::new("Patch bytes…")
+                                            .color(Color32::from_rgb(230, 140, 120)),
+                                    )
+                                    .on_hover_text("Type the bytes to write over this instruction")
+                                    .clicked()
+                                {
+                                    patch_prompt_target = Some((addr as usize, length));
+                                    ui.close();
+                                }
                                 ui.separator();
                                 if ui
                                     .button("Set breakpoint here")
@@ -1233,24 +1463,20 @@ impl DisassemblyPanel {
             self.pending_action = Some(act);
         }
         if let Some((addr, l)) = nop_target {
-            let mut ok = true;
-            for i in 0..l {
-                if process.write::<u8>(addr + i, 0x90u8).is_err() {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                self.status_msg = Some(format!("Wrote {l} NOP byte(s) at {addr:#x}"));
-                // Drop the session so the focus rebuilds it from the patched
-                // bytes (a plain re-focus would just scroll the stale listing).
-                self.linear_insns.clear();
-                self.linear_next = None;
-                self.pending_focus = Some(self.address);
-                ui.ctx().request_repaint();
-            } else {
-                self.status_msg = Some(format!("NOP write failed at {addr:#x}"));
-            }
+            self.apply_patch(process, addr, &vec![0x90u8; l], "NOP out");
+            ui.ctx().request_repaint();
+        }
+        if let Some((addr, len)) = patch_prompt_target {
+            // Seeded with the current bytes so the prompt shows what is being
+            // replaced rather than an empty box.
+            let mut current = vec![0u8; len];
+            let read = process.read_buf(addr, &mut current).unwrap_or(0);
+            let seed = current[..read]
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.patch_prompt = Some((addr, len, seed));
         }
 
         // ── resolve pending signature request ─────────────────────────────

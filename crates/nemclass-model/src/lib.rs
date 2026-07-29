@@ -13,6 +13,7 @@ pub mod dissect;
 pub mod enums;
 pub mod error;
 pub mod node;
+pub mod patch;
 pub mod project;
 pub mod rcnet;
 pub mod serialize;
@@ -36,6 +37,7 @@ pub use node::vector::{
 };
 pub use node::unknown::UnknownNode;
 pub use node::{DEFAULT_POINTER_SIZE, Node, RenderedValue};
+pub use patch::{Patch, PatchSet};
 pub use project::{Project, SCHEMA_VERSION, SCHEMA_VERSION_BASE};
 pub use rcnet::{ExportReport, ImportReport};
 
