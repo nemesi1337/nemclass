@@ -102,8 +102,24 @@ pub struct DisassemblyPanel {
     patches: nemclass_model::PatchSet,
     /// Hex the user typed into the "patch bytes" prompt, and where it goes.
     patch_prompt: Option<(usize, usize, String)>,
+    /// Assembly the user typed into the "assemble here" prompt: the address, how
+    /// many bytes the original instruction occupied, and the source.
+    asm_prompt: Option<(usize, usize, String)>,
     /// Whether the patch list is expanded.
     patches_open: bool,
+    /// User comments and labels, keyed by address. The Comment column was
+    /// derived only — there was nowhere to write down what an instruction does.
+    annotations: std::collections::BTreeMap<u64, Annotation>,
+    /// The annotation being edited: its address and the text so far.
+    annotation_edit: Option<(u64, String, bool)>,
+    /// The "inject code here" prompt: hook address and the payload source.
+    inject_prompt: Option<(usize, String)>,
+    /// Text of the instruction/byte search, and whether it is a byte pattern.
+    search_text: String,
+    search_bytes: bool,
+    /// Addresses the last search matched, and which one is shown.
+    search_hits: Vec<u64>,
+    search_cursor: usize,
 
     // ── navigation ────────────────────────────────────────────────────────
     /// Current focus address (function entry, or the address the user jumped to
@@ -181,6 +197,16 @@ pub struct DisassemblyPanel {
     last_signature: Option<Result<String, String>>,
 }
 
+/// A user note on one address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Annotation {
+    /// A short name shown in place of the address — a renamed function, or a
+    /// jump target worth naming.
+    pub label: String,
+    /// Free text shown in the Comment column.
+    pub comment: String,
+}
+
 /// A cross-panel request from the disassembler's row context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisasmAction {
@@ -196,7 +222,15 @@ impl DisassemblyPanel {
         Self {
             patches: nemclass_model::PatchSet::new(),
             patch_prompt: None,
+            asm_prompt: None,
             patches_open: false,
+            annotations: std::collections::BTreeMap::new(),
+            annotation_edit: None,
+            inject_prompt: None,
+            search_text: String::new(),
+            search_bytes: false,
+            search_hits: Vec::new(),
+            search_cursor: 0,
             address: 0,
             address_input: String::new(),
             address_error: None,
@@ -907,6 +941,373 @@ impl DisassemblyPanel {
         }
     }
 
+    /// Search the decoded listing for a mnemonic substring or a byte pattern.
+    ///
+    /// Over the decoded session rather than the whole module: that is what is on
+    /// screen, and a module-wide byte search is the AOB scanner's job.
+    #[cfg(target_os = "linux")]
+    fn show_search_bar(&mut self, ui: &mut egui::Ui) {
+        let mut run = false;
+        let mut step = 0isize;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Find:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.search_text)
+                    .desired_width(180.0)
+                    .hint_text(if self.search_bytes { "48 89 E5" } else { "call" }),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                run = true;
+            }
+            if ui.checkbox(&mut self.search_bytes, "bytes").changed() {
+                self.search_hits.clear();
+            }
+            if ui.button("Find").clicked() {
+                run = true;
+            }
+            if !self.search_hits.is_empty() {
+                if ui.small_button("◀").clicked() {
+                    step = -1;
+                }
+                if ui.small_button("▶").clicked() {
+                    step = 1;
+                }
+                ui.weak(format!(
+                    "{}/{}",
+                    self.search_cursor + 1,
+                    self.search_hits.len()
+                ));
+            } else if run {
+                ui.weak("no match");
+            }
+        });
+
+        if run {
+            self.run_search();
+            if let Some(&addr) = self.search_hits.first() {
+                self.search_cursor = 0;
+                self.pending_navigate = Some(addr as usize);
+            }
+        } else if step != 0 && !self.search_hits.is_empty() {
+            let len = self.search_hits.len() as isize;
+            // Wrapping, so ▶ past the last hit returns to the first rather than
+            // stopping with no indication of why.
+            self.search_cursor =
+                ((self.search_cursor as isize + step).rem_euclid(len)) as usize;
+            self.pending_navigate = Some(self.search_hits[self.search_cursor] as usize);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_search(&mut self) {
+        self.search_hits.clear();
+        self.search_cursor = 0;
+        let needle = self.search_text.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return;
+        }
+        if self.search_bytes {
+            let Ok(pattern) = nemclass_scan::BytePattern::parse(&needle) else {
+                self.status_msg =
+                    Some(format!("'{needle}' is not a byte pattern — expected e.g. 48 89 E5."));
+                return;
+            };
+            for insn in &self.linear_insns {
+                let bytes = insn.data.as_slice();
+                if (0..bytes.len()).any(|off| pattern.matches_at(bytes, off)) {
+                    self.search_hits.push(insn.address);
+                }
+            }
+        } else {
+            for insn in &self.linear_insns {
+                if insn.instruction.to_ascii_lowercase().contains(&needle) {
+                    self.search_hits.push(insn.address);
+                }
+            }
+        }
+    }
+
+    /// The "name this address / note what it does" prompt.
+    #[cfg(target_os = "linux")]
+    fn show_annotation_prompt(&mut self, ctx: &egui::Context) {
+        let Some((addr, _, is_label)) = self.annotation_edit.clone() else { return };
+        let mut confirm = false;
+        let mut cancel = false;
+        let what = if is_label { "Label" } else { "Comment" };
+
+        egui::Window::new(format!("{what} at {addr:#x}"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if let Some((_, text, _)) = self.annotation_edit.as_mut() {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(text)
+                            .desired_width(320.0)
+                            .hint_text(if is_label { "name" } else { "what it does" }),
+                    );
+                    resp.request_focus();
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirm = true;
+                    }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Clear").clicked() {
+                        if let Some((_, text, _)) = self.annotation_edit.as_mut() {
+                            text.clear();
+                        }
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if cancel {
+            self.annotation_edit = None;
+            return;
+        }
+        if !confirm {
+            return;
+        }
+        let Some((addr, text, is_label)) = self.annotation_edit.take() else { return };
+        let entry = self.annotations.entry(addr).or_default();
+        if is_label {
+            entry.label = text.trim().to_string();
+        } else {
+            entry.comment = text.trim().to_string();
+        }
+        // An emptied annotation is removed rather than left as a blank entry,
+        // so the map does not grow with nothing in it.
+        if entry.label.is_empty() && entry.comment.is_empty() {
+            self.annotations.remove(&addr);
+        }
+    }
+
+    /// The "inject code here" prompt.
+    ///
+    /// Finds a code cave in the same module, builds the detour, and records
+    /// **both** writes as patches so both can be reverted — a hook whose cave is
+    /// still live would jump into orphaned code.
+    #[cfg(target_os = "linux")]
+    fn show_inject_prompt(&mut self, ctx: &egui::Context, process: &Process) {
+        let Some((hook, _)) = self.inject_prompt.clone() else { return };
+        let mut confirm = false;
+        let mut cancel = false;
+
+        egui::Window::new("Inject code")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Divert {hook:#x} into a code cave and return."));
+                if let Some((_, text)) = self.inject_prompt.as_mut() {
+                    ui.add(
+                        egui::TextEdit::multiline(text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(6)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("mov [rbx+0x10], 0\nnop"),
+                    );
+                }
+                ui.weak(
+                    "The instructions displaced by the jump are relocated into the cave and \
+                     run after your code.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Inject").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if cancel {
+            self.inject_prompt = None;
+            return;
+        }
+        if !confirm {
+            return;
+        }
+        let Some((hook, payload)) = self.inject_prompt.take() else { return };
+        self.do_inject(process, hook, &payload);
+    }
+
+    /// Find a cave, build the detour, and write both halves.
+    #[cfg(target_os = "linux")]
+    fn do_inject(&mut self, process: &Process, hook: usize, payload: &str) {
+        let Some(module) = self.modules.iter().find(|m| hook >= m.base && hook < m.base + m.size)
+        else {
+            self.status_msg =
+                Some(format!("{hook:#x} is not inside a known module — no cave to search."));
+            return;
+        };
+        let (mod_base, mod_end) = (module.base, module.base + module.size);
+
+        let needed = match nemclass_core::cave_size_for(payload, mod_base) {
+            Ok(n) => n,
+            Err(e) => {
+                self.status_msg = Some(format!("Inject: {e}"));
+                return;
+            }
+        };
+        let read = |addr: usize, buf: &mut [u8]| process.read_buf(addr, buf);
+        let Some(cave) = nemclass_core::find_code_cave(mod_base, mod_end, needed, read) else {
+            self.status_msg = Some(format!(
+                "No code cave of {needed} bytes in {} — the payload is too large to inject \
+                 without allocating.",
+                module.name
+            ));
+            return;
+        };
+
+        let detour =
+            match nemclass_core::build_detour(hook, cave, needed, payload, |addr, buf| {
+                process.read_buf(addr, buf)
+            }) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.status_msg = Some(format!("Inject: {e}"));
+                    return;
+                }
+            };
+
+        // The cave first: if the hook were written first and the cave write
+        // failed, execution would jump straight into whatever padding is there.
+        let cave_bytes = detour.cave_bytes.clone();
+        self.apply_patch(process, detour.cave, &cave_bytes, "injected code");
+        if self.patches.patches.iter().all(|p| p.address != detour.cave) {
+            // `apply_patch` reports the reason; do not hook into a cave that was
+            // never written.
+            return;
+        }
+        let hook_bytes = detour.hook_bytes.clone();
+        self.apply_patch(process, hook, &hook_bytes, "detour");
+        self.status_msg = Some(format!(
+            "Injected {} byte(s) at {cave:#x}; {hook:#x} now jumps there.",
+            detour.cave_bytes.len()
+        ));
+    }
+
+    /// The "type an instruction to write" prompt.
+    ///
+    /// The assembled bytes must fit the span they replace. Overrunning would
+    /// clobber the instruction after it — which is sometimes what you want, but
+    /// never something to do without being told; a short patch is padded with
+    /// `nop` so the following instruction still starts where the decoder
+    /// expects.
+    #[cfg(target_os = "linux")]
+    fn show_assemble_prompt(&mut self, ctx: &egui::Context, process: &Process) {
+        let Some((addr, len, _)) = self.asm_prompt.clone() else { return };
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut preview: Option<Result<Vec<u8>, String>> = None;
+
+        egui::Window::new("Assemble")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Assemble at {addr:#x}, over {len} byte(s):"));
+                if let Some((_, _, text)) = self.asm_prompt.as_mut() {
+                    ui.add(
+                        egui::TextEdit::multiline(text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("mov eax, 1\nret"),
+                    );
+                }
+                if let Some((_, _, text)) = self.asm_prompt.as_ref() {
+                    preview = Some(
+                        nemclass_core::assemble(text, addr as u64)
+                            .map(|a| a.bytes)
+                            .map_err(|e| e.to_string()),
+                    );
+                }
+                match &preview {
+                    Some(Ok(bytes)) => {
+                        let hex = bytes
+                            .iter()
+                            .map(|b| format!("{b:02X}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        ui.monospace(&hex);
+                        if bytes.len() > len {
+                            ui.colored_label(
+                                Color32::from_rgb(230, 140, 120),
+                                format!(
+                                    "{} byte(s) — too long for the {len}-byte instruction it \
+                                     replaces.",
+                                    bytes.len()
+                                ),
+                            );
+                        } else if bytes.len() < len {
+                            ui.weak(format!(
+                                "{} byte(s); the remaining {} will be filled with nop.",
+                                bytes.len(),
+                                len - bytes.len()
+                            ));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(Color32::from_rgb(230, 120, 120), e);
+                    }
+                    None => {}
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ok = matches!(&preview, Some(Ok(b)) if b.len() <= len && !b.is_empty());
+                    if ui.add_enabled(ok, egui::Button::new("Write")).clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if cancel {
+            self.asm_prompt = None;
+            return;
+        }
+        if !confirm {
+            return;
+        }
+        let Some((addr, len, source)) = self.asm_prompt.take() else { return };
+        match nemclass_core::assemble(&source, addr as u64) {
+            Ok(assembled) => {
+                let mut bytes = assembled.bytes;
+                // Pad rather than leave a partial instruction behind: the tail
+                // of the old encoding would decode as garbage and execute.
+                bytes.resize(len.max(bytes.len()), 0x90);
+                let first_line =
+                    source.lines().find(|l| !l.trim().is_empty()).unwrap_or("assembled");
+                self.apply_patch(process, addr, &bytes, first_line.trim());
+            }
+            Err(e) => self.status_msg = Some(format!("Assemble: {e}")),
+        }
+    }
+
     /// The "type the bytes to write" prompt.
     #[cfg(target_os = "linux")]
     fn show_patch_prompt(&mut self, ctx: &egui::Context, process: &Process) {
@@ -992,8 +1393,12 @@ impl DisassemblyPanel {
         }
         self.show_top_bar(ui, process);
         ui.separator();
+        self.show_search_bar(ui);
         self.show_patch_list(ui, process);
         self.show_patch_prompt(ui.ctx(), process);
+        self.show_assemble_prompt(ui.ctx(), process);
+        self.show_inject_prompt(ui.ctx(), process);
+        self.show_annotation_prompt(ui.ctx());
         self.handle_keyboard(ui);
         self.show_table(ui, process);
 
@@ -1179,6 +1584,18 @@ impl DisassemblyPanel {
         let mut new_selection: Option<usize> = None;
         let mut nop_target: Option<(usize, usize)> = None;
         let mut patch_prompt_target: Option<(usize, usize)> = None;
+        let mut asm_prompt_target: Option<(usize, usize)> = None;
+        let mut inject_target: Option<usize> = None;
+        let mut annotate_target: Option<(u64, bool)> = None;
+        // Cloned for the body closure, which cannot borrow `self`.
+        let annotations = self.annotations.clone();
+        // Basic-block leaders, so the listing shows where the straight-line runs
+        // begin instead of being one undifferentiated wall of instructions.
+        let blocks = nemclass_core::basic_blocks(&self.linear_insns);
+        let block_starts: std::collections::HashMap<u64, (usize, bool)> = blocks
+            .iter()
+            .map(|b| (b.start, (b.predecessors.len(), b.is_loop_header())))
+            .collect();
         let mut queued_action: Option<DisasmAction> = None;
         let mut copy_text: Option<String> = None;
         let mut pending_sig_addr: Option<usize> = None;
@@ -1301,7 +1718,40 @@ impl DisassemblyPanel {
                             // Address (+ xref badge).
                             row.col(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.monospace(format!("{addr:#018x}"));
+                                    // A block leader, with a marker for a join
+                                    // or a loop — the shape the linear listing
+                                    // otherwise hides completely.
+                                    if let Some(&(preds, is_loop)) = block_starts.get(&addr) {
+                                        let (glyph, tip) = if is_loop {
+                                            ("↻", "loop header")
+                                        } else if preds > 1 {
+                                            ("⋔", "join: reached from several places")
+                                        } else {
+                                            ("▸", "block start")
+                                        };
+                                        ui.label(
+                                            RichText::new(glyph)
+                                                .small()
+                                                .color(Color32::from_rgb(150, 150, 200)),
+                                        )
+                                        .on_hover_text(tip);
+                                    } else {
+                                        ui.add_space(10.0);
+                                    }
+                                    // A user label replaces the address, which is
+                                    // the whole point of naming one.
+                                    match annotations.get(&addr).filter(|a| !a.label.is_empty()) {
+                                        Some(note) => {
+                                            ui.monospace(
+                                                RichText::new(&note.label)
+                                                    .color(Color32::from_rgb(210, 200, 130)),
+                                            )
+                                            .on_hover_text(format!("{addr:#018x}"));
+                                        }
+                                        None => {
+                                            ui.monospace(format!("{addr:#018x}"));
+                                        }
+                                    }
                                     if !referrers.is_empty() {
                                         ui.menu_button(
                                             RichText::new(format!("⟵{}", referrers.len()))
@@ -1359,12 +1809,22 @@ impl DisassemblyPanel {
                                     ui.monospace(RichText::new(mnemonic).color(color));
                                 }
                             });
-                            // Comment.
+                            // Comment: the derived one, then the user's.
                             row.col(|ui| {
                                 if let Some(c) = &comment {
                                     ui.monospace(
                                         RichText::new(format!("; {c}"))
                                             .color(Color32::from_rgb(120, 160, 120)),
+                                    );
+                                }
+                                if let Some(note) = annotations.get(&addr)
+                                    && !note.comment.is_empty()
+                                {
+                                    // Brighter than the derived comment: it is
+                                    // the one a person wrote.
+                                    ui.monospace(
+                                        RichText::new(format!("; {}", note.comment))
+                                            .color(Color32::from_rgb(210, 200, 130)),
                                     );
                                 }
                             });
@@ -1418,6 +1878,30 @@ impl DisassemblyPanel {
                                     nop_target = Some((addr as usize, length));
                                     ui.close();
                                 }
+                                if ui.button("Add comment…").clicked() {
+                                    annotate_target = Some((addr, false));
+                                    ui.close();
+                                }
+                                if ui
+                                    .button("Rename / label…")
+                                    .on_hover_text("Show a name here instead of the address")
+                                    .clicked()
+                                {
+                                    annotate_target = Some((addr, true));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(
+                                        RichText::new("Assemble here…")
+                                            .color(Color32::from_rgb(230, 140, 120)),
+                                    )
+                                    .on_hover_text("Write an instruction over this one")
+                                    .clicked()
+                                {
+                                    asm_prompt_target = Some((addr as usize, length));
+                                    ui.close();
+                                }
                                 if ui
                                     .button(
                                         RichText::new("Patch bytes…")
@@ -1427,6 +1911,21 @@ impl DisassemblyPanel {
                                     .clicked()
                                 {
                                     patch_prompt_target = Some((addr as usize, length));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(
+                                        RichText::new("Inject code here…")
+                                            .color(Color32::from_rgb(230, 140, 120)),
+                                    )
+                                    .on_hover_text(
+                                        "Divert execution into a code cave, run your code, and \
+                                         return",
+                                    )
+                                    .clicked()
+                                {
+                                    inject_target = Some(addr as usize);
                                     ui.close();
                                 }
                                 ui.separator();
@@ -1465,6 +1964,28 @@ impl DisassemblyPanel {
         if let Some((addr, l)) = nop_target {
             self.apply_patch(process, addr, &vec![0x90u8; l], "NOP out");
             ui.ctx().request_repaint();
+        }
+        if let Some(addr) = inject_target {
+            self.inject_prompt = Some((addr, String::new()));
+        }
+        if let Some((addr, is_label)) = annotate_target {
+            let seed = self
+                .annotations
+                .get(&addr)
+                .map(|a| if is_label { a.label.clone() } else { a.comment.clone() })
+                .unwrap_or_default();
+            self.annotation_edit = Some((addr, seed, is_label));
+        }
+        if let Some((addr, len)) = asm_prompt_target {
+            // Seeded with the instruction that is there, so the prompt shows
+            // what is being replaced rather than an empty box.
+            let seed = self
+                .linear_insns
+                .iter()
+                .find(|i| i.address == addr as u64)
+                .map(|i| i.instruction.clone())
+                .unwrap_or_default();
+            self.asm_prompt = Some((addr, len, seed));
         }
         if let Some((addr, len)) = patch_prompt_target {
             // Seeded with the current bytes so the prompt shows what is being

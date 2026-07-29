@@ -47,6 +47,15 @@ pub use process::{
 
 // Disassembler wrapper (iced-x86) — consumed by the future scanner/host APIs.
 // `FlowKind` is the coarse control-flow class carried on each `InstructionData`.
+pub mod assembler;
+pub use assembler::{AsmError, Assembled, assemble, assembled_len};
+
+pub mod blocks;
+pub use blocks::{BasicBlock, basic_blocks};
+
+pub mod inject;
+pub use inject::{Detour, InjectError, JMP_LEN, build_detour, cave_size_for, find_code_cave};
+
 pub use decoder::{
     Bitness, FlowKind, HOST_BITNESS, InstructionData, disassemble_instructions,
     disassemble_instructions_with_bitness, find_code_refs, make_masked_signature,

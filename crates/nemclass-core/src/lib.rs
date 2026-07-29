@@ -27,6 +27,19 @@ pub use internal::{
     ThreadInfo,
     // Process enumeration.
     ProcessIterator,
+    // Text assembler (x86-64 patching subset) and code injection.
+    AsmError,
+    Assembled,
+    assemble,
+    assembled_len,
+    BasicBlock,
+    basic_blocks,
+    Detour,
+    InjectError,
+    JMP_LEN,
+    build_detour,
+    cave_size_for,
+    find_code_cave,
     // Disassembler wrapper (iced-x86). `FlowKind` is the per-instruction
     // control-flow class the dissector/analysis layer reasons about.
     InstructionData,
