@@ -79,9 +79,39 @@ impl CheatTablePanel {
     }
 }
 
+/// A toolbar action over the selected rows.
+enum BulkAction {
+    SelectAll,
+    ClearSelection,
+    Freeze(bool),
+    Group(String),
+    Remove,
+}
+
+/// The persisted spelling of a freeze mode, back to the mode.
+///
+/// An unrecognised spelling falls back to an exact freeze: a table written by a
+/// newer build should still load, and the strictest interpretation is the safe
+/// one to guess.
+fn parse_freeze_mode(text: &str) -> nemclass_scan::FreezeMode {
+    match text.trim() {
+        "allow_increase" => nemclass_scan::FreezeMode::AllowIncrease,
+        "allow_decrease" => nemclass_scan::FreezeMode::AllowDecrease,
+        _ => nemclass_scan::FreezeMode::Exact,
+    }
+}
+
+fn freeze_mode_tag(mode: nemclass_scan::FreezeMode) -> &'static str {
+    match mode {
+        nemclass_scan::FreezeMode::Exact => "exact",
+        nemclass_scan::FreezeMode::AllowIncrease => "allow_increase",
+        nemclass_scan::FreezeMode::AllowDecrease => "allow_decrease",
+    }
+}
+
 /// The frozen entries as the writer thread sees them.
 #[cfg(target_os = "linux")]
-type SharedEntries = std::sync::Arc<std::sync::Mutex<Vec<(usize, Vec<u8>)>>>;
+type SharedEntries = std::sync::Arc<std::sync::Mutex<Vec<nemclass_scan::FreezeEntry>>>;
 
 /// Writes the frozen values on its own thread.
 ///
@@ -126,13 +156,12 @@ impl FreezeWorker {
                         if snapshot.is_empty() {
                             continue;
                         }
-                        let mut set = FreezeSet::new();
-                        for (addr, bytes) in snapshot {
-                            set.set(addr, bytes);
-                        }
+                        let mut set = FreezeSet { entries: snapshot };
+                        // Ratcheting, so an "allow increase" entry holds the
+                        // new high rather than dragging the value back down.
                         // Report *why* a value did not stick instead of
                         // discarding the result.
-                        let report = set.apply(&target);
+                        let report = set.apply_ratcheting(&target);
                         if let Ok(mut slot) = problem.lock() {
                             *slot = report.problem();
                         }
@@ -144,7 +173,7 @@ impl FreezeWorker {
         Self { pid, entries, problem, stop, handle }
     }
 
-    fn publish(&self, entries: Vec<(usize, Vec<u8>)>) {
+    fn publish(&self, entries: Vec<nemclass_scan::FreezeEntry>) {
         if let Ok(mut slot) = self.entries.lock() {
             *slot = entries;
         }
@@ -180,6 +209,13 @@ pub struct CheatTablePanel {
     /// again on every 200 ms freeze tick.
     modules: Vec<ModuleInfoWithName>,
     modules_at: Option<Instant>,
+    /// Rows the user has selected, by index. Bulk actions act on these; a
+    /// table of two hundred entries is unusable one row at a time.
+    selected_rows: std::collections::BTreeSet<usize>,
+    /// Groups collapsed in the view.
+    collapsed_groups: std::collections::BTreeSet<String>,
+    /// Text of the bulk "assign group" field.
+    bulk_group: String,
     /// The thread that writes the frozen values. It owns the target handle, so
     /// `ProcessTarget::attach` happens once per pid rather than on every tick.
     #[cfg(target_os = "linux")]
@@ -195,6 +231,9 @@ impl CheatTablePanel {
             status_msg: None,
             modules: Vec::new(),
             modules_at: None,
+            selected_rows: std::collections::BTreeSet::new(),
+            collapsed_groups: std::collections::BTreeSet::new(),
+            bulk_group: String::new(),
             #[cfg(target_os = "linux")]
             freeze_worker: None,
         }
@@ -318,7 +357,7 @@ impl CheatTablePanel {
             )
                 && let Some(bytes) = value_text_to_bytes(vt, &entry.frozen_value)
             {
-                freeze_set.set(addr, bytes);
+                freeze_set.set_with(addr, bytes, parse_freeze_mode(&entry.freeze_mode), Some(vt));
             }
         }
         let Some(pid) = pid else {
@@ -357,6 +396,51 @@ impl CheatTablePanel {
     #[cfg(not(target_os = "linux"))]
     pub fn tick_freeze(&mut self, _process: Option<&Process>, _pid: Option<Pid>) {}
 
+    /// Toggle any entry whose hotkey was pressed this frame.
+    ///
+    /// Guarded on text focus by the caller: a hotkey is a *global* shortcut and
+    /// must not fire while the user is typing a description into this very
+    /// table.
+    pub fn tick_hotkeys(&mut self, ctx: &egui::Context) {
+        let mut toggled = Vec::new();
+        for (i, entry) in self.table.entries.iter().enumerate() {
+            if entry.hotkey.trim().is_empty() {
+                continue;
+            }
+            let Some((ctrl, shift, alt, key)) = super::parse_hotkey(&entry.hotkey) else {
+                continue;
+            };
+            let modifiers = egui::Modifiers {
+                command: ctrl,
+                ctrl,
+                shift,
+                alt,
+                mac_cmd: false,
+            };
+            // `consume_key`, so a table hotkey does not also reach whatever else
+            // is listening for the same combination.
+            if ctx.input_mut(|i| i.consume_key(modifiers, key)) {
+                toggled.push(i);
+            }
+        }
+        for i in toggled {
+            let live = self.live_values.get(i).cloned().unwrap_or_default();
+            if let Some(entry) = self.table.entries.get_mut(i) {
+                entry.frozen = !entry.frozen;
+                if entry.frozen {
+                    entry.frozen_value = live;
+                } else {
+                    entry.frozen_value.clear();
+                }
+                self.status_msg = Some(format!(
+                    "{} '{}'",
+                    if entry.frozen { "Froze" } else { "Unfroze" },
+                    entry.description
+                ));
+            }
+        }
+    }
+
     /// Draw the panel. Returns an action for the parent to apply.
     pub fn show(
         &mut self,
@@ -366,6 +450,7 @@ impl CheatTablePanel {
         project_dir: Option<&std::path::Path>,
     ) -> CheatTablePanelAction {
         let mut action = CheatTablePanelAction::None;
+        let mut bulk: Option<BulkAction> = None;
 
         // ── toolbar ─────────────────────────────────────────────────────────
         ui.horizontal(|ui| {
@@ -419,10 +504,81 @@ impl CheatTablePanel {
             ui.weak("(Ctrl+F: freeze all)");
         });
 
+        // Bulk actions over the selected rows.
+        ui.horizontal_wrapped(|ui| {
+            let picked = self.selected_rows.len();
+            let any = picked > 0;
+            ui.weak(format!("{picked} selected"));
+            if ui.add_enabled(any, egui::Button::new("Freeze")).clicked() {
+                bulk = Some(BulkAction::Freeze(true));
+            }
+            if ui.add_enabled(any, egui::Button::new("Unfreeze")).clicked() {
+                bulk = Some(BulkAction::Freeze(false));
+            }
+            if ui.add_enabled(any, egui::Button::new("Remove")).clicked() {
+                bulk = Some(BulkAction::Remove);
+            }
+            ui.label("Group:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.bulk_group)
+                    .desired_width(90.0)
+                    .hint_text("name"),
+            );
+            if ui
+                .add_enabled(any, egui::Button::new("Assign"))
+                .on_hover_text("Put every selected row in this group")
+                .clicked()
+            {
+                bulk = Some(BulkAction::Group(self.bulk_group.trim().to_string()));
+            }
+            ui.separator();
+            if ui.button("Select all").clicked() {
+                bulk = Some(BulkAction::SelectAll);
+            }
+            if ui.add_enabled(any, egui::Button::new("Clear selection")).clicked() {
+                bulk = Some(BulkAction::ClearSelection);
+            }
+
+            // Group visibility. Collapsing is what makes a two-hundred-row table
+            // navigable at all.
+            let groups: std::collections::BTreeSet<String> = self
+                .table
+                .entries
+                .iter()
+                .map(|e| e.group.clone())
+                .filter(|g| !g.is_empty())
+                .collect();
+            if !groups.is_empty() {
+                ui.separator();
+                ui.menu_button("Groups ▸", |ui| {
+                    for g in &groups {
+                        let mut shown = !self.collapsed_groups.contains(g);
+                        if ui.checkbox(&mut shown, g).changed() {
+                            if shown {
+                                self.collapsed_groups.remove(g);
+                            } else {
+                                self.collapsed_groups.insert(g.clone());
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
         ui.separator();
 
         // ── refresh live values ──────────────────────────────────────────────
-        let n = self.table.entries.len();
+        // Rows of a collapsed group are not drawn, so the table maps a drawn
+        // row back to its entry rather than indexing the entries directly.
+        let visible: Vec<usize> = self
+            .table
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.group.is_empty() || !self.collapsed_groups.contains(&e.group))
+            .map(|(i, _)| i)
+            .collect();
+        let n = visible.len();
         self.live_values.resize(n, String::new());
         // Cached — this used to parse the whole of /proc/<pid>/maps every frame,
         // and again further down for a value write.
@@ -436,6 +592,13 @@ impl CheatTablePanel {
         // Collect deferred mutations (can't mutate inside the TableBuilder closure).
         let mut to_remove: Option<usize> = None;
         let mut freeze_toggle: Option<usize> = None;
+        let mut select_toggle: Option<usize> = None;
+        let mut group_edit: Option<(usize, String)> = None;
+        let mut mode_edit: Option<(usize, nemclass_scan::FreezeMode)> = None;
+        let mut hotkey_edit: Option<(usize, String)> = None;
+        let mut offset_edit: Option<usize> = None;
+        // Cloned so the body closure does not borrow `self`.
+        let selected_rows = self.selected_rows.clone();
         let mut write_value: Option<(usize, String)> = None;
         let mut addr_edit_commit: Option<(usize, String)> = None;
         let mut desc_edit_commit: Option<(usize, String)> = None;
@@ -451,13 +614,19 @@ impl CheatTablePanel {
             TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
-                .column(Column::initial(24.0).at_least(24.0))
-                .column(Column::initial(140.0).at_least(80.0))
-                .column(Column::initial(140.0).at_least(80.0))
-                .column(Column::initial(80.0).at_least(60.0))
-                .column(Column::initial(100.0).at_least(60.0))
-                .column(Column::remainder().at_least(80.0))
+                .column(Column::initial(24.0).at_least(24.0))   // select
+                .column(Column::initial(24.0).at_least(24.0))   // freeze
+                .column(Column::initial(140.0).at_least(80.0))  // description
+                .column(Column::initial(140.0).at_least(80.0))  // address
+                .column(Column::initial(80.0).at_least(50.0))   // group
+                .column(Column::initial(80.0).at_least(60.0))   // type
+                .column(Column::initial(118.0).at_least(70.0))  // hold
+                .column(Column::initial(100.0).at_least(60.0))  // value
+                .column(Column::remainder().at_least(80.0))     // actions
                 .header(row_height + 2.0, |mut h| {
+                    h.col(|ui| {
+                        ui.strong("☑");
+                    });
                     h.col(|ui| {
                         ui.strong("❄");
                     });
@@ -468,7 +637,13 @@ impl CheatTablePanel {
                         ui.strong("Address");
                     });
                     h.col(|ui| {
+                        ui.strong("Group");
+                    });
+                    h.col(|ui| {
                         ui.strong("Type");
+                    });
+                    h.col(|ui| {
+                        ui.strong("Hold");
                     });
                     h.col(|ui| {
                         ui.strong("Value");
@@ -479,7 +654,7 @@ impl CheatTablePanel {
                 })
                 .body(|body| {
                     body.rows(row_height, n, |mut row| {
-                        let idx = row.index();
+                        let Some(&idx) = visible.get(row.index()) else { return };
                         let entry = match self.table.entries.get(idx) {
                             Some(e) => e,
                             None => return,
@@ -488,9 +663,18 @@ impl CheatTablePanel {
                         let addr_str = entry.address.clone();
                         let desc_str = entry.description.clone();
                         let vtype_str = entry.value_type.clone();
+                        let group_str = entry.group.clone();
+                        let mode_str = entry.freeze_mode.clone();
+                        let hotkey_str = entry.hotkey.clone();
                         let live_val =
                             self.live_values.get(idx).cloned().unwrap_or_default();
 
+                        row.col(|ui| {
+                            let mut picked = selected_rows.contains(&idx);
+                            if ui.checkbox(&mut picked, "").changed() {
+                                select_toggle = Some(idx);
+                            }
+                        });
                         row.col(|ui| {
                             let mut f = frozen;
                             if ui.checkbox(&mut f, "").changed() {
@@ -510,6 +694,19 @@ impl CheatTablePanel {
                             }
                         });
                         row.col(|ui| {
+                            let mut group = group_str.clone();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut group)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("group"),
+                                )
+                                .changed()
+                            {
+                                group_edit = Some((idx, group));
+                            }
+                        });
+                        row.col(|ui| {
                             let cur_vt = ScanValueType::from_tag(&vtype_str)
                                 .unwrap_or(ScanValueType::I32);
                             egui::ComboBox::from_id_salt(egui::Id::new(("ct_vtype", idx)))
@@ -521,6 +718,26 @@ impl CheatTablePanel {
                                             .clicked()
                                         {
                                             vtype_edit = Some((idx, vt));
+                                        }
+                                    }
+                                });
+                        });
+                        row.col(|ui| {
+                            let cur_mode = parse_freeze_mode(&mode_str);
+                            egui::ComboBox::from_id_salt(egui::Id::new(("ct_mode", idx)))
+                                .selected_text(cur_mode.label())
+                                .width(110.0)
+                                .show_ui(ui, |ui| {
+                                    for mode in [
+                                        nemclass_scan::FreezeMode::Exact,
+                                        nemclass_scan::FreezeMode::AllowIncrease,
+                                        nemclass_scan::FreezeMode::AllowDecrease,
+                                    ] {
+                                        if ui
+                                            .selectable_label(cur_mode == mode, mode.label())
+                                            .clicked()
+                                        {
+                                            mode_edit = Some((idx, mode));
                                         }
                                     }
                                 });
@@ -538,6 +755,27 @@ impl CheatTablePanel {
                                     && let Some(a) = parse_addr_text(&addr_str) {
                                         goto_addr = Some(a);
                                     }
+                                if ui
+                                    .small_button("+[ ]")
+                                    .on_hover_text("Wrap the address in a pointer dereference")
+                                    .clicked()
+                                {
+                                    offset_edit = Some(idx);
+                                }
+                                let mut key = hotkey_str.clone();
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut key)
+                                            .desired_width(74.0)
+                                            .hint_text("hotkey"),
+                                    )
+                                    .on_hover_text(
+                                        "A combination that toggles this freeze, e.g. Ctrl+Shift+H",
+                                    )
+                                    .changed()
+                                {
+                                    hotkey_edit = Some((idx, key));
+                                }
                                 if ui.small_button("Remove").clicked() {
                                     to_remove = Some(idx);
                                 }
@@ -565,6 +803,30 @@ impl CheatTablePanel {
             && let Some(entry) = self.table.entries.get_mut(idx) {
                 entry.address = addr;
             }
+        if let Some(idx) = select_toggle
+            && !self.selected_rows.remove(&idx)
+        {
+            self.selected_rows.insert(idx);
+        }
+        if let Some((idx, group)) = group_edit
+            && let Some(entry) = self.table.entries.get_mut(idx) {
+                entry.group = group;
+            }
+        if let Some((idx, mode)) = mode_edit
+            && let Some(entry) = self.table.entries.get_mut(idx) {
+                entry.freeze_mode = freeze_mode_tag(mode).to_string();
+            }
+        if let Some((idx, key)) = hotkey_edit
+            && let Some(entry) = self.table.entries.get_mut(idx) {
+                entry.hotkey = key;
+            }
+        if let Some(idx) = offset_edit
+            && let Some(entry) = self.table.entries.get_mut(idx) {
+                // Wrap the current expression in a dereference and add an
+                // offset placeholder. Building a pointer chain by hand meant
+                // getting every bracket right in a single-line text field.
+                entry.address = format!("[{}] + 0x0", entry.address.trim());
+            }
         if let Some((idx, vt)) = vtype_edit
             && let Some(entry) = self.table.entries.get_mut(idx) {
                 entry.value_type = vt.as_tag().to_string();
@@ -586,9 +848,21 @@ impl CheatTablePanel {
             && idx < self.table.entries.len() {
                 self.table.entries.remove(idx);
                 self.live_values.truncate(self.table.entries.len());
+                // Indices after the removed row all shift down by one; leaving
+                // the set alone would silently re-point every selection.
+                self.selected_rows = self
+                    .selected_rows
+                    .iter()
+                    .filter(|&&i| i != idx)
+                    .map(|&i| if i > idx { i - 1 } else { i })
+                    .collect();
             }
         if let Some(addr) = goto_addr {
             action = CheatTablePanelAction::GotoAddr(addr);
+        }
+
+        if let Some(bulk) = bulk {
+            self.apply_bulk(bulk);
         }
 
         if let Some(msg) = &self.status_msg {
@@ -597,6 +871,47 @@ impl CheatTablePanel {
         }
 
         action
+    }
+
+    /// Apply a bulk action to the selected rows.
+    fn apply_bulk(&mut self, bulk: BulkAction) {
+        match bulk {
+            BulkAction::SelectAll => {
+                self.selected_rows = (0..self.table.entries.len()).collect();
+            }
+            BulkAction::ClearSelection => self.selected_rows.clear(),
+            BulkAction::Freeze(on) => {
+                for &i in &self.selected_rows {
+                    if let Some(entry) = self.table.entries.get_mut(i) {
+                        entry.frozen = on;
+                        if on {
+                            entry.frozen_value =
+                                self.live_values.get(i).cloned().unwrap_or_default();
+                        } else {
+                            entry.frozen_value.clear();
+                        }
+                    }
+                }
+            }
+            BulkAction::Group(name) => {
+                for &i in &self.selected_rows {
+                    if let Some(entry) = self.table.entries.get_mut(i) {
+                        entry.group = name.clone();
+                    }
+                }
+            }
+            BulkAction::Remove => {
+                // Back to front: removing an earlier row shifts every later
+                // index, so front-to-back would delete the wrong entries.
+                for &i in self.selected_rows.iter().rev() {
+                    if i < self.table.entries.len() {
+                        self.table.entries.remove(i);
+                    }
+                }
+                self.live_values.truncate(self.table.entries.len());
+                self.selected_rows.clear();
+            }
+        }
     }
 }
 

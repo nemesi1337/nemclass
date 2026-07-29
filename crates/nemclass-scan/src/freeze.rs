@@ -1,14 +1,62 @@
 //! Frozen values — addresses whose bytes are periodically re-written so the
 //! target can't change them (Cheat Engine's "freeze" checkbox).
 
-use crate::target::WriteTarget;
+use crate::target::{ScanTarget, WriteTarget};
+use crate::value_type::ScanValueType;
 
-/// A set of frozen `(address, bytes)` entries. The UI calls [`FreezeSet::apply`]
-/// on a cadence (e.g. once per frame) to re-pin each value in the target.
+/// How strictly a value is held.
+///
+/// Cheat Engine's freeze dropdown. "Allow increase" is not a weaker freeze — it
+/// is a *ratchet*: the value may rise on its own and the new high becomes the
+/// floor, which is how a score or a level is held without pinning it to one
+/// number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FreezeMode {
+    /// Hold exactly this value.
+    #[default]
+    Exact,
+    /// Let the value rise; write it back if it falls.
+    AllowIncrease,
+    /// Let the value fall; write it back if it rises.
+    AllowDecrease,
+}
+
+impl FreezeMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "Exact",
+            Self::AllowIncrease => "Allow increase",
+            Self::AllowDecrease => "Allow decrease",
+        }
+    }
+
+    /// Whether the mode needs to read before it writes.
+    pub fn reads_first(self) -> bool {
+        !matches!(self, Self::Exact)
+    }
+}
+
+/// One frozen value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreezeEntry {
+    /// Absolute address.
+    pub address: usize,
+    /// The exact bytes to hold there.
+    pub bytes: Vec<u8>,
+    /// How strictly.
+    pub mode: FreezeMode,
+    /// How to compare, for the ratchet modes. `None` compares bytewise, which is
+    /// wrong for a signed or floating-point value — so a ratchet without a type
+    /// falls back to an exact freeze rather than comparing nonsense.
+    pub value_type: Option<ScanValueType>,
+}
+
+/// A set of frozen entries. The UI calls [`FreezeSet::apply`] on a cadence
+/// (e.g. once per frame) to re-pin each value in the target.
 #[derive(Debug, Clone, Default)]
 pub struct FreezeSet {
-    /// The frozen entries: an absolute address and the exact bytes to hold there.
-    pub entries: Vec<(usize, Vec<u8>)>,
+    /// The frozen entries.
+    pub entries: Vec<FreezeEntry>,
 }
 
 impl FreezeSet {
@@ -17,25 +65,36 @@ impl FreezeSet {
         Self::default()
     }
 
-    /// Adds (or replaces) a frozen value at `address`.
+    /// Adds (or replaces) an exact frozen value at `address`.
     pub fn set(&mut self, address: usize, bytes: Vec<u8>) {
-        if let Some(entry) = self.entries.iter_mut().find(|(a, _)| *a == address) {
-            entry.1 = bytes;
-        } else {
-            self.entries.push((address, bytes));
+        self.set_with(address, bytes, FreezeMode::Exact, None);
+    }
+
+    /// Adds (or replaces) a frozen value with an explicit mode.
+    pub fn set_with(
+        &mut self,
+        address: usize,
+        bytes: Vec<u8>,
+        mode: FreezeMode,
+        value_type: Option<ScanValueType>,
+    ) {
+        let entry = FreezeEntry { address, bytes, mode, value_type };
+        match self.entries.iter_mut().find(|e| e.address == address) {
+            Some(existing) => *existing = entry,
+            None => self.entries.push(entry),
         }
     }
 
     /// Removes the frozen value at `address`, if present.
     pub fn remove(&mut self, address: usize) {
-        self.entries.retain(|(a, _)| *a != address);
+        self.entries.retain(|e| e.address != address);
     }
 
-    /// Consumes the set, returning its `(address, bytes)` entries.
+    /// Consumes the set, returning its entries.
     ///
     /// For handing a snapshot to a writer thread: the set is rebuilt from the
     /// table on every UI tick, so there is nothing to keep.
-    pub fn into_entries(self) -> Vec<(usize, Vec<u8>)> {
+    pub fn into_entries(self) -> Vec<FreezeEntry> {
         self.entries
     }
 
@@ -60,9 +119,72 @@ impl FreezeSet {
     /// is read-only" from "frozen fine".
     pub fn apply<T: WriteTarget>(&self, target: &T) -> FreezeReport {
         let mut report = FreezeReport::default();
-        for (addr, bytes) in &self.entries {
-            match target.write(*addr, bytes) {
-                Ok(written) if written == bytes.len() => report.written += 1,
+        for entry in &self.entries {
+            match target.write(entry.address, &entry.bytes) {
+                Ok(written) if written == entry.bytes.len() => report.written += 1,
+                Ok(_) => report.short += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    report.last_error = Some(e);
+                }
+            }
+        }
+        report
+    }
+
+    /// [`Self::apply`], honouring the ratchet modes.
+    ///
+    /// Takes `&mut self` because a ratchet *moves*: when the value rises past an
+    /// `AllowIncrease` floor, the new high becomes the floor. Storing that back
+    /// is the whole behaviour — without it the next pass would drag the value
+    /// back down to the original, which is an exact freeze wearing a different
+    /// label.
+    pub fn apply_ratcheting<T: ScanTarget + WriteTarget>(
+        &mut self,
+        target: &T,
+    ) -> FreezeReport {
+        let mut report = FreezeReport::default();
+        for entry in &mut self.entries {
+            // A ratchet needs a numeric comparison, and a bytewise one is wrong
+            // for anything signed or floating-point.
+            let ratchet = match (entry.mode, entry.value_type) {
+                (FreezeMode::Exact, _) | (_, None) => None,
+                (mode, Some(vt)) => Some((mode, vt)),
+            };
+
+            if let Some((mode, value_type)) = ratchet {
+                let mut current = vec![0u8; entry.bytes.len()];
+                match target.read(entry.address, &mut current) {
+                    Ok(n) if n == current.len() => {
+                        let moved_the_right_way = match mode {
+                            FreezeMode::AllowIncrease => value_type.compare_change(
+                                crate::compare::ScanCompareType::Increased,
+                                &current,
+                                &entry.bytes,
+                            ),
+                            FreezeMode::AllowDecrease => value_type.compare_change(
+                                crate::compare::ScanCompareType::Decreased,
+                                &current,
+                                &entry.bytes,
+                            ),
+                            FreezeMode::Exact => false,
+                        };
+                        if moved_the_right_way {
+                            // Let it stand, and hold the new value from now on.
+                            entry.bytes = current;
+                            report.written += 1;
+                            continue;
+                        }
+                    }
+                    // Unreadable: fall through and write, which is the safer of
+                    // the two — a ratchet that stops writing because one read
+                    // failed silently stops freezing.
+                    _ => {}
+                }
+            }
+
+            match target.write(entry.address, &entry.bytes) {
+                Ok(written) if written == entry.bytes.len() => report.written += 1,
                 Ok(_) => report.short += 1,
                 Err(e) => {
                     report.failed += 1;

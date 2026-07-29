@@ -430,17 +430,29 @@ impl PointerScanPanel {
         let rows = std::mem::take(&mut self.rows);
         let before = rows.len();
         self.status_msg = Some("Rescanning…".into());
-        self.rescan_job.spawn(rt, ctx, move || {
+        // Cancellable, and it publishes progress: a rescan does one live read
+        // per path, which over ten thousand results is not instant.
+        self.rescan_job.spawn_cancellable(rt, ctx, move |job| {
             let read_ptr = |addr: usize| -> Option<usize> {
                 proc.read::<u64>(addr).ok().map(|v| v as usize)
             };
-            let kept: Vec<PathRow> = rows
-                .into_iter()
-                .filter(|row| {
-                    let path = PointerPath { base: row.base, offsets: row.offsets.clone() };
-                    path.resolve(read_ptr) == Some(goal)
-                })
-                .collect();
+            let total = rows.len() as u64;
+            let mut kept: Vec<PathRow> = Vec::new();
+            for (i, row) in rows.into_iter().enumerate() {
+                if i % 128 == 0 {
+                    job.set_progress(i as u64, total);
+                    if job.is_cancelled() {
+                        // Hand back what survived so far rather than an empty
+                        // list: a stopped rescan should not look like "every
+                        // chain is dead".
+                        break;
+                    }
+                }
+                let path = PointerPath { base: row.base, offsets: row.offsets.clone() };
+                if path.resolve(read_ptr) == Some(goal) {
+                    kept.push(row);
+                }
+            }
             (kept, before)
         });
     }

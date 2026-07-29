@@ -490,6 +490,74 @@ fn enumerate_modules(handle: HANDLE) -> crate::Result<Vec<Module>> {
     Ok(out)
 }
 
+/// The full on-disk path of the module loaded at `module_base`.
+///
+/// [`Module::name`] holds only the file name, which is enough to identify a
+/// module but not to find its PDB — so symbolication asks for the path
+/// separately rather than widening the platform-neutral `Module` shape for one
+/// platform's needs.
+fn module_path_at(handle: HANDLE, module_base: usize) -> crate::Result<String> {
+    let mut needed: u32 = 0;
+    // SAFETY: as in `enumerate_modules` — a null array with `cb = 0` asks only
+    // for the required size.
+    let ok = unsafe { EnumProcessModules(handle, core::ptr::null_mut(), 0, &mut needed) };
+    if ok == FALSE {
+        return Error::last_win32();
+    }
+    let count = needed as usize / core::mem::size_of::<HMODULE>();
+    if count == 0 {
+        return Err(Error::ModuleNotFound);
+    }
+    let mut modules: Vec<HMODULE> = vec![core::ptr::null_mut(); count];
+    let cb = (modules.len() * core::mem::size_of::<HMODULE>()) as u32;
+    // SAFETY: `modules` is a live buffer of `count` `HMODULE`s and `cb` its exact
+    // byte length.
+    let ok = unsafe { EnumProcessModules(handle, modules.as_mut_ptr(), cb, &mut needed) };
+    if ok == FALSE {
+        return Error::last_win32();
+    }
+    modules.truncate(needed as usize / core::mem::size_of::<HMODULE>());
+
+    for hmodule in modules {
+        let mut info = MODULEINFO::default();
+        // SAFETY: live out-buffer, live handles; a module unloaded between the
+        // two calls fails cleanly and is skipped.
+        let ok = unsafe {
+            GetModuleInformation(
+                handle,
+                hmodule,
+                &mut info,
+                core::mem::size_of::<MODULEINFO>() as u32,
+            )
+        };
+        if ok == FALSE || info.lpBaseOfDll as usize != module_base {
+            continue;
+        }
+        let mut buf = [0u16; MAX_PATH as usize];
+        // SAFETY: `buf` is a live array of `buf.len()` `u16`s matching `nsize`.
+        let len = unsafe {
+            GetModuleFileNameExW(handle, hmodule, buf.as_mut_ptr(), buf.len() as u32)
+        };
+        if len == 0 {
+            return Error::last_win32();
+        }
+        return Ok(wide_to_string(&buf[..len as usize]));
+    }
+    Err(Error::ModuleNotFound)
+}
+
+impl WindowsProvider {
+    /// The on-disk path of the module loaded at `module_base` in `pid`.
+    ///
+    /// Opens its own handle: this is a one-shot query for symbolication, not
+    /// something on any hot path, and taking a handle as a parameter would push
+    /// the Win32 type into a platform-neutral caller.
+    pub fn module_path(pid: Pid, module_base: usize) -> crate::Result<String> {
+        let backend = WindowsBackend::open(pid)?;
+        module_path_at(backend.handle(), module_base)
+    }
+}
+
 /// Maps a Win32 `PAGE_*` protection mask to the neutral [`Protection`] bits.
 ///
 /// Mirrors the `Protect` decoding in ReClass.NET's

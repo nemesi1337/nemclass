@@ -1586,3 +1586,94 @@ fn the_byte_prefilter_does_not_change_which_positions_match() {
         BASE + 2500
     ]);
 }
+
+// ── freeze modes ───────────────────────────────────────────────────────────
+
+#[test]
+fn an_allow_increase_freeze_lets_the_value_rise_and_holds_the_new_high() {
+    use crate::{FreezeMode, FreezeSet};
+
+    let target = CellTarget::new(BASE, buf_with_i32(0, 100));
+    let mut set = FreezeSet::new();
+    set.set_with(BASE, 100i32.to_le_bytes().to_vec(), FreezeMode::AllowIncrease, Some(ScanValueType::I32));
+
+    // It went up on its own: leave it, and hold the new value from now on.
+    target.poke(BASE, &150i32.to_le_bytes());
+    set.apply_ratcheting(&target);
+    assert_eq!(target.peek(BASE, 4), 150i32.to_le_bytes());
+
+    // It went down: put it back to the *new* high, not the original.
+    target.poke(BASE, &20i32.to_le_bytes());
+    set.apply_ratcheting(&target);
+    assert_eq!(
+        target.peek(BASE, 4),
+        150i32.to_le_bytes(),
+        "the ratchet moved; restoring 100 would be an exact freeze wearing a different label"
+    );
+}
+
+#[test]
+fn an_allow_decrease_freeze_is_the_mirror_image() {
+    use crate::{FreezeMode, FreezeSet};
+
+    let target = CellTarget::new(BASE, buf_with_i32(0, 100));
+    let mut set = FreezeSet::new();
+    set.set_with(BASE, 100i32.to_le_bytes().to_vec(), FreezeMode::AllowDecrease, Some(ScanValueType::I32));
+
+    target.poke(BASE, &40i32.to_le_bytes());
+    set.apply_ratcheting(&target);
+    assert_eq!(target.peek(BASE, 4), 40i32.to_le_bytes(), "falling is allowed");
+
+    target.poke(BASE, &900i32.to_le_bytes());
+    set.apply_ratcheting(&target);
+    assert_eq!(target.peek(BASE, 4), 40i32.to_le_bytes(), "rising is not");
+}
+
+#[test]
+fn an_exact_freeze_pins_the_value_in_both_directions() {
+    use crate::{FreezeMode, FreezeSet};
+
+    let target = CellTarget::new(BASE, buf_with_i32(0, 100));
+    let mut set = FreezeSet::new();
+    set.set_with(BASE, 100i32.to_le_bytes().to_vec(), FreezeMode::Exact, Some(ScanValueType::I32));
+
+    for other in [5i32, 5000] {
+        target.poke(BASE, &other.to_le_bytes());
+        set.apply_ratcheting(&target);
+        assert_eq!(target.peek(BASE, 4), 100i32.to_le_bytes());
+    }
+}
+
+#[test]
+fn a_ratchet_compares_as_the_value_type_not_as_bytes() {
+    use crate::{FreezeMode, FreezeSet};
+
+    // -1 has a larger *unsigned* byte pattern than 1, so a bytewise comparison
+    // gets the direction exactly backwards for a signed value.
+    let target = CellTarget::new(BASE, buf_with_i32(0, 1));
+    let mut set = FreezeSet::new();
+    set.set_with(BASE, 1i32.to_le_bytes().to_vec(), FreezeMode::AllowIncrease, Some(ScanValueType::I32));
+
+    target.poke(BASE, &(-1i32).to_le_bytes());
+    set.apply_ratcheting(&target);
+    assert_eq!(
+        target.peek(BASE, 4),
+        1i32.to_le_bytes(),
+        "-1 is a decrease, so it is written back"
+    );
+}
+
+#[test]
+fn a_ratchet_with_no_value_type_falls_back_to_an_exact_freeze() {
+    use crate::{FreezeMode, FreezeSet};
+
+    // Without a type there is no way to compare correctly, and guessing
+    // bytewise would be wrong for most types.
+    let target = CellTarget::new(BASE, buf_with_i32(0, 100));
+    let mut set = FreezeSet::new();
+    set.set_with(BASE, 100i32.to_le_bytes().to_vec(), FreezeMode::AllowIncrease, None);
+
+    target.poke(BASE, &900i32.to_le_bytes());
+    set.apply_ratcheting(&target);
+    assert_eq!(target.peek(BASE, 4), 100i32.to_le_bytes());
+}

@@ -148,6 +148,20 @@ impl SymbolResolver {
     }
 }
 
+// The Windows counterpart: the module list already carries the on-disk path, so
+// finding it needs no extra syscall.
+#[cfg(windows)]
+impl SymbolResolver {
+    /// Builds a resolver for the module mapped at `module_base` in process
+    /// `pid`, taking its on-disk path from the module list.
+    ///
+    /// Fails with [`Error::ModuleNotFound`] if no module is mapped there.
+    pub fn for_process_module(pid: crate::Pid, module_base: usize) -> crate::Result<Self> {
+        let path = crate::WindowsProvider::module_path(pid, module_base)?;
+        Self::for_module(Path::new(&path), module_base)
+    }
+}
+
 // A Linux convenience that finds a module's on-disk path from `/proc/<pid>/maps`
 // and builds a resolver for it. Kept Linux-specific (it reads `/proc`) while the
 // core `for_module` stays platform-neutral.

@@ -38,6 +38,18 @@ pub struct CheatEntry {
     /// means ungrouped.
     #[serde(default)]
     pub group: String,
+    /// How strictly the value is held: `"exact"` (the default),
+    /// `"allow_increase"` or `"allow_decrease"`.
+    ///
+    /// A string rather than an enum so an older build reading a newer table sees
+    /// an unfamiliar mode and falls back to an exact freeze, instead of failing
+    /// to parse the whole file over one row.
+    #[serde(default)]
+    pub freeze_mode: String,
+    /// A key combination that toggles this entry's freeze, in the same spelling
+    /// the scripting API's hotkeys use (`"Ctrl+Shift+H"`). Empty means none.
+    #[serde(default)]
+    pub hotkey: String,
 }
 
 impl CheatEntry {
@@ -54,6 +66,8 @@ impl CheatEntry {
             frozen: false,
             frozen_value: String::new(),
             group: String::new(),
+            freeze_mode: String::new(),
+            hotkey: String::new(),
         }
     }
 }

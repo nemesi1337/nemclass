@@ -610,3 +610,111 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::ProcessTarget;
+
+// The Windows target. Structurally the same as the Linux one — the seams are
+// platform-neutral, which is the whole point of having them — but it enumerates
+// through `WindowsProvider` (`VirtualQueryEx`) and reads through
+// `ReadProcessMemory`. There was previously no Windows `ScanTarget` at all, so
+// the scanner, the pointer scan and the spider could not run there even though
+// every layer beneath them could.
+#[cfg(windows)]
+mod win {
+    use std::sync::Arc;
+
+    use super::{Region, ScanTarget, SectionFilter, WriteTarget, coalesce_regions};
+    use nemclass_core::{Process, ProviderRegistry, Result};
+
+    /// A live Windows scan target backed by an opened [`Process`].
+    pub struct ProcessTarget {
+        process: Arc<Process>,
+        pid: nemclass_core::Pid,
+        filter: SectionFilter,
+    }
+
+    impl ProcessTarget {
+        /// Opens `pid` through the native (`"windows-native"`) provider.
+        pub fn attach(pid: nemclass_core::Pid) -> Result<Self> {
+            use nemclass_core::ProcessProvider;
+            let provider = nemclass_core::WindowsProvider;
+            Ok(Self::from_shared(Arc::new(provider.open(pid)?)))
+        }
+
+        /// Wraps an already-opened process handle.
+        pub fn from_shared(process: Arc<Process>) -> Self {
+            let pid = process.pid();
+            Self { process, pid, filter: SectionFilter::default() }
+        }
+
+        /// Opens `pid` through a named provider in `registry`.
+        pub fn open_with(
+            registry: &ProviderRegistry,
+            provider: &str,
+            pid: nemclass_core::Pid,
+        ) -> Result<Self> {
+            let provider = registry
+                .get(provider)
+                .ok_or(nemclass_core::Error::ProcessNotFound)?;
+            Ok(Self::from_shared(Arc::new(provider.open(pid)?)))
+        }
+
+        pub fn with_section_filter(mut self, filter: SectionFilter) -> Self {
+            self.filter = filter;
+            self
+        }
+
+        pub fn set_section_filter(&mut self, filter: SectionFilter) {
+            self.filter = filter;
+        }
+
+        pub fn section_filter(&self) -> &SectionFilter {
+            &self.filter
+        }
+
+        pub fn process(&self) -> &Process {
+            &self.process
+        }
+    }
+
+    impl ScanTarget for ProcessTarget {
+        fn regions(&self) -> Result<Vec<Region>> {
+            use nemclass_core::ProcessProvider;
+            let provider = nemclass_core::WindowsProvider;
+            let sections = provider.enumerate_sections(self.pid)?;
+            Ok(coalesce_regions(
+                sections
+                    .into_iter()
+                    .filter(|s| s.size > 0 && self.filter.keep(s))
+                    .map(|s| Region::new(s.base, s.size))
+                    .collect(),
+            ))
+        }
+
+        fn read(&self, addr: usize, buf: &mut [u8]) -> Result<usize> {
+            self.process.read_buf(addr, buf)
+        }
+
+        fn read_batch(
+            &self,
+            spans: &mut [(usize, &mut [u8])],
+            out: &mut [Result<usize>],
+        ) {
+            // `ReadProcessMemory` has no vectored form, so the batch is a loop —
+            // but going through the same entry point keeps the scan engine's
+            // batching path identical on both platforms rather than special-cased.
+            for (i, (addr, buf)) in spans.iter_mut().enumerate() {
+                if let Some(slot) = out.get_mut(i) {
+                    *slot = self.process.read_buf(*addr, buf);
+                }
+            }
+        }
+    }
+
+    impl WriteTarget for ProcessTarget {
+        fn write(&self, addr: usize, buf: &[u8]) -> Result<usize> {
+            self.process.write_buf(addr, buf)
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use win::ProcessTarget;

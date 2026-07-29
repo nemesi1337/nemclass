@@ -1166,6 +1166,8 @@ mod inner {
                     self.cheat_table.push(nemclass_model::CheatEntry {
                         description, address, value_type, frozen,
                         frozen_value, group: String::new(),
+                        freeze_mode: String::new(),
+                        hotkey: String::new(),
                     });
                     Ok(json!(idx))
                 }

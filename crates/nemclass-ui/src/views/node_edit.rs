@@ -327,29 +327,29 @@ impl NemclassApp {
     pub(crate) fn undo(&mut self) {
         let Some(current) = self.project_snapshot() else { return };
         let Some(previous) = self.history.take_undo(current) else {
-            self.status_msg = Some("Nothing to undo".to_string());
+            self.toasts.info("Nothing to undo");
             return;
         };
         if let Err(e) = self.restore_snapshot(&previous) {
-            self.last_error = Some(e);
+            self.toasts.error(e);
             return;
         }
         self.project_dirty = true;
-        self.status_msg = Some("Undo".to_string());
+        self.toasts.info("Undo");
     }
 
     pub(crate) fn redo(&mut self) {
         let Some(current) = self.project_snapshot() else { return };
         let Some(next) = self.history.take_redo(current) else {
-            self.status_msg = Some("Nothing to redo".to_string());
+            self.toasts.info("Nothing to redo");
             return;
         };
         if let Err(e) = self.restore_snapshot(&next) {
-            self.last_error = Some(e);
+            self.toasts.error(e);
             return;
         }
         self.project_dirty = true;
-        self.status_msg = Some("Redo".to_string());
+        self.toasts.info("Redo");
     }
 
     /// Drop every cached view of the class body.

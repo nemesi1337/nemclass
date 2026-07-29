@@ -37,7 +37,7 @@ pub mod symbols;
 #[cfg(feature = "symbols")]
 pub mod symbol_resolver;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -87,7 +87,7 @@ pub struct Process {
     // Resolvers are stored inline (not `Arc`'d): `SymbolResolver` wraps an mmap
     // and is not `Sync`, so we resolve while holding the lock instead of sharing a
     // handle across threads.
-    #[cfg(all(feature = "symbols", target_os = "linux"))]
+    #[cfg(all(feature = "symbols", any(target_os = "linux", windows)))]
     symbol_cache: std::sync::Mutex<HashMap<usize, symbol_resolver::SymbolResolver>>,
 }
 
@@ -108,7 +108,7 @@ impl Process {
         Process {
             pid,
             backend,
-            #[cfg(all(feature = "symbols", target_os = "linux"))]
+            #[cfg(all(feature = "symbols", any(target_os = "linux", windows)))]
             symbol_cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -323,6 +323,18 @@ impl Process {
         Ok(out.into_iter())
     }
 
+    /// The target's loaded modules, from `EnumProcessModules`.
+    ///
+    /// The Windows counterpart of the `/proc/<pid>/maps` walk above, so
+    /// `resolve_symbol` can find the module covering an address on either
+    /// platform through the same call.
+    #[cfg(windows)]
+    pub fn modules(&self) -> crate::Result<impl Iterator<Item = ModuleInfoWithName>> {
+        let provider = WindowsProvider;
+        let (_sections, modules) = ProcessProvider::enumerate_sections_and_modules(&provider, self.pid)?;
+        Ok(modules.into_iter())
+    }
+
     /// Resolves a runtime **absolute** code address to a function name using
     /// richer on-disk debug info (DWARF / ELF symbol table) than the export-only
     /// [`Process::resolve`] path (M5.2).
@@ -338,7 +350,7 @@ impl Process {
     ///
     /// The per-module resolver is cached on this handle, so repeated lookups into
     /// the same module reparse nothing.
-    #[cfg(all(feature = "symbols", target_os = "linux"))]
+    #[cfg(all(feature = "symbols", any(target_os = "linux", windows)))]
     pub fn resolve_symbol(&self, addr: usize) -> crate::Result<Option<String>> {
         // Locate the covering module (base..base+size). `modules()` gives the
         // aggregated base/size; symbolication needs the on-disk path, which the

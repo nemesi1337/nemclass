@@ -59,7 +59,7 @@ mod signature;
 mod value_type;
 
 pub use compare::ScanCompareType;
-pub use freeze::{FreezeReport, FreezeSet};
+pub use freeze::{FreezeEntry, FreezeMode, FreezeReport, FreezeSet};
 pub use pattern::{BytePattern, PatternByte, PatternError};
 pub use pointerscan::{
     NoPointerObserver, PointerMap, PointerMapIoError, PointerPath, PointerScanConfig,
@@ -81,8 +81,10 @@ pub use value_type::{
     DEFAULT_FLOAT_TOLERANCE, FloatRound, Needle, NeedleParseError, ScanValueType,
 };
 
-// The live Linux scan target (`process_vm_readv`/`writev` regions + IO).
-#[cfg(target_os = "linux")]
+// The live scan target: `process_vm_readv`/`writev` on Linux,
+// `ReadProcessMemory`/`VirtualQueryEx` on Windows. Same name and same shape on
+// both, so callers are not `#[cfg]`-ed.
+#[cfg(any(target_os = "linux", windows))]
 pub use target::ProcessTarget;
 
 // Re-export the core error/result vocabulary so callers keep one `Result` type.

@@ -30,6 +30,7 @@ mod script_log;
 mod scripts_panel;
 mod host_api_impl;
 mod node_edit;
+mod toast;
 mod pointer_scan_panel;
 mod spider_panel;
 pub(crate) mod cheat_table_panel;
@@ -425,6 +426,10 @@ pub struct NemclassApp {
     history: EditHistory,
     /// Nodes copied out of a class, ready to paste.
     node_clipboard: Vec<nemclass_model::serialize::NodeDef>,
+    /// The one notification surface. Panels keep their `status_msg` as an
+    /// outbox and it is drained here each frame, so a message from a tab the
+    /// user is not looking at is still seen — and expires.
+    toasts: toast::Toasts,
     /// Set by every edit, cleared by a save. Drives the title-bar marker and
     /// the prompt before New/Open discards work.
     project_dirty: bool,
@@ -599,7 +604,9 @@ pub struct HotkeyReg {
 /// case-insensitively; `Ctrl`/`Control`, `Shift`, and `Alt`/`Option` are
 /// modifiers and everything else must be exactly one egui-nameable key. Returns
 /// `None` for empty input, an unknown key, or more than one non-modifier token.
-#[cfg(feature = "scripting")]
+///
+/// Not gated on the `scripting` feature: cheat-table entries bind hotkeys too,
+/// and those work in a build with no JS engine at all.
 pub fn parse_hotkey(combo: &str) -> Option<(bool, bool, bool, egui::Key)> {
     let (mut ctrl, mut shift, mut alt) = (false, false, false);
     let mut key: Option<egui::Key> = None;
@@ -730,6 +737,7 @@ impl NemclassApp {
             visible_order: Vec::new(),
             history: EditHistory::default(),
             node_clipboard: Vec::new(),
+            toasts: toast::Toasts::new(),
             project_dirty: false,
             class_search: String::new(),
             extract_class_dialog: None,
@@ -2007,6 +2015,12 @@ impl eframe::App for NemclassApp {
         #[cfg(target_os = "linux")]
         self.disassembly_panel.poll();
         self.debugger_panel.tick_events();
+        self.collect_status_messages();
+        // Cheat-table hotkeys are global shortcuts, so they must not fire while
+        // the user is typing into a field — including this table's own.
+        if !typing_in_a_text_field(ctx) {
+            self.cheat_table_panel.tick_hotkeys(ctx);
+        }
         #[cfg(target_os = "linux")]
         self.cheat_table_panel.tick_freeze(
             self.process.as_deref(),
@@ -2114,6 +2128,7 @@ impl eframe::App for NemclassApp {
         self.show_enum_editor(ui.ctx());
         self.show_settings_dialog(ui.ctx());
         self.show_unsaved_changes_prompt(ui.ctx());
+        self.toasts.show(ui.ctx());
         // After the dialogs: a modal that has keyboard focus must get the
         // keystroke, and `typing_in_a_text_field` only reports focus once the
         // widget has been drawn this frame.
@@ -2948,6 +2963,8 @@ impl NemclassApp {
                 frozen: false,
                 frozen_value: String::new(),
                 group: String::new(),
+                        freeze_mode: String::new(),
+                        hotkey: String::new(),
             });
         }
         if let Some((addr, tag, value)) = freeze_addr {
@@ -2969,6 +2986,8 @@ impl NemclassApp {
                     frozen: true,
                     frozen_value: value,
                     group: String::new(),
+                    freeze_mode: String::new(),
+                    hotkey: String::new(),
                 }),
             }
         }
@@ -3093,6 +3112,8 @@ impl NemclassApp {
                     frozen: false,
                     frozen_value: String::new(),
                     group: String::new(),
+                        freeze_mode: String::new(),
+                        hotkey: String::new(),
                 });
             }
             SpiderAction::Freeze { formula, tag, value } => {
@@ -3113,6 +3134,8 @@ impl NemclassApp {
                         frozen: true,
                         frozen_value: value,
                         group: String::new(),
+                    freeze_mode: String::new(),
+                    hotkey: String::new(),
                     }),
                 }
             }
@@ -5137,7 +5160,10 @@ impl NemclassApp {
         if notes.len() > shown.len() {
             msg.push_str(&format!("\n  …and {} more", notes.len() - shown.len()));
         }
-        self.last_error = Some(msg);
+        // A warning, not an error: the import succeeded. It is louder than an
+        // info message because a silently downgraded field is exactly the kind
+        // of loss a user finds out about much later.
+        self.toasts.warn(msg);
     }
 
     // -----------------------------------------------------------------------
@@ -5217,6 +5243,25 @@ impl NemclassApp {
     // -----------------------------------------------------------------------
     // Settings
     // -----------------------------------------------------------------------
+
+    /// Move every panel's pending message into the one notification surface.
+    ///
+    /// Each panel used to render its own message in its own tab, so a scan error
+    /// raised while the user was looking at the class view simply never
+    /// appeared — and none of them ever expired.
+    fn collect_status_messages(&mut self) {
+        self.toasts.drain(&mut self.last_error);
+        self.toasts.drain(&mut self.status_msg);
+        self.toasts.drain(&mut self.scanner_panel.status_msg);
+        self.toasts.drain(&mut self.cheat_table_panel.status_msg);
+        self.toasts.drain(&mut self.pointer_scan_panel.status_msg);
+        self.toasts.drain(&mut self.spider_panel.status_msg);
+        #[cfg(target_os = "linux")]
+        {
+            self.toasts.drain(&mut self.memory_viewer.status_msg);
+            self.toasts.drain(&mut self.disassembly_panel.status_msg);
+        }
+    }
 
     /// Apply the saved theme to the egui context.
     ///

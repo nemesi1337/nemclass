@@ -730,8 +730,12 @@ impl DisassemblyPanel {
             return;
         }
         self.dissect_status = Some("Dissecting…".to_owned());
-        self.dissect_job
-            .spawn(rt, ctx, move || compute_dissect_many(&process, &targets));
+        // Cancellable and reporting progress: scanning a module's code takes
+        // seconds each, and several selected modules take a while with nothing
+        // but a spinner to show for it.
+        self.dissect_job.spawn_cancellable(rt, ctx, move |job| {
+            compute_dissect_many(&process, &targets, job)
+        });
     }
 
     /// `(base, size)` of every currently-selected module, for a dissect scan.
@@ -753,7 +757,10 @@ impl DisassemblyPanel {
             self.dissect_status = Some("Select modules in the Modules panel first.".to_owned());
             return;
         }
-        let result = compute_dissect_many(process, &targets);
+        // A never-cancelled handle: the screenshot path runs to completion by
+        // definition, and threading a real one through it would be ceremony.
+        let job = super::tasks::JobHandle::default();
+        let result = compute_dissect_many(process, &targets, &job);
         self.apply_dissect(result);
     }
 
@@ -2060,9 +2067,18 @@ fn compute_dissect(process: &Process, base: usize, size: usize) -> Result<Dissec
 fn compute_dissect_many(
     process: &Process,
     targets: &[(usize, usize)],
+    job: &super::tasks::JobHandle,
 ) -> Result<DissectResult, String> {
     let mut merged = DissectResult::default();
-    for &(base, size) in targets {
+    let total = targets.len() as u64;
+    for (i, &(base, size)) in targets.iter().enumerate() {
+        // Between modules rather than inside one: a single module's scan is one
+        // pass with no natural checkpoint, and cancelling part-way through it
+        // would leave a half-built cross-reference map.
+        job.set_progress(i as u64, total);
+        if job.is_cancelled() {
+            return Err("Dissect stopped".to_string());
+        }
         merge_dissect(&mut merged, compute_dissect(process, base, size)?);
     }
     // Restore the per-map "sorted + de-duplicated referrers" invariant that
