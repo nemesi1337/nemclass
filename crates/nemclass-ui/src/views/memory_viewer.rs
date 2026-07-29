@@ -32,8 +32,9 @@ use nemclass_core::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Bytes shown per row in Bytes/Word/Dword view.
-const BYTES_PER_ROW: usize = 16;
+/// Bytes-per-row choices. 16 is the default and what every hex editor uses;
+/// 8 suits pointer-dense structures and 32 suits scanning for a pattern.
+const BYTES_PER_ROW_CHOICES: [usize; 3] = [8, 16, 32];
 
 /// How many bytes to snapshot around the current address (4 KiB page).
 const SNAPSHOT_SIZE: usize = 4096;
@@ -46,6 +47,14 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(150);
 
 /// Navigation history depth cap (avoids unbounded growth).
 const HISTORY_CAP: usize = 64;
+
+/// The most qwords one snapshot will classify.
+///
+/// `classify_value` issues a live read per pointer-looking slot plus a vtable
+/// probe, so classifying a whole 4 KiB page is ~512 of those. Only the rows on
+/// screen are ever looked at, so the window follows the viewport and this is
+/// just the ceiling on how big that window may get.
+const MAX_CLASSIFIED_QWORDS: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Display type
@@ -88,6 +97,14 @@ impl DisplayType {
     }
 }
 
+/// A named address the user marked, so a structure found once can be returned
+/// to without re-deriving its address.
+#[derive(Debug, Clone)]
+pub struct Bookmark {
+    pub address: usize,
+    pub name: String,
+}
+
 // ---------------------------------------------------------------------------
 // MemoryViewer
 // ---------------------------------------------------------------------------
@@ -105,6 +122,36 @@ pub struct MemoryViewer {
     address_error: Option<String>,
     /// Back-navigation stack (push on navigate, pop on Back).
     history: Vec<usize>,
+    /// Forward stack, filled by Back so the jump can be undone. History was
+    /// back-only: stepping back one page past what you wanted meant retyping
+    /// the address.
+    forward: Vec<usize>,
+    /// Bytes shown per row.
+    bytes_per_row: usize,
+    /// Named addresses the user has marked, newest first.
+    bookmarks: Vec<Bookmark>,
+    /// Text for the "add bookmark" name field.
+    bookmark_name: String,
+
+    // ── selection and editing ─────────────────────────────────────────────
+    /// The selected byte span as absolute addresses, inclusive of both ends.
+    selection: Option<(usize, usize)>,
+    /// The address a shift-click extends the selection from.
+    selection_anchor: Option<usize>,
+    /// The byte currently being typed over: its address and the text so far.
+    editing: Option<(usize, String)>,
+    /// Bytes copied out of the view, for Paste.
+    ///
+    /// Internal rather than the system clipboard because egui cannot read the
+    /// system clipboard synchronously on every backend, and a paste that
+    /// silently did nothing would be worse than one that only round-trips
+    /// within the app. Copy also puts the hex on the system clipboard.
+    clipboard: Vec<u8>,
+    /// The byte value the Fill action writes.
+    fill_text: String,
+    /// The rows on screen last frame, so the pointer classification can follow
+    /// the viewport instead of scanning the whole page.
+    visible_rows: (usize, usize),
 
     // ── display type ──────────────────────────────────────────────────────
     display_type: DisplayType,
@@ -151,6 +198,17 @@ impl MemoryViewer {
             address_input:  String::new(),
             address_error:  None,
             history:        Vec::new(),
+            forward:        Vec::new(),
+            bytes_per_row:  16,
+            bookmarks:      Vec::new(),
+            bookmark_name:  String::new(),
+
+            selection: None,
+            selection_anchor: None,
+            editing: None,
+            clipboard: Vec::new(),
+            fill_text: "00".to_string(),
+            visible_rows: (0, 32),
 
             display_type: DisplayType::Bytes,
 
@@ -184,6 +242,10 @@ impl MemoryViewer {
         self.string_runs.clear();
         self.qword_classes.clear();
         self.history.clear();
+        self.forward.clear();
+        self.selection = None;
+        self.selection_anchor = None;
+        self.editing = None;
         self.address_error  = None;
         self.status_msg     = None;
         self.pending_disassemble = None;
@@ -244,18 +306,49 @@ impl MemoryViewer {
                 self.history.remove(0);
             }
             self.history.push(self.address);
+            // A fresh jump forks the trail, so the forward branch is gone.
+            self.forward.clear();
         }
+        self.seek(addr);
+    }
+
+    /// Move without touching the history — paging and Back/Forward.
+    fn seek(&mut self, addr: usize) {
         self.address       = addr;
-        self.address_input = format!("{:#018x}", addr);
+        self.address_input = format!("{addr:#018x}");
+        self.editing = None;
         // Force an immediate re-snapshot on next frame.
         self.last_snapshot = None;
     }
 
     fn navigate_back(&mut self) {
         if let Some(prev) = self.history.pop() {
-            self.address       = prev;
-            self.address_input = format!("{:#018x}", prev);
-            self.last_snapshot = None;
+            self.forward.push(self.address);
+            self.seek(prev);
+        }
+    }
+
+    fn navigate_forward(&mut self) {
+        if let Some(next) = self.forward.pop() {
+            if self.history.len() >= HISTORY_CAP {
+                self.history.remove(0);
+            }
+            self.history.push(self.address);
+            self.seek(next);
+        }
+    }
+
+    /// Step the window by whole pages. Saturating at both ends: a wrap would
+    /// silently teleport the view to the other end of the address space.
+    fn page(&mut self, pages: isize) {
+        let delta = SNAPSHOT_SIZE.saturating_mul(pages.unsigned_abs());
+        let target = if pages < 0 {
+            self.address.saturating_sub(delta)
+        } else {
+            self.address.saturating_add(delta)
+        };
+        if target != self.address {
+            self.seek(target);
         }
     }
 
@@ -320,17 +413,29 @@ impl MemoryViewer {
             self.qword_classes.clear();
             return;
         };
-        let num_qwords = self.bytes_read / 8;
-        self.qword_classes = (0..num_qwords)
-            .map(|qi| {
-                let off = qi * 8;
-                if off + 8 > self.buf.len() {
-                    return PointerClass::NotPointer;
-                }
-                let v = u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap_or([0u8; 8]));
-                classify_value(v, idx, |addr, buf| process.read_buf(addr, buf))
-            })
-            .collect();
+        // Only the rows on screen are ever read, and each classification costs
+        // a live read plus a vtable probe, so the window follows the viewport
+        // rather than covering the whole page.
+        let (first_row, last_row) = self.visible_rows;
+        let per_row = self.bytes_per_row;
+        let first_qword = first_row.saturating_mul(per_row) / 8;
+        let last_qword = last_row
+            .saturating_add(1)
+            .saturating_mul(per_row)
+            .div_ceil(8)
+            .min(self.bytes_read / 8)
+            .min(first_qword + MAX_CLASSIFIED_QWORDS);
+        // Indexed by absolute qword, so the draw code can look a slot up
+        // directly; slots outside the window stay `NotPointer`.
+        self.qword_classes = vec![PointerClass::NotPointer; last_qword];
+        for qi in first_qword..last_qword {
+            let off = qi * 8;
+            if off + 8 > self.buf.len() {
+                continue;
+            }
+            let v = u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap_or([0u8; 8]));
+            self.qword_classes[qi] = classify_value(v, idx, |addr, buf| process.read_buf(addr, buf));
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -406,6 +511,10 @@ impl MemoryViewer {
             if ui.add_enabled(can_back, egui::Button::new("◀ Back")).clicked() {
                 self.navigate_back();
             }
+            let can_forward = !self.forward.is_empty();
+            if ui.add_enabled(can_forward, egui::Button::new("Forward ▶")).clicked() {
+                self.navigate_forward();
+            }
 
             ui.label("Address:");
 
@@ -451,10 +560,226 @@ impl MemoryViewer {
                         ui.selectable_value(&mut self.display_type, dt, dt.label());
                     }
                 });
+
+            ui.label("Width:");
+            egui::ComboBox::from_id_salt("mem_viewer_row_width")
+                .selected_text(self.bytes_per_row.to_string())
+                .width(48.0)
+                .show_ui(ui, |ui| {
+                    for n in BYTES_PER_ROW_CHOICES {
+                        ui.selectable_value(&mut self.bytes_per_row, n, n.to_string());
+                    }
+                });
         });
+
+        self.show_edit_bar(ui, process);
+        self.show_bookmark_bar(ui);
 
         // Region info line (platform-neutral classify path — always available).
         self.show_region_info(ui, process);
+    }
+
+    /// Selection actions: copy, paste, fill, and a pattern for the scanner.
+    fn show_edit_bar(&mut self, ui: &mut egui::Ui, process: &Process) {
+        let selection = self.selection_span();
+        let has_selection = selection.is_some();
+
+        let mut page_by = 0isize;
+        ui.horizontal_wrapped(|ui| {
+            // Paging: the window was a fixed 4 KiB and the only way past it was
+            // to retype the address.
+            if ui.button("◀ Page").on_hover_text("Back one page (PageUp)").clicked() {
+                page_by = -1;
+            }
+            if ui.button("Page ▶").on_hover_text("Forward one page (PageDown)").clicked() {
+                page_by = 1;
+            }
+            ui.separator();
+            match selection {
+                Some((start, len)) => {
+                    ui.label(
+                        RichText::new(format!("{len} byte(s) at {start:#x}")).monospace(),
+                    );
+                }
+                None => {
+                    ui.weak("click a byte to select; shift-click to extend");
+                }
+            }
+            ui.separator();
+
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copy"))
+                .on_hover_text("Copy the selected bytes as hex")
+                .clicked()
+                && let Some(bytes) = self.selected_bytes()
+            {
+                let hex = hex_string(&bytes);
+                ui.ctx().copy_text(hex.clone());
+                self.clipboard = bytes;
+                self.status_msg = Some(format!("Copied {hex}"));
+            }
+
+            if ui
+                .add_enabled(
+                    has_selection && !self.clipboard.is_empty(),
+                    egui::Button::new("Paste"),
+                )
+                .on_hover_text("Write the copied bytes over the selection")
+                .clicked()
+                && let Some((start, _)) = selection
+            {
+                let bytes = self.clipboard.clone();
+                self.write_bytes(process, start, &bytes);
+            }
+
+            ui.add(
+                egui::TextEdit::singleline(&mut self.fill_text)
+                    .desired_width(28.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Fill"))
+                .on_hover_text("Write this byte over every byte of the selection")
+                .clicked()
+                && let Some((start, len)) = selection
+            {
+                match u8::from_str_radix(self.fill_text.trim(), 16) {
+                    Ok(byte) => {
+                        let bytes = vec![byte; len];
+                        self.write_bytes(process, start, &bytes);
+                    }
+                    Err(_) => {
+                        self.status_msg =
+                            Some("Fill value must be two hex digits, e.g. 90.".into());
+                    }
+                }
+            }
+
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copy as AOB"))
+                .on_hover_text("Copy the selection as an array-of-bytes pattern for the scanner")
+                .clicked()
+                && let Some(bytes) = self.selected_bytes()
+            {
+                let pattern = hex_string(&bytes);
+                ui.ctx().copy_text(pattern.clone());
+                self.status_msg = Some(format!("AOB: {pattern}"));
+            }
+
+            if ui.add_enabled(has_selection, egui::Button::new("Clear")).clicked() {
+                self.selection = None;
+                self.selection_anchor = None;
+            }
+        });
+
+        // Keyboard paging, but not while a byte is being typed over — the
+        // keystroke belongs to the text field.
+        if self.editing.is_none() && !super::typing_in_a_text_field(ui.ctx()) {
+            ui.input(|i| {
+                if i.key_pressed(egui::Key::PageUp) {
+                    page_by = -1;
+                } else if i.key_pressed(egui::Key::PageDown) {
+                    page_by = 1;
+                }
+            });
+        }
+        if page_by != 0 {
+            self.page(page_by);
+        }
+    }
+
+    /// Bookmarks: name the current address, and jump back to a named one.
+    fn show_bookmark_bar(&mut self, ui: &mut egui::Ui) {
+        let mut goto: Option<usize> = None;
+        let mut remove: Option<usize> = None;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Bookmark:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.bookmark_name)
+                    .desired_width(110.0)
+                    .hint_text("name"),
+            );
+            if ui.button("+").on_hover_text("Bookmark the current address").clicked() {
+                let name = if self.bookmark_name.trim().is_empty() {
+                    format!("{:#x}", self.address)
+                } else {
+                    self.bookmark_name.trim().to_string()
+                };
+                // Newest first: a bookmark just made is the one about to be used.
+                self.bookmarks.insert(0, Bookmark { address: self.address, name });
+                self.bookmark_name.clear();
+            }
+            for (i, bm) in self.bookmarks.iter().enumerate() {
+                if ui
+                    .small_button(&bm.name)
+                    .on_hover_text(format!("{:#018x}", bm.address))
+                    .clicked()
+                {
+                    goto = Some(bm.address);
+                }
+                if ui.small_button("✖").on_hover_text("Remove").clicked() {
+                    remove = Some(i);
+                }
+            }
+        });
+
+        if let Some(addr) = goto {
+            self.navigate_to(addr);
+        }
+        if let Some(i) = remove {
+            self.bookmarks.remove(i);
+        }
+    }
+
+    /// The selection as `(start address, length)`, if any.
+    fn selection_span(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.selection?;
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        Some((lo, hi - lo + 1))
+    }
+
+    /// The selected bytes, read out of the current snapshot.
+    fn selected_bytes(&self) -> Option<Vec<u8>> {
+        let (start, len) = self.selection_span()?;
+        let offset = start.checked_sub(self.address)?;
+        let end = offset.checked_add(len)?;
+        self.buf.get(offset..end.min(self.bytes_read)).map(<[u8]>::to_vec)
+    }
+
+    /// Write bytes into the target and refresh the view.
+    ///
+    /// A short write is reported rather than swallowed: a read-only page accepts
+    /// the request and writes nothing, and a hex editor that shows the old value
+    /// again with no explanation is the worst of both.
+    fn write_bytes(&mut self, process: &Process, addr: usize, bytes: &[u8]) {
+        match process.write_buf(addr, bytes) {
+            Ok(n) if n == bytes.len() => {
+                self.status_msg = Some(format!("Wrote {n} byte(s) at {addr:#x}"));
+            }
+            Ok(n) => {
+                self.status_msg = Some(format!(
+                    "Only {n} of {} byte(s) written at {addr:#x} — the page may be read-only.",
+                    bytes.len()
+                ));
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("Write failed at {addr:#x}: {e}"));
+            }
+        }
+        // Show the result immediately rather than up to a snapshot interval later.
+        self.last_snapshot = None;
+    }
+
+    /// Handle a click on the byte at `addr`, honouring the shift modifier.
+    fn click_byte(&mut self, addr: usize, extend: bool) {
+        match (extend, self.selection_anchor) {
+            (true, Some(anchor)) => self.selection = Some((anchor, addr)),
+            _ => {
+                self.selection_anchor = Some(addr);
+                self.selection = Some((addr, addr));
+            }
+        }
     }
 
     fn try_parse_address(&mut self) {
@@ -514,7 +839,8 @@ impl MemoryViewer {
         let text_height = ui.text_style_height(&egui::TextStyle::Monospace);
         let row_height  = text_height + 6.0;
 
-        let num_rows = SNAPSHOT_SIZE / BYTES_PER_ROW;
+        let bytes_per_row = self.bytes_per_row;
+        let num_rows = SNAPSHOT_SIZE / bytes_per_row;
 
         // ── Pre-classify Qword values before entering the TableBuilder closure ──
         //
@@ -546,6 +872,18 @@ impl MemoryViewer {
 
         // Accumulate any navigation request from pointer-click inside the table.
         let mut navigate_target: Option<usize> = None;
+        // Interaction collected during the draw and applied after the closure
+        // releases the borrow on `self`.
+        let mut clicked_byte: Option<usize> = None;
+        let mut begin_edit: Option<usize> = None;
+        let mut edit_text: Option<String> = None;
+        let mut commit_edit = false;
+        let mut cancel_edit = false;
+        let mut first_drawn = usize::MAX;
+        let mut last_drawn = 0usize;
+        let selection = self.selection_span().map(|(start, len)| (start, start + len - 1));
+        let editing = self.editing.clone();
+        let shift_held = ui.input(|i| i.modifiers.shift);
 
         TableBuilder::new(ui)
             .id_salt("mem_viewer_table")
@@ -562,8 +900,13 @@ impl MemoryViewer {
             .body(|body| {
                 body.rows(row_height, num_rows, |mut row| {
                     let row_idx    = row.index();
-                    let buf_offset = row_idx * BYTES_PER_ROW;
+                    let buf_offset = row_idx * bytes_per_row;
                     let row_addr   = base_addr.wrapping_add(buf_offset);
+
+                    // The viewport, so the next snapshot only classifies what
+                    // is on screen.
+                    first_drawn = first_drawn.min(row_idx);
+                    last_drawn = last_drawn.max(row_idx);
 
                     // ── Address column ──────────────────────────────────────
                     row.col(|ui| {
@@ -577,8 +920,8 @@ impl MemoryViewer {
 
                             let unit = display_type.unit_size();
                             let mut b = 0usize;
-                            while b < BYTES_PER_ROW {
-                                let end   = (b + unit).min(BYTES_PER_ROW);
+                            while b < bytes_per_row {
+                                let end   = (b + unit).min(bytes_per_row);
                                 let buf_end = (buf_offset + end).min(buf.len());
                                 let slice = if buf_offset + b < buf.len() {
                                     &buf[buf_offset + b .. buf_end]
@@ -597,6 +940,7 @@ impl MemoryViewer {
                                 match display_type {
                                     DisplayType::Bytes => {
                                         let byte = slice[0];
+                                        let addr = row_addr.wrapping_add(b);
                                         let color = if !valid {
                                             Color32::DARK_GRAY
                                         } else if changed {
@@ -604,9 +948,46 @@ impl MemoryViewer {
                                         } else {
                                             Color32::LIGHT_GRAY
                                         };
-                                        ui.label(
-                                            RichText::new(format!("{byte:02X}")).monospace().color(color),
-                                        );
+                                        // Double-click types over the byte;
+                                        // a single click selects it.
+                                        if editing.as_ref().is_some_and(|(a, _)| *a == addr) {
+                                            let mut text = editing
+                                                .as_ref()
+                                                .map(|(_, t)| t.clone())
+                                                .unwrap_or_default();
+                                            let resp = ui.add(
+                                                egui::TextEdit::singleline(&mut text)
+                                                    .desired_width(24.0)
+                                                    .font(egui::TextStyle::Monospace),
+                                            );
+                                            resp.request_focus();
+                                            edit_text = Some(text);
+                                            if resp.lost_focus() {
+                                                commit_edit = ui.input(|i| {
+                                                    i.key_pressed(egui::Key::Enter)
+                                                });
+                                                cancel_edit = !commit_edit;
+                                            }
+                                        } else {
+                                            let selected = selection
+                                                .is_some_and(|(lo, hi)| addr >= lo && addr <= hi);
+                                            let mut text = RichText::new(format!("{byte:02X}"))
+                                                .monospace()
+                                                .color(color);
+                                            if selected {
+                                                text = text
+                                                    .background_color(Color32::from_rgb(60, 90, 130));
+                                            }
+                                            let resp = ui.add(
+                                                egui::Label::new(text)
+                                                    .sense(egui::Sense::click()),
+                                            );
+                                            if resp.double_clicked() {
+                                                begin_edit = Some(addr);
+                                            } else if resp.clicked() {
+                                                clicked_byte = Some(addr);
+                                            }
+                                        }
                                     }
                                     DisplayType::Word if slice.len() >= 2 => {
                                         let v = u16::from_le_bytes([slice[0], slice[1]]);
@@ -722,7 +1103,7 @@ impl MemoryViewer {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
 
-                            for byte_idx in 0..BYTES_PER_ROW {
+                            for byte_idx in 0..bytes_per_row {
                                 let buf_pos = buf_offset + byte_idx;
                                 if buf_pos >= buf.len() { break; }
 
@@ -762,6 +1143,37 @@ impl MemoryViewer {
                 });
             });
 
+        if first_drawn != usize::MAX {
+            self.visible_rows = (first_drawn, last_drawn);
+        }
+        if let Some(text) = edit_text
+            && let Some((_, stored)) = self.editing.as_mut()
+        {
+            *stored = text;
+        }
+        if let Some(addr) = begin_edit {
+            let offset = addr.wrapping_sub(self.address);
+            let current = self.buf.get(offset).copied().unwrap_or(0);
+            self.editing = Some((addr, format!("{current:02X}")));
+            self.selection = Some((addr, addr));
+            self.selection_anchor = Some(addr);
+        } else if commit_edit {
+            if let Some((addr, text)) = self.editing.take() {
+                match u8::from_str_radix(text.trim(), 16) {
+                    Ok(byte) => self.write_bytes(process, addr, &[byte]),
+                    Err(_) => {
+                        self.status_msg =
+                            Some(format!("'{text}' is not a byte — expected two hex digits."));
+                    }
+                }
+            }
+        } else if cancel_edit {
+            self.editing = None;
+        }
+        if let Some(addr) = clicked_byte {
+            self.click_byte(addr, shift_held);
+        }
+
         // Apply any navigation queued during the table draw (pointer-click follow).
         if let Some(target) = navigate_target {
             self.navigate_to(target);
@@ -777,8 +1189,140 @@ impl MemoryViewer {
     }
 }
 
+/// Space-separated uppercase hex — the spelling every AOB scanner accepts,
+/// including this one's own `BytePattern::parse`.
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+}
+
 impl Default for MemoryViewer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn viewer_at(addr: usize, bytes: &[u8]) -> MemoryViewer {
+        let mut v = MemoryViewer::new();
+        v.address = addr;
+        v.buf = vec![0u8; SNAPSHOT_SIZE];
+        v.buf[..bytes.len()].copy_from_slice(bytes);
+        v.bytes_read = bytes.len();
+        v
+    }
+
+    #[test]
+    fn a_shift_click_extends_the_selection_from_the_anchor() {
+        let mut v = viewer_at(0x1000, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        v.click_byte(0x1002, false);
+        assert_eq!(v.selection_span(), Some((0x1002, 1)));
+        v.click_byte(0x1005, true);
+        assert_eq!(v.selection_span(), Some((0x1002, 4)));
+        // Backwards from the anchor selects the same span the other way round.
+        v.click_byte(0x1000, true);
+        assert_eq!(v.selection_span(), Some((0x1000, 3)));
+    }
+
+    #[test]
+    fn a_plain_click_replaces_the_selection_and_moves_the_anchor() {
+        let mut v = viewer_at(0x1000, &[0; 16]);
+        v.click_byte(0x1002, false);
+        v.click_byte(0x1008, true);
+        assert_eq!(v.selection_span(), Some((0x1002, 7)));
+        v.click_byte(0x100C, false);
+        assert_eq!(v.selection_span(), Some((0x100C, 1)));
+        v.click_byte(0x100E, true);
+        assert_eq!(v.selection_span(), Some((0x100C, 3)), "extends from the new anchor");
+    }
+
+    #[test]
+    fn the_selected_bytes_come_from_the_snapshot_at_the_right_offset() {
+        let v = {
+            let mut v = viewer_at(0x1000, &[0xDE, 0xAD, 0xBE, 0xEF, 0x11]);
+            v.selection = Some((0x1001, 0x1003));
+            v
+        };
+        assert_eq!(v.selected_bytes(), Some(vec![0xAD, 0xBE, 0xEF]));
+        assert_eq!(hex_string(&v.selected_bytes().unwrap()), "AD BE EF");
+    }
+
+    #[test]
+    fn a_selection_past_the_short_read_is_clamped_not_padded_with_zeros() {
+        // The buffer is a full page but only five bytes were readable; a
+        // selection running off the end must not hand back invented zeros.
+        let mut v = viewer_at(0x1000, &[1, 2, 3, 4, 5]);
+        v.selection = Some((0x1003, 0x1010));
+        assert_eq!(v.selected_bytes(), Some(vec![4, 5]));
+    }
+
+    #[test]
+    fn back_and_forward_walk_the_same_trail() {
+        let mut v = MemoryViewer::new();
+        v.navigate_to(0x1000);
+        v.navigate_to(0x2000);
+        v.navigate_to(0x3000);
+        v.navigate_back();
+        assert_eq!(v.address, 0x2000);
+        v.navigate_back();
+        assert_eq!(v.address, 0x1000);
+        v.navigate_forward();
+        assert_eq!(v.address, 0x2000);
+        v.navigate_forward();
+        assert_eq!(v.address, 0x3000);
+        // Nothing further forward, and the address stays put.
+        v.navigate_forward();
+        assert_eq!(v.address, 0x3000);
+    }
+
+    #[test]
+    fn a_fresh_jump_forks_the_trail_and_drops_the_forward_branch() {
+        let mut v = MemoryViewer::new();
+        v.navigate_to(0x1000);
+        v.navigate_to(0x2000);
+        v.navigate_back();
+        assert_eq!(v.address, 0x1000);
+        v.navigate_to(0x9000);
+        v.navigate_forward();
+        assert_eq!(v.address, 0x9000, "0x2000 is no longer on the trail");
+    }
+
+    #[test]
+    fn paging_moves_by_a_whole_window_and_saturates_at_the_ends() {
+        let mut v = MemoryViewer::new();
+        v.seek(0x10000);
+        v.page(1);
+        assert_eq!(v.address, 0x10000 + SNAPSHOT_SIZE);
+        v.page(-1);
+        assert_eq!(v.address, 0x10000);
+        // Paging back from near zero must not wrap to the top of the address
+        // space.
+        v.seek(0x10);
+        v.page(-1);
+        assert_eq!(v.address, 0);
+        v.seek(usize::MAX - 8);
+        v.page(1);
+        assert_eq!(v.address, usize::MAX);
+    }
+
+    #[test]
+    fn paging_does_not_pile_up_history_entries() {
+        let mut v = MemoryViewer::new();
+        v.navigate_to(0x1000);
+        let depth = v.history.len();
+        for _ in 0..10 {
+            v.page(1);
+        }
+        assert_eq!(v.history.len(), depth, "scrolling is not navigation");
+    }
+
+    #[test]
+    fn hex_string_is_the_spelling_the_aob_scanner_parses() {
+        let text = hex_string(&[0x48, 0x89, 0xE5, 0x00]);
+        assert_eq!(text, "48 89 E5 00");
+        let pattern = nemclass_scan::BytePattern::parse(&text).expect("parses as an AOB");
+        assert_eq!(pattern.len(), 4);
     }
 }
