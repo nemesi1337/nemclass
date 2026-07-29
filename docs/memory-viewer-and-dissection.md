@@ -55,16 +55,31 @@ only registered type tags, so they deserialize straight back into live nodes.
 2. **Memory View ▸ live node expansion.** Expanding a `VTable` node walks the
    pointer array live and lists each method (resolved name + a *disasm* link);
    expanding a `Function`/`FunctionPtr` node shows its disassembly inline.
-3. **Memory tab (raw hex viewer).** `address | 16 hex bytes | ascii` grid with a
+3. **Memory tab (raw hex editor).** `address | hex bytes | ascii` grid with a
    go-to box, follow-pointer (a qword classified as a pointer becomes a clickable
    link tagged data/code/vtable), display-type toggle (byte/word/dword/qword/
-   float), string-run highlighting, and changed-byte tinting between snapshots.
-   Context actions: *Dissect as class here* and *Disassemble here*.
+   float), configurable row width (8/16/32), string-run highlighting, and
+   changed-byte tinting between snapshots.
+
+   It edits: double-click a byte to type over it, click and shift-click to
+   select a span, then Copy, Paste, Fill, or *Copy as AOB* to hand the pattern
+   to the scanner. Paging is a whole window at a time (buttons or
+   PageUp/PageDown), navigation is back **and** forward, and addresses can be
+   bookmarked by name. Context actions: *Dissect as class here* and
+   *Disassemble here*.
 4. **Disassembly tab.** `address | bytes | instruction`, with the entry function
    named via `resolve_symbol`, call/jmp/jcc targets rendered as clickable links
    (annotated with the target's symbol name when known), and a back/forward
    navigation stack.
 
-Together these cover the request: **strings, vtables, functions, and function
-calls** — discoverable automatically or by hand, and cross-linked so a vtable
-method jumps straight into the disassembler.
+   Patching lives here: *NOP out* and *Patch bytes…* write through a recorded
+   [`PatchSet`], so every change keeps the bytes it replaced and the patch list
+   reverts or re-applies it. *Set breakpoint here* arms an execute breakpoint in
+   the debugger without retyping the address.
+
+Together these cover **strings, vtables, functions, and function calls** —
+discoverable automatically or by hand, and cross-linked so a vtable method jumps
+straight into the disassembler.
+
+Auto-dissect runs on the background pool: it reads and classifies every word in
+the span, and running that inline froze the window until it finished.

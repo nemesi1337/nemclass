@@ -79,6 +79,96 @@ impl CheatTablePanel {
     }
 }
 
+/// The frozen entries as the writer thread sees them.
+#[cfg(target_os = "linux")]
+type SharedEntries = std::sync::Arc<std::sync::Mutex<Vec<(usize, Vec<u8>)>>>;
+
+/// Writes the frozen values on its own thread.
+///
+/// The UI recomputes *what* to freeze — resolving an address formula needs the
+/// module list, which lives on this side — and publishes it here; this thread
+/// only writes. A published set going stale while the UI is idle is the
+/// intended behaviour: a frozen address does not move, so continuing to write
+/// the last known set is exactly right.
+struct FreezeWorker {
+    pid: Pid,
+    /// The entries to write, replaced wholesale by the UI.
+    entries: SharedEntries,
+    /// The most recent write problem, for the UI to display.
+    problem: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl FreezeWorker {
+    fn spawn(pid: Pid, target: ProcessTarget) -> Self {
+        let entries: SharedEntries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let problem = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let handle = {
+            let entries = std::sync::Arc::clone(&entries);
+            let problem = std::sync::Arc::clone(&problem);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::Builder::new()
+                .name(format!("nemclass-freeze-{pid}"))
+                .spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(FREEZE_INTERVAL);
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let snapshot = match entries.lock() {
+                            Ok(guard) => guard.clone(),
+                            Err(_) => break,
+                        };
+                        if snapshot.is_empty() {
+                            continue;
+                        }
+                        let mut set = FreezeSet::new();
+                        for (addr, bytes) in snapshot {
+                            set.set(addr, bytes);
+                        }
+                        // Report *why* a value did not stick instead of
+                        // discarding the result.
+                        let report = set.apply(&target);
+                        if let Ok(mut slot) = problem.lock() {
+                            *slot = report.problem();
+                        }
+                    }
+                })
+                .ok()
+        };
+
+        Self { pid, entries, problem, stop, handle }
+    }
+
+    fn publish(&self, entries: Vec<(usize, Vec<u8>)>) {
+        if let Ok(mut slot) = self.entries.lock() {
+            *slot = entries;
+        }
+    }
+
+    /// The most recent write problem, cleared as it is read.
+    fn take_problem(&self) -> Option<String> {
+        self.problem.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FreezeWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Joined rather than detached: the thread holds a handle to the target,
+        // and a detached one would keep writing into a process the app has
+        // already let go of.
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct CheatTablePanel {
     table: CheatTable,
     last_freeze: Option<Instant>,
@@ -90,12 +180,10 @@ pub struct CheatTablePanel {
     /// again on every 200 ms freeze tick.
     modules: Vec<ModuleInfoWithName>,
     modules_at: Option<Instant>,
-    /// The write target for freezing, held across ticks. `ProcessTarget::attach`
-    /// was called fresh on every tick, five times a second, forever.
+    /// The thread that writes the frozen values. It owns the target handle, so
+    /// `ProcessTarget::attach` happens once per pid rather than on every tick.
     #[cfg(target_os = "linux")]
-    freeze_target: Option<ProcessTarget>,
-    #[cfg(target_os = "linux")]
-    freeze_target_pid: Option<Pid>,
+    freeze_worker: Option<FreezeWorker>,
 }
 
 impl CheatTablePanel {
@@ -108,9 +196,7 @@ impl CheatTablePanel {
             modules: Vec::new(),
             modules_at: None,
             #[cfg(target_os = "linux")]
-            freeze_target: None,
-            #[cfg(target_os = "linux")]
-            freeze_target_pid: None,
+            freeze_worker: None,
         }
     }
 
@@ -129,10 +215,11 @@ impl CheatTablePanel {
         self.live_values.clear();
         self.modules.clear();
         self.modules_at = None;
+        // Dropping the worker stops and joins its thread, which is what stops
+        // it writing into a process the app has just let go of.
         #[cfg(target_os = "linux")]
         {
-            self.freeze_target = None;
-            self.freeze_target_pid = None;
+            self.freeze_worker = None;
         }
     }
 
@@ -201,6 +288,13 @@ impl CheatTablePanel {
     /// an old address.
     #[cfg(target_os = "linux")]
     pub fn tick_freeze(&mut self, process: Option<&Process>, pid: Option<Pid>) {
+        // Surface whatever the writer thread has to say, every tick.
+        if let Some(worker) = &self.freeze_worker
+            && let Some(problem) = worker.take_problem()
+        {
+            self.status_msg = Some(problem);
+        }
+
         let should_apply = self
             .last_freeze
             .map(|t| t.elapsed() >= FREEZE_INTERVAL)
@@ -227,24 +321,36 @@ impl CheatTablePanel {
                 freeze_set.set(addr, bytes);
             }
         }
-        if freeze_set.is_empty() {
-            return;
-        }
-        let Some(pid) = pid else { return };
-        // Attach once and hold it. This ran `ProcessTarget::attach` fresh on
-        // every tick — five times a second, for as long as the app was open.
-        if self.freeze_target_pid != Some(pid) {
-            self.freeze_target = ProcessTarget::attach(pid).ok();
-            self.freeze_target_pid = self.freeze_target.is_some().then_some(pid);
-        }
-        let Some(target) = self.freeze_target.as_ref() else {
-            self.status_msg = Some(format!("Cannot write to pid {pid} — values not frozen."));
+        let Some(pid) = pid else {
+            self.freeze_worker = None;
             return;
         };
-        // Report *why* a value did not stick instead of discarding the result.
-        let report = freeze_set.apply(target);
-        if let Some(problem) = report.problem() {
-            self.status_msg = Some(problem);
+        if freeze_set.is_empty() {
+            // Nothing frozen: publish the empty set so the worker stops writing
+            // an unfreeze the user already asked for.
+            if let Some(worker) = &self.freeze_worker {
+                worker.publish(Vec::new());
+            }
+            return;
+        }
+
+        // The writes happen on a dedicated thread. They used to run from
+        // `App::logic`, which egui calls only when it repaints — so freezing
+        // silently stopped the moment the window was minimised or the app lost
+        // focus, which is exactly when a trainer is supposed to be working.
+        if self.freeze_worker.as_ref().map(|w| w.pid) != Some(pid) {
+            match ProcessTarget::attach(pid) {
+                Ok(target) => self.freeze_worker = Some(FreezeWorker::spawn(pid, target)),
+                Err(e) => {
+                    self.freeze_worker = None;
+                    self.status_msg =
+                        Some(format!("Cannot write to pid {pid} ({e}) — values not frozen."));
+                    return;
+                }
+            }
+        }
+        if let Some(worker) = &self.freeze_worker {
+            worker.publish(freeze_set.into_entries());
         }
     }
 

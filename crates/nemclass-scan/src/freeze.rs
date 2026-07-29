@@ -31,6 +31,14 @@ impl FreezeSet {
         self.entries.retain(|(a, _)| *a != address);
     }
 
+    /// Consumes the set, returning its `(address, bytes)` entries.
+    ///
+    /// For handing a snapshot to a writer thread: the set is rebuilt from the
+    /// table on every UI tick, so there is nothing to keep.
+    pub fn into_entries(self) -> Vec<(usize, Vec<u8>)> {
+        self.entries
+    }
+
     /// Number of frozen entries.
     pub fn len(&self) -> usize {
         self.entries.len()

@@ -70,6 +70,18 @@ pub trait ProcessProvider: Send + Sync {
         &self,
         pid: Pid,
     ) -> crate::Result<(Vec<Section>, Vec<Module>)>;
+
+    /// Enumerates the target's memory [`Section`]s only.
+    ///
+    /// The default runs the combined call and throws the modules away, which is
+    /// what every section-only caller was doing by hand. A provider whose module
+    /// walk is expensive should override this: on Linux it opens a second
+    /// handle and reads a PE header out of the target for each Wine module, and
+    /// every value scan and pointer-map build paid for that and then discarded
+    /// the result.
+    fn enumerate_sections(&self, pid: Pid) -> crate::Result<Vec<Section>> {
+        Ok(self.enumerate_sections_and_modules(pid)?.0)
+    }
 }
 
 /// Native Linux provider: enumerates via `/proc`, opens the
@@ -105,6 +117,14 @@ impl ProcessProvider for LinuxProvider {
         let sections = super::parse_maps_sections(&maps);
         let modules = process.modules()?.collect();
         Ok((sections, modules))
+    }
+
+    fn enumerate_sections(&self, pid: Pid) -> crate::Result<Vec<Section>> {
+        // No `Process::attach`, no module walk, no remote PE-header reads: a
+        // section list is a single read of `/proc/<pid>/maps` and nothing else.
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .map_err(|_| crate::Error::ProcessDied)?;
+        Ok(super::parse_maps_sections(&maps))
     }
 }
 

@@ -384,6 +384,10 @@ pub struct NemclassApp {
     /// Payload: `(class uuid, resolved address)`. The v8 round-trip blocks, so it
     /// runs on the pool. See [`Self::do_resolve_class_address`].
     resolve_job: BackgroundJob<(Uuid, Option<usize>)>,
+    /// In-flight auto-dissect. It ran synchronously on the UI thread, so
+    /// dissecting a large span froze the whole window until it finished.
+    #[cfg(target_os = "linux")]
+    dissect_job: BackgroundJob<(Uuid, Result<Vec<NodeDef>, String>)>,
 
     // Project
     project: Project,
@@ -685,6 +689,8 @@ impl NemclassApp {
             attach_epoch: 0,
             last_liveness_check: None,
             resolve_job: BackgroundJob::default(),
+            #[cfg(target_os = "linux")]
+            dissect_job: BackgroundJob::default(),
             project,
             node_registry,
             project_dir,
@@ -1065,6 +1071,10 @@ impl NemclassApp {
         }
         if let JobPoll::Done((uuid, resolved)) = self.resolve_job.poll() {
             self.ingest_resolve(uuid, resolved);
+        }
+        #[cfg(target_os = "linux")]
+        if let JobPoll::Done((uuid, result)) = self.dissect_job.poll() {
+            self.ingest_dissect(uuid, result);
         }
     }
 
@@ -3205,7 +3215,7 @@ impl NemclassApp {
         #[cfg(target_os = "linux")]
         if let Some(addr) = self.memory_viewer.take_dissect_request() {
             self.pending_focus = Some(TabKind::ClassView);
-            self.run_auto_dissect(addr);
+            self.run_auto_dissect(addr, ui.ctx().clone());
         }
     }
 
@@ -3342,33 +3352,48 @@ impl NemclassApp {
     /// and store the result in `dissect_preview`.  Errors are routed through
     /// `last_error`.  No-op on non-Linux targets (the caller is cfg-gated).
     #[cfg(target_os = "linux")]
-    fn run_auto_dissect(&mut self, base: usize) {
-        use nemclass_model::dissect::auto_dissect;
-
+    fn run_auto_dissect(&mut self, base: usize, ctx: egui::Context) {
         let Some(uuid) = self.selected_class else {
             self.last_error = Some("Auto-dissect: no class selected".into());
             return;
         };
-        let Some(proc) = &self.process else {
+        let Some(proc) = self.process.clone() else {
             self.last_error = Some("Auto-dissect: no process attached".into());
             return;
         };
+        if self.dissect_job.is_running() {
+            return;
+        }
+        let Some(rt) = self.runtime.as_ref().map(|r| r.handle()) else { return };
 
+        // Off the UI thread: dissecting a large span reads and classifies every
+        // word in it, and running that inline froze the whole window — including
+        // the button that started it — until it finished.
         let len = self.parse_dissect_len();
-        match auto_dissect(proc, base, len) {
-            Err(e) => {
-                self.last_error = Some(format!("Auto-dissect failed: {e}"));
-            }
+        self.status_msg = Some("Dissecting…".into());
+        self.dissect_job.spawn(&rt, ctx, move || {
+            use nemclass_model::dissect::auto_dissect;
+            let result = auto_dissect(&proc, base, len)
+                .map_err(|e| format!("Auto-dissect failed: {e}"));
+            (uuid, result)
+        });
+    }
+
+    /// Ingest a finished auto-dissect.
+    #[cfg(target_os = "linux")]
+    fn ingest_dissect(&mut self, uuid: Uuid, result: Result<Vec<NodeDef>, String>) {
+        self.status_msg = None;
+        match result {
+            Err(e) => self.last_error = Some(e),
             Ok(defs) => {
                 // Build a compact type-count summary for the preview banner.
-                let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+                let mut counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
                 for d in &defs {
                     *counts.entry(d.type_tag.as_str()).or_insert(0) += 1;
                 }
-                let mut summary: Vec<(String, usize)> = counts
-                    .into_iter()
-                    .map(|(t, n)| (t.to_owned(), n))
-                    .collect();
+                let mut summary: Vec<(String, usize)> =
+                    counts.into_iter().map(|(t, n)| (t.to_owned(), n)).collect();
                 summary.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                 self.dissect_preview = Some(AutoDissectPreview {
                     defs,
@@ -3457,7 +3482,7 @@ impl NemclassApp {
 
             if do_dissect {
                 let base = self.class_base.unwrap();
-                self.run_auto_dissect(base);
+                self.run_auto_dissect(base, ui.ctx().clone());
             }
 
             // -----------------------------------------------------------------

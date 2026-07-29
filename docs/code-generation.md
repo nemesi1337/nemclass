@@ -6,9 +6,12 @@ language, so a reconstructed layout can be pasted straight into a real codebase.
 ## API
 
 ```rust,ignore
-use nemclass_model::{generate_code, CodeGenerator, Language};
+use nemclass_model::{generate_code, CodeGenerator, Language, NodeRegistry};
 
-let src = generate_code(&project, Language::Cpp)?;
+let registry = NodeRegistry::new().with_builtins();
+// Infallible: an unresolvable reference becomes a commented byte blob rather
+// than an error, so a partially-reconstructed project still generates.
+let src: String = generate_code(Language::Cpp, &project, &registry);
 ```
 
 - **`Language`** — the supported outputs: C++, C#, and Rust.

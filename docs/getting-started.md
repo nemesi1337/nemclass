@@ -31,16 +31,20 @@ cargo run -p nemclass-app
 This opens the **NemClass** window. The layout:
 
 ```text
-┌─ menu bar (New / Open / Save) ───────────────────────────────────┐
-├─ address bar (selected class base + formula) ────────────────────┤
-├─ left panel ────────────┬─ central panel ─────────────────────────┤
-│ Backend: [combo]        │ [Memory View][Scanner][Debugger]         │
-│ (auth key, if kernel)   │ [Memory][Disassembly]                    │
-│ Filter: [___]  Refresh  │                                          │
-│  process list           │  active tab content …                    │
-│ Classes:  ▶ MyClass     │                                          │
+┌─ menu bar (File / View / Project) ───────────────────────────────┐
+├─ address bar (class base, formula, comment) ─────────────────────┤
+├─ left panel ────────────┬─ dock area ─────────────────────────────┤
+│ Backend: [combo]        │ tabs, split and floated as you like:    │
+│ (auth key, if kernel)   │  Classes · Scanner · Debugger · Memory  │
+│ Filter: [___]  Refresh  │  Disassembly · Modules · Navigator      │
+│  process list           │  Pointer scan · Spider · Cheat table    │
+│ Classes:  ▶ MyClass     │  Generator · Scripts                    │
 └─────────────────────────┴──────────────────────────────────────────┘
 ```
+
+Panels are dockable: drag a tab to split, float or re-order it, and the layout
+is saved between sessions. **View** toggles panels on and off and resets the
+arrangement; **Project** holds the enum editor and the target's pointer width.
 
 ## First class (the vertical slice)
 

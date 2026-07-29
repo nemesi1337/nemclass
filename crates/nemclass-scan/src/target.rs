@@ -578,8 +578,12 @@ mod linux {
             // would reject wholesale. Classification has to come from
             // `/proc/<pid>/maps`.
             let provider = nemclass_core::LinuxProvider;
-            let (sections, _modules) =
-                nemclass_core::ProcessProvider::enumerate_sections_and_modules(&provider, self.pid)?;
+            // Sections only: the module list was enumerated and immediately
+            // discarded on every scan and every pointer-map build, and building
+            // it means opening a second handle and reading a PE header out of
+            // the target for each Wine module.
+            let sections =
+                nemclass_core::ProcessProvider::enumerate_sections(&provider, self.pid)?;
             Ok(super::coalesce_regions(
                 sections
                     .into_iter()

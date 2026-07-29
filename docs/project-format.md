@@ -39,15 +39,18 @@ pub struct NodeDef {
 
 A small illustrative shape:
 
-```text
+```toml
 [project]
 name = "MyProject"
+version = "1"
+# Only written for a 32-bit target; absent means 8-byte pointers.
+# pointer_size = 4
 
 [[classes]]
-type = "Class"
+uuid = "6f1d0b9e-6a1a-4a2f-9a3c-2a0a1d5e7b31"
 name = "Player"
 comment = ""
-address_formula = "\"game\"+0x4C0A10"
+address_formula = "<game> + 0x4C0A10"
 
   [[classes.nodes]]
   type = "Int32"
@@ -57,8 +60,20 @@ address_formula = "\"game\"+0x4C0A10"
   [[classes.nodes]]
   type = "Pointer"
   name = "inventory"
-  comment = ""
+  target_class_uuid = "9c2f5a80-0b41-4c26-8e77-1f3a55d2c904"
+
+  [[classes.nodes]]
+  type = "Utf8Text"
+  name = "display_name"
+  length = 32
+  hidden = true
 ```
+
+A class is a `[[classes]]` table with its own `uuid`, not a node with
+`type = "Class"`; the `type` key appears on the *nodes*. Type-specific
+attributes (`length`, `count`, `element_type`, `bits`, `enum_name`,
+`target_class_uuid`, `class_uuid`) sit alongside `name`/`comment`, and `hidden`
+is written only when set.
 
 ## Round-trip guarantee
 
@@ -66,6 +81,18 @@ address_formula = "\"game\"+0x4C0A10"
 with nested classes, pointers, arrays, and the RE node types, serializes it,
 deserializes it via the registry, and asserts structural equality. Deserialization
 is depth-bounded to reject maliciously deep documents.
+
+A node type this build does not recognise — written by a newer version, or by a
+build with a plugin this one lacks — is **not** an error and is **not** dropped.
+It is kept verbatim as an `Unknown` placeholder and written back byte-for-byte,
+so opening and re-saving a project in an older build does not strip the fields it
+did not understand.
+
+The `version` field is checked on load: a file from a newer schema is refused
+rather than half-read. A 64-bit project is written as version `1`, which older
+builds still read correctly; a 32-bit one is version `2`, because an older build
+would ignore `pointer_size`, lay every pointer out as eight bytes, and silently
+shift every field after the first.
 
 ## Scaffolding
 

@@ -181,6 +181,41 @@ fn os_error_message(code: u32) -> String {
 #[allow(missing_docs)]
 pub type Result<T> = result::Result<T, Error>;
 
+/// The calling thread's `errno`.
+///
+/// The accessor is not one symbol across Unix: glibc and musl expose
+/// `__errno_location`, the BSDs and Apple expose `__error`, and this used to
+/// call the glibc one under a bare `cfg(unix)` — which does not link at all on
+/// macOS or FreeBSD.
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+fn errno() -> i32 {
+    // SAFETY: the accessor returns a valid, thread-local `*mut i32` that libc
+    // guarantees is live for the current thread; we only read it.
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+fn errno() -> i32 {
+    // SAFETY: as above; `__error` is the same accessor under a different name.
+    unsafe { *libc::__error() }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    ))
+))]
+fn errno() -> i32 {
+    // SAFETY: `errno_location` is the accessor on the remaining Unix targets
+    // libc supports.
+    unsafe { *libc::__errno() }
+}
+
 impl Error {
     /// Captures the current thread's `errno` as an [`Error::Errno`].
     // Gated on `unix` only (not the `std` feature): the callers in the iovec
@@ -188,9 +223,7 @@ impl Error {
     // `--no-default-features` builds (the `alloc`-only tier the crate advertises).
     #[cfg(unix)]
     pub(crate) fn last<T>() -> Result<T> {
-        // SAFETY: `__errno_location` returns a valid, thread-local `*mut i32`
-        // that libc guarantees is live for the current thread; we only read it.
-        unsafe { Err(Error::Errno(*libc::__errno_location())) }
+        Err(Error::Errno(errno()))
     }
 
     /// Captures the current thread's Win32 last-error as an [`Error::WinApi`].
