@@ -10,8 +10,10 @@ against the ReClass.NET sources. The architecture held up well: the layered
 and the ~70-method JS host API are all ahead of the references in places. What
 was weak was correctness underneath and *workflow* on top.
 
-**Phase 0 and M1–M8 are implemented.** What is still open is listed under
-[Still open](#still-open) at the end, honestly and specifically.
+**Phase 0 and M1–M8 are implemented**, including the items that were left open
+in the first pass. What remains is listed under [Still open](#still-open) at the
+end, honestly and specifically — it is now a short list of things that need a
+Windows machine or a running target to finish, not features.
 
 ---
 
@@ -163,7 +165,7 @@ what writes this" on a class field; "Set breakpoint here" in the disassembler; a
 clicked access site opens in the disassembler; a thread list, because every hit
 reports a tid and nothing turned that number into a named thread.
 
-## M7 — Assembler, patching, CE ecosystem ✅ *(partly — see below)*
+## M7 — Assembler, patching, CE ecosystem ✅
 
 `PatchSet` keeps the bytes that were there alongside the ones written.
 Re-patching an address keeps the *first* patch's originals: the second patch
@@ -176,13 +178,46 @@ NOP-out is a recorded patch, "Patch bytes…" writes an arbitrary sequence, and
 the patch list reverts and re-applies. Each write invalidates the decoded
 listing — a plain re-focus only scrolled the stale one.
 
+**A text assembler.** `iced-x86` decodes and builds instructions
+programmatically but has no text assembler, and neither does anything else in the
+Rust x86 ecosystem — so this parses the subset patching uses: flow control,
+register and memory moves, arithmetic, comparisons, stack ops. It is deliberately
+incomplete, and an unrecognised mnemonic is an error naming itself rather than a
+wrong encoding. Branch targets are absolute and resolve against the address being
+assembled at. The tests round-trip through the decoder rather than comparing
+against hand-written bytes, which would only prove the test author and the code
+agree.
+
+**Code injection** is a detour into a code cave. Allocating in the target needs
+`mmap` executed *in* the target, which is not wired up — and a detour works
+without it, because every real binary has runs of alignment padding already
+mapped executable. Displaced instructions are taken whole (a partial one decodes
+as garbage and executes) and re-encoded at their new address so their branches
+still point where they meant to. A payload that does not fit is refused rather
+than run off the end of the padding, and the cave is written before the hook: the
+other order leaves a jump into whatever the padding was.
+
+**Disassembler annotations**: user comments and labels (the Comment column was
+derived only, and a label replaces the address, which is the point of naming
+one), an instruction/byte-pattern search, and basic-block reconstruction — the
+listing decoded linearly and said nothing about shape. A branch out of the
+decoded listing produces no edge, because claiming one to an address nothing is
+known about would be a lie.
+
 **`.CT` import.** Pointer chains convert correctly: CE lists offsets
 innermost-first, so reading them in file order builds the chain backwards.
 Imported formulas are checked against the real address grammar by a test. Nested
 group headers become the `group` field. Auto-assembler scripts, Lua and bitfield
 entries are reported by name rather than dropped.
 
-## M8 — Platform, polish, docs ✅ *(partly — see below)*
+**Cheat-table UX**: freeze modes, group collapsing, multi-select with bulk
+actions, per-entry hotkeys, and a pointer-offset button. "Allow increase" is a
+*ratchet*, not a weaker freeze: the new high becomes the floor, and the
+comparison goes through the value type rather than the bytes — -1 has a larger
+unsigned byte pattern than 1, so a bytewise ratchet is backwards for anything
+signed.
+
+## M8 — Platform, polish, docs ✅
 
 - **Freeze on its own thread.** It ran from `App::logic`, which egui calls only
   when it repaints, so freezing silently stopped when the window was minimised —
@@ -200,6 +235,18 @@ entries are reported by name rather than dropped.
   window size, dock layout, recent projects and live interval since it existed,
   with no way to see or change any of it, and no `set_visuals` call existed at
   all.
+- **One notification surface.** Messages went to eight independent
+  `status_msg`/`last_error` fields, each drawn in its own tab, so a scan error
+  raised while the user was looking at the class view never appeared — and none
+  of them expired. Panels keep their field as an outbox and it is drained into
+  one stack per frame; a repeating message counts up rather than stacking.
+- Progress and cancellation now also cover the pointer-scan rescan and the module
+  dissect. A stopped rescan hands back what survived rather than an empty list,
+  which would read as "every chain is dead".
+- **Windows has a `ScanTarget`**, so the scanner, pointer scan and spider run
+  there — every layer beneath them already could. `Process::resolve_symbol` and
+  the PDB resolver are reachable: the resolver existed and nothing called it,
+  because its entry point was `cfg(target_os = "linux")`.
 - Docs: the getting-started layout showed the pre-dock arrangement, the
   code-generation example had the wrong signature and a `?` on an infallible
   call, and the project-format sample showed a shape the serializer does not
@@ -211,31 +258,20 @@ entries are reported by name rather than dropped.
 
 Named specifically rather than left implied by the ticks above.
 
-**A text assembler.** M7 asked for "assemble-in-place". `iced-x86` decodes and
-can *build* instructions programmatically (`code_asm`), but it has no text
-assembler, so "type `mov eax, 1` and write it" needs an x86 mnemonic parser that
-does not exist in the ecosystem's Rust crates. What shipped is byte-level
-patching with revert, which covers NOP-ing, `ret`-ing and hand-assembled edits.
-Code injection (alloc + detour) sits on top of the assembler and is not started.
+**The Windows UI.** `nemclass-core`, `-model` and `-scan` cross-compile to
+`x86_64-pc-windows-gnu` — including the scan target and the PDB resolver — but
+the egui shell is not Windows-clean and nothing here has been *run* on Windows.
+This was the user's explicit scoping decision: fix the contract, stay
+Linux-first. The Windows paths are compile-checked on every change and honest
+about what they do; they are not validated behaviour.
 
-**Disassembler annotations.** User comments and labels, rename-function,
-byte/instruction search, and basic-block reconstruction (the walk is still
-linear-only).
-
-**Cheat-table UX.** Groups import from `.CT` and serialize, but there is no
-group UI; per-entry hotkeys, a pointer-offset editor and freeze modes
-(allow-increase/decrease) are not built.
-
-**One status surface.** The eight independent `status_msg`/`last_error` channels
-are still eight; messages never expire. Progress and cancel reached the pointer
-scan and auto-dissect, not the scanner rescan or the module dissect.
-
-**Windows.** `nemclass-core`, `-model` and `-scan` cross-compile to
-`x86_64-pc-windows-gnu` and the short-read contract is honest, but there is
-still no Windows `ScanTarget`, the Windows symbol resolver is reachable from
-nothing, and the UI is not Windows-clean. Linux remains the supported platform.
+**The PDB resolver's runtime behaviour.** It compiles and is now reachable, but
+matching a module to its PDB is done by looking for a sibling `.pdb` rather than
+reading the RSDS entry from the PE debug directory and consulting a symbol
+server. That is written down in the module's own docs, not hidden.
 
 **The CI gate.** `cargo make ci` fails at `fmt-check` on repo-wide pre-existing
 rustfmt drift (~757 hunks) unrelated to any of this work. Clippy `-D warnings`
-and the full test suite are green. A repo-wide reformat belongs in its own
-commit with nothing else in it.
+and the full test suite are green. A repo-wide reformat belongs in its own commit
+with nothing else in it — that call is the user's, not a side effect of feature
+work.
