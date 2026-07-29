@@ -29,7 +29,7 @@ use nemclass_core::{ModuleInfoWithName, Pid, Process};
 use nemclass_scan::{PointerScanConfig, Region};
 
 #[cfg(target_os = "linux")]
-use nemclass_scan::{pointer_scan, PointerPath};
+use nemclass_scan::PointerPath;
 
 #[cfg(target_os = "linux")]
 use super::tasks::{BackgroundJob, Poll as JobPoll};
@@ -58,7 +58,7 @@ struct PathRow {
     /// The chain's offsets, kept so a "Rescan" can re-resolve the path against
     /// the live process (Cheat-Engine-style filtering after a relocation).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    offsets: Vec<usize>,
+    offsets: Vec<isize>,
 }
 
 /// All state owned by the pointer-scan panel.
@@ -69,6 +69,12 @@ pub struct PointerScanPanel {
     depth_text: String,
     /// Max per-hop struct offset text (hex).
     max_offset_text: String,
+    /// Maximum backwards offset; 0 (the default) means forwards only.
+    max_negative_text: String,
+    /// Only accept offsets that are a multiple of this.
+    offset_align_text: String,
+    /// Report chains that ran out of depth without reaching a module.
+    include_unanchored: bool,
     /// Prepared result rows.
     rows: Vec<PathRow>,
     /// Number of harvested pointer-map entries from the last scan.
@@ -99,6 +105,9 @@ impl PointerScanPanel {
             goal_text: String::new(),
             depth_text: "5".to_string(),
             max_offset_text: "0x1000".to_string(),
+            max_negative_text: "0".to_string(),
+            offset_align_text: "1".to_string(),
+            include_unanchored: false,
             rows: Vec::new(),
             map_entries: 0,
             truncated: false,
@@ -194,6 +203,28 @@ impl PointerScanPanel {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.max_offset_text).desired_width(72.0),
                 );
+                ui.label("Max −offset:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.max_negative_text).desired_width(60.0),
+                )
+                .on_hover_text(
+                    "How far backwards a hop may reach. 0 is forwards-only; raise it to find \
+                     a field addressed from a pointer stored after it.",
+                );
+                ui.label("Align:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.offset_align_text).desired_width(36.0),
+                )
+                .on_hover_text(
+                    "Only accept offsets that are a multiple of this. Set it to the pointer \
+                     size when the target's fields are aligned — it cuts the search by that \
+                     factor.",
+                );
+                ui.checkbox(&mut self.include_unanchored, "Unanchored")
+                    .on_hover_text(
+                        "Also report chains that never reach a module. They will not survive \
+                         a restart, but they show how the structure is reached.",
+                    );
 
                 #[cfg(target_os = "linux")]
                 {
@@ -325,6 +356,10 @@ impl PointerScanPanel {
         };
         let max_depth: usize = self.depth_text.trim().parse().unwrap_or(5).clamp(1, 12);
         let max_offset = super::parse_hex_addr(&self.max_offset_text).unwrap_or(0x1000);
+        let max_negative_offset = super::parse_hex_addr(&self.max_negative_text).unwrap_or(0);
+        let offset_alignment =
+            self.offset_align_text.trim().parse::<usize>().unwrap_or(1).max(1);
+        let must_end_in_static = !self.include_unanchored;
 
         // Static anchors = module images. Snapshot them (owned) for the worker.
         let static_ranges: Vec<Region> =
@@ -336,18 +371,31 @@ impl PointerScanPanel {
         let modules: Vec<ModuleInfoWithName> = modules.to_vec();
 
         self.status_msg = Some("Scanning…".into());
-        self.scan_job.spawn(rt, ctx, move || {
+        // Cancellable: this is the longest operation in the application, and it
+        // used to show a spinner with no progress and no way to stop it.
+        self.scan_job.spawn_cancellable(rt, ctx, move |job| {
             use nemclass_scan::ProcessTarget;
             let target =
                 ProcessTarget::attach(pid).map_err(|e| format!("ProcessTarget: {e}"))?;
             let cfg = PointerScanConfig {
                 max_depth,
                 max_offset,
+                max_negative_offset,
+                offset_alignment,
+                must_end_in_static,
                 static_ranges,
                 ..Default::default()
             };
-            let result =
-                pointer_scan(&target, goal, &cfg).map_err(|e| format!("Pointer scan: {e}"))?;
+            let result = nemclass_scan::pointer_scan_with(
+                &target,
+                goal,
+                &cfg,
+                &mut |p: nemclass_scan::PointerScanProgress| {
+                    job.set_progress(p.done as u64, p.total as u64);
+                    !job.is_cancelled()
+                },
+            )
+            .map_err(|e| format!("Pointer scan: {e}"))?;
             // Turn each path into a module-relative formula.
             let rows: Vec<PathRow> =
                 result.paths.iter().map(|p| path_row(p, &modules)).collect();

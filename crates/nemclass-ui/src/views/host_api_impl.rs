@@ -1557,10 +1557,12 @@ mod inner {
                         let Some(base) = p.get("base").and_then(|v| v.as_f64()) else {
                             return false;
                         };
-                        let offsets: Vec<usize> = p
+                        // Signed: a chain may step backwards from a pointer
+                        // stored in the middle of a structure.
+                        let offsets: Vec<isize> = p
                             .get("offsets")
                             .and_then(|o| o.as_array())
-                            .map(|a| a.iter().filter_map(|v| v.as_f64().map(|x| x as usize)).collect())
+                            .map(|a| a.iter().filter_map(|v| v.as_f64().map(|x| x as isize)).collect())
                             .unwrap_or_default();
                         let path = nemclass_scan::PointerPath { base: base as usize, offsets };
                         path.resolve(read_ptr) == Some(goal)

@@ -62,7 +62,9 @@ pub use compare::ScanCompareType;
 pub use freeze::{FreezeReport, FreezeSet};
 pub use pattern::{BytePattern, PatternByte, PatternError};
 pub use pointerscan::{
-    pointer_scan, PointerMap, PointerPath, PointerScanConfig, PointerScanResult,
+    NoPointerObserver, PointerMap, PointerMapIoError, PointerPath, PointerScanConfig,
+    PointerScanObserver, PointerScanPhase, PointerScanProgress, PointerScanResult,
+    pointer_scan, pointer_scan_with, rescan_paths,
 };
 pub use results::{ResultsIoError, ScanResult, ScanResults};
 pub use signature::{format_signature, make_signature, SignatureConfig};

@@ -17,6 +17,10 @@ fn emitted_formulas_parse_in_the_model() {
         PointerPath { base: 0x140000000, offsets: vec![0x8] },
         PointerPath { base: 0x140000010, offsets: vec![] },
         PointerPath { base: 0x7f0000abcd, offsets: vec![0x0, 0x18, 0x220, 0x8] },
+        // Negative offsets: a pointer stored in the middle of a structure is
+        // reached backwards from a field after it.
+        PointerPath { base: 0x140001000, offsets: vec![-0x10, 0x8] },
+        PointerPath { base: 0x140001000, offsets: vec![-0x8] },
     ];
     for p in &cases {
         let f = p.to_formula("game.exe", 0x140000000);
