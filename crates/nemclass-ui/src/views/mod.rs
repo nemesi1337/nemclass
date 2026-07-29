@@ -626,6 +626,22 @@ pub fn parse_hotkey(combo: &str) -> Option<(bool, bool, bool, egui::Key)> {
 
 impl NemclassApp {
     pub fn new() -> Self {
+        Self::build(true)
+    }
+
+    /// An app with no script engine, for tests.
+    ///
+    /// [`Self::new`] spawns a real v8 isolate. v8's platform initialisation is
+    /// process-global and is not safe to perform concurrently, so several tests
+    /// each building an app on the default multi-threaded harness segfaults the
+    /// whole test binary — taking every other test in it with it, which is how
+    /// this went unnoticed at first: a crashed binary reports no failures.
+    #[cfg(test)]
+    pub(crate) fn new_headless() -> Self {
+        Self::build(false)
+    }
+
+    fn build(with_scripting: bool) -> Self {
         let registry = ProviderRegistry::default();
         let mut backend_names: Vec<String> = registry.names().map(str::to_owned).collect();
         backend_names.sort();
@@ -672,7 +688,8 @@ impl NemclassApp {
 
         // Spawn the JS engine (feature-gated; `Disabled` otherwise). Any spawn
         // error is surfaced in the initial status message.
-        let (script_host, script_spawn_msg) = ScriptHost::spawn();
+        let (script_host, script_spawn_msg) =
+            if with_scripting { ScriptHost::spawn() } else { (ScriptHost::disabled(), None) };
         let script_log = new_script_log();
 
         let mut app = Self {
@@ -6501,7 +6518,7 @@ mod edit_tests {
 
     /// An app with one class of four `Int32` fields named a/b/c/d.
     fn app_with_four_fields() -> (NemclassApp, Uuid) {
-        let mut app = NemclassApp::new();
+        let mut app = NemclassApp::new_headless();
         let mut project = Project::new("test");
         let mut class = ClassNode::new("Entity");
         for name in ["a", "b", "c", "d"] {
@@ -6733,7 +6750,7 @@ mod edit_tests {
 
     #[test]
     fn pasted_nodes_also_take_the_projects_pointer_width() {
-        let mut app = NemclassApp::new();
+        let mut app = NemclassApp::new_headless();
         let mut project = Project::new("test");
         let mut class = ClassNode::new("Entity");
         class.children.push(Box::new(Float32Node::new("f")));

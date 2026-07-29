@@ -24,6 +24,11 @@ pub enum ScriptHost {
 }
 
 impl ScriptHost {
+    /// A host with no engine behind it. Every call is a no-op.
+    pub fn disabled() -> Self {
+        ScriptHost::Disabled
+    }
+
     /// Attempts to spawn the real engine (feature-gated) and returns the host
     /// together with an optional human-readable error message.
     ///
