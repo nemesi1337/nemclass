@@ -74,6 +74,9 @@ struct ScreenshotConfig {
     goto: Option<usize>,
     /// Run a dissect and show the Navigator (rather than the disassembler).
     dissect: bool,
+    /// Maximize the tab with this title, so a capture can reach any panel and
+    /// not just the disassembler. Applies with or without `--attach`.
+    tab: Option<String>,
 }
 
 impl ScreenshotConfig {
@@ -102,6 +105,7 @@ impl ScreenshotConfig {
             usize::from_str_radix(s, 16).ok()
         });
         let dissect = args.iter().any(|a| a == "--dissect");
+        let tab = flag("--tab");
         Some(Self {
             path,
             shot_frame,
@@ -110,6 +114,7 @@ impl ScreenshotConfig {
             module,
             goto,
             dissect,
+            tab,
         })
     }
 }
@@ -136,6 +141,15 @@ impl eframe::App for ScreenshotHarness {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // On the first frame, optionally attach + drive the disassembler so the
         // capture shows a live view rather than the "attach first" placeholder.
+        // `--tab` is independent of attaching: most panels are worth capturing
+        // with no target, and the two solo helpers below only reach two of them.
+        if self.frame_count == 0
+            && let Some(name) = self.cfg.tab.clone()
+            && !self.inner.debug_solo_tab(&name)
+        {
+            eprintln!("screenshot: no tab named {name:?}");
+        }
+
         if self.frame_count == 0
             && let Some(pid) = self.cfg.attach_pid
         {

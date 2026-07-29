@@ -32,6 +32,7 @@ mod host_api_impl;
 mod node_edit;
 mod toast;
 mod pointer_scan_panel;
+mod ptrmap_io;
 mod spider_panel;
 pub(crate) mod cheat_table_panel;
 mod tasks;
@@ -1071,6 +1072,20 @@ impl NemclassApp {
     /// Debug/screenshot hook: maximize the Navigator tab.
     pub fn debug_solo_navigator(&mut self) {
         self.dock_state = Some(DockState::new(vec![TabKind::Navigator]));
+    }
+
+    /// Debug/screenshot hook: maximize the tab whose title matches `name`
+    /// case-insensitively, so a capture can reach any panel rather than only the
+    /// two with a hand-written helper. Returns false if no tab matches.
+    pub fn debug_solo_tab(&mut self, name: &str) -> bool {
+        let Some(&tab) = TabKind::ALL
+            .iter()
+            .find(|t| t.title().eq_ignore_ascii_case(name))
+        else {
+            return false;
+        };
+        self.dock_state = Some(DockState::new(vec![tab]));
+        true
     }
 
     /// Debug/screenshot hook: run a dissect over the disassembler's selected
@@ -3024,12 +3039,14 @@ impl NemclassApp {
         }
 
         let rt = self.runtime.as_ref().expect("bg runtime").handle();
+        let start_dir = self.dialog_start_dir();
         let action = self.pointer_scan_panel.show(
             ui,
             self.process.clone(),
             pid,
             &modules,
             &rt,
+            &start_dir,
         );
 
         // Stash the action for application after the dock draw closes all borrows.
@@ -3084,7 +3101,10 @@ impl NemclassApp {
         let rt = self.runtime.as_ref().expect("bg runtime").handle();
 
         self.spider_panel.set_live_interval(self.snapshot_interval);
-        let action = self.spider_panel.show(ui, self.process.as_ref(), &modules, &rt);
+        let start_dir = self.dialog_start_dir();
+        let action =
+            self.spider_panel
+                .show(ui, self.process.as_ref(), &modules, &rt, &start_dir);
 
         // Stash for application after the dock draw closes all borrows.
         match action {

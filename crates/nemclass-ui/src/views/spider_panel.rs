@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,10 +41,14 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use nemclass_core::{ModuleInfoWithName, Process};
-use nemclass_scan::{ScanCompareType, ScanValueType, SpiderHit};
+use nemclass_scan::{
+    PathKind, PtrMapEntry, PtrMapFile, ResolvedPath, ScanCompareType, ScanValueType, SpiderHit,
+};
 
 #[cfg(target_os = "linux")]
 use nemclass_scan::{spider_refine_with, spider_scan_with, SpiderConfig};
+
+use super::ptrmap_io::{self, RebaseDialog};
 
 use super::scanner_panel::{
     compare_label, format_value_bytes, value_type_label, ALL_VALUE_TYPES, CHANGED_COLOR,
@@ -125,7 +130,18 @@ type RefineOutcome = Result<(Vec<HitRow>, usize), String>;
 struct HitRow {
     hit: SpiderHit,
     formula: String,
+    /// The module the root sits in, as `(name, base)`.
+    ///
+    /// Kept rather than recomputed when exporting: a path imported while its
+    /// module was not loaded would otherwise be saved as a bare address, which
+    /// will not survive the next restart.
+    module: Option<(String, usize)>,
 }
+
+/// What a completed seed pass hands back: the rows that still resolve, with
+/// their values read, and the count before the pass.
+#[cfg(target_os = "linux")]
+type SeedOutcome = (Vec<HitRow>, usize);
 
 /// All state owned by the spider panel.
 pub struct SpiderPanel {
@@ -166,6 +182,19 @@ pub struct SpiderPanel {
     /// In-flight refine. Payload: surviving rows and the pre-refine count.
     #[cfg(target_os = "linux")]
     refine_job: BackgroundJob<RefineOutcome>,
+    /// In-flight seed pass after an import, reading each path's current value.
+    #[cfg(target_os = "linux")]
+    seed_job: BackgroundJob<SeedOutcome>,
+    /// True while the rows carry no value readings — the state an import leaves
+    /// them in until the seed pass fills them.
+    ///
+    /// A refine compares against `hit.current`, and `compare_change` returns
+    /// `false` whenever the previous reading is shorter than the value width.
+    /// Refining unseeded rows would therefore discard every one of them and
+    /// report it as "nothing survived", so the button stays disabled instead.
+    unseeded: bool,
+    /// Import prompt for a `.ptrmap`, shown after a file is picked.
+    rebase_dialog: RebaseDialog,
     /// Live readings for the rows the viewport drew, keyed by row index (a
     /// spider row has no fixed address — the chain has to be walked).
     live_cache: HashMap<usize, Option<(usize, Vec<u8>)>>,
@@ -207,6 +236,10 @@ impl SpiderPanel {
             scan_job: BackgroundJob::default(),
             #[cfg(target_os = "linux")]
             refine_job: BackgroundJob::default(),
+            #[cfg(target_os = "linux")]
+            seed_job: BackgroundJob::default(),
+            unseeded: false,
+            rebase_dialog: RebaseDialog::default(),
             live_cache: HashMap::new(),
             last_live_refresh: None,
             visible_rows: 0..0,
@@ -225,6 +258,116 @@ impl SpiderPanel {
         self.root_text = format!("0x{addr:X}");
     }
 
+    // -----------------------------------------------------------------------
+    // Saving and loading the hit set
+    //
+    // A wide search returns six figures of hits and the table draws a thousand.
+    // These carry the rest of them out of the tool and back in.
+    // -----------------------------------------------------------------------
+
+    /// Package the current rows as a `.ptrmap`.
+    ///
+    /// The value readings are deliberately not saved: a byte read from the last
+    /// session says nothing about this one, and writing it would let a refine
+    /// compare against a fabricated baseline. [`Self::seed`] re-reads them.
+    ///
+    /// `goal` carries the **search root**. That is load-bearing, not a label:
+    /// [`Self::compare`] uses it to line a saved run's heap roots up with the
+    /// object being searched now.
+    fn to_file(&self) -> PtrMapFile {
+        let mut file = PtrMapFile {
+            goal: super::parse_hex_addr(&self.root_text).unwrap_or(0),
+            modules: Vec::new(),
+            entries: Vec::with_capacity(self.rows.len()),
+            truncated: self.truncated,
+        };
+        for row in &self.rows {
+            let owner = row.module.as_ref().map(|(n, b)| (n.as_str(), *b));
+            let anchor = ptrmap_io::anchor_for(&mut file, row.hit.path.root, owner);
+            file.entries
+                .push(PtrMapEntry::from_spider_path(&row.hit.path, anchor));
+        }
+        file
+    }
+
+    /// Rebuild display rows from paths resolved against the current process.
+    ///
+    /// The reconstructed hits carry empty value buffers, which is what
+    /// [`Self::unseeded`] exists to guard.
+    fn rows_from(paths: &[ResolvedPath]) -> Vec<HitRow> {
+        paths
+            .iter()
+            .filter_map(|p| {
+                let path = p.to_spider_path().ok()?;
+                Some(HitRow {
+                    formula: p.to_formula(),
+                    hit: SpiderHit { path, current: Vec::new(), previous: Vec::new() },
+                    module: p.module.as_ref().map(|m| (m.name.clone(), m.base)),
+                })
+            })
+            .collect()
+    }
+
+    /// Pick a `.ptrmap` and stage it in the rebase prompt.
+    fn import(&mut self, modules: &[ModuleInfoWithName], start_dir: &Path) {
+        match ptrmap_io::pick(start_dir) {
+            Ok(Some((file, name))) => {
+                if let Err(e) = self.rebase_dialog.open(file, name, PathKind::Spider, modules) {
+                    self.status_msg = Some(e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => self.status_msg = Some(e),
+        }
+    }
+
+    /// Narrow the current hits to the paths a saved run also found.
+    ///
+    /// A spider root is a heap address, and the object sits somewhere else every
+    /// run — so comparing raw roots would match nothing at all and report it as
+    /// "no paths in common". The saved file records the root it was searched
+    /// from, so the two runs are lined up on that before intersecting, and what
+    /// is really being compared is the offset chain *within* the object. Module-
+    /// anchored paths need no such help; they already compare by name and offset.
+    fn compare(&mut self, start_dir: &Path) {
+        let picked = match ptrmap_io::pick(start_dir) {
+            Ok(Some(picked)) => picked,
+            Ok(None) => return,
+            Err(e) => {
+                self.status_msg = Some(e);
+                return;
+            }
+        };
+        let (loaded, name) = picked;
+        if let Some(&got) = loaded.kinds().iter().find(|&&k| k != PathKind::Spider) {
+            self.status_msg =
+                Some(format!("{name} holds {} paths, not spider ones.", got.label()));
+            return;
+        }
+
+        let before = self.rows.len();
+        let current = self.to_file();
+        let aligned = align_roots(&loaded, current.goal);
+        // Retained in place by index, so the surviving rows keep the value
+        // readings that rebuilding them from the file would throw away — and
+        // that a refine needs as its baseline.
+        let kept: std::collections::HashSet<usize> =
+            current.intersect_indices(&aligned).into_iter().collect();
+        let mut i = 0;
+        self.rows.retain(|_| {
+            let keep = kept.contains(&i);
+            i += 1;
+            keep
+        });
+        self.live_cache.clear();
+        self.truncated |= loaded.truncated;
+        self.status_msg = Some(format!(
+            "Compare: {} of {before} path(s) also in {name} ({} there).",
+            self.rows.len(),
+            loaded.entries.len()
+        ));
+    }
+
     /// Drop everything tied to the old target when the user detaches.
     pub fn on_detach(&mut self) {
         self.clear_results();
@@ -235,6 +378,7 @@ impl SpiderPanel {
             // Discard in-flight work so stale results never land on a new target.
             self.scan_job = BackgroundJob::default();
             self.refine_job = BackgroundJob::default();
+            self.seed_job = BackgroundJob::default();
         }
         self.status_msg = None;
     }
@@ -243,6 +387,7 @@ impl SpiderPanel {
         self.rows.clear();
         self.truncated = false;
         self.nodes_visited = 0;
+        self.unseeded = false;
         self.live_cache.clear();
         self.last_live_refresh = None;
         self.visible_rows = 0..0;
@@ -283,6 +428,16 @@ impl SpiderPanel {
                 Err(e) => self.status_msg = Some(e),
             }
         }
+        if let JobPoll::Done((rows, before)) = self.seed_job.poll() {
+            let kept = rows.len();
+            self.rows = rows;
+            self.unseeded = false;
+            self.live_cache.clear();
+            self.last_live_refresh = None;
+            self.status_msg = Some(format!(
+                "Imported {before} path(s); {kept} still resolve in this process.",
+            ));
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -296,6 +451,7 @@ impl SpiderPanel {
         process: Option<&Arc<Process>>,
         modules: &[ModuleInfoWithName],
         rt: &tokio::runtime::Handle,
+        start_dir: &Path,
     ) -> SpiderAction {
         self.process = process.cloned();
         let attached = process.is_some();
@@ -305,8 +461,24 @@ impl SpiderPanel {
         }
 
         self.show_config(ui, attached, modules, rt);
+        self.show_file_row(ui, modules, start_dir);
         ui.separator();
         self.show_summary(ui);
+
+        // The import prompt, once a file has been picked.
+        if let Some(outcome) = self.rebase_dialog.show(ui.ctx()) {
+            self.clear_results();
+            self.rows = Self::rows_from(&outcome.paths);
+            self.truncated = outcome.truncated;
+            self.unseeded = true;
+            #[cfg(target_os = "linux")]
+            self.seed(rt, ui.ctx().clone());
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.status_msg = Some(format!("Imported {} path(s).", self.rows.len()));
+            }
+        }
+
         let action = self.show_results(ui);
         self.show_refine(ui, rt);
 
@@ -429,6 +601,61 @@ impl SpiderPanel {
             {
                 let _ = (modules, rt, locked);
                 ui.add_enabled(false, egui::Button::new("Search"));
+            }
+        });
+    }
+
+    /// Export / import / compare. A wide search returns far more hits than the
+    /// table draws, so these are the only way to reach the rest of them.
+    fn show_file_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        modules: &[ModuleInfoWithName],
+        start_dir: &Path,
+    ) {
+        ui.horizontal(|ui| {
+            let has_rows = !self.rows.is_empty();
+            let busy = self.is_busy();
+            if ui
+                .add_enabled(has_rows && !busy, egui::Button::new("Export…"))
+                .on_hover_text("Save every path — not just the ones shown — to a .ptrmap")
+                .clicked()
+            {
+                let file = self.to_file();
+                self.status_msg = Some(ptrmap_io::export(&file, "spider", start_dir));
+            }
+            if ui
+                .add_enabled(has_rows && !busy, egui::Button::new("Export text…"))
+                .on_hover_text("Save every path as a plain list of formulas, one per line")
+                .clicked()
+            {
+                let file = self.to_file();
+                self.status_msg = Some(ptrmap_io::export_text(&file, "spider", start_dir));
+            }
+            // Disabled while a prompt is already up: a second pick would replace
+            // the staged file and the open dialog would apply the wrong one.
+            if ui
+                .add_enabled(
+                    !busy && !self.rebase_dialog.is_open(),
+                    egui::Button::new("Import…"),
+                )
+                .on_hover_text(
+                    "Load a saved .ptrmap. The root is usually a heap address, so the \
+                     prompt lets you type where the object lives now.",
+                )
+                .clicked()
+            {
+                self.import(modules, start_dir);
+            }
+            if ui
+                .add_enabled(has_rows && !busy, egui::Button::new("Compare…"))
+                .on_hover_text(
+                    "Keep only the paths a saved run also found — the offsets that are \
+                     really part of the structure rather than of one heap layout.",
+                )
+                .clicked()
+            {
+                self.compare(start_dir);
             }
         });
     }
@@ -663,8 +890,17 @@ impl SpiderPanel {
             #[cfg(target_os = "linux")]
             {
                 let busy = self.is_busy();
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Refine"))
+                // Unseeded rows have no baseline reading, and a refine against
+                // an empty one rejects every row — a total wipe reported as
+                // "nothing survived". Blocked rather than run.
+                let response = ui
+                    .add_enabled(!busy && !self.unseeded, egui::Button::new("Refine"));
+                if self.unseeded {
+                    response.on_hover_text(
+                        "Imported paths have no value reading to compare against yet. \
+                         Attach to a process and re-import to read them.",
+                    );
+                } else if response
                     .on_hover_text("Re-walk every chain and keep only the matching values")
                     .clicked()
                 {
@@ -678,9 +914,58 @@ impl SpiderPanel {
         });
     }
 
+    /// Read each imported path's current value, dropping the ones whose chain no
+    /// longer resolves.
+    ///
+    /// An imported hit arrives with empty value buffers, and a refine compares
+    /// against them — `compare_change` rejects any reading shorter than the
+    /// value width, so refining unseeded rows would discard all of them. This
+    /// gives every surviving row the equal `current`/`previous` pair a fresh
+    /// search would have produced.
+    #[cfg(target_os = "linux")]
+    fn seed(&mut self, rt: &tokio::runtime::Handle, ctx: egui::Context) {
+        let Some(process) = self.process.clone() else {
+            self.status_msg = Some(format!(
+                "Imported {} path(s). Attach to a process to read their values.",
+                self.rows.len()
+            ));
+            return;
+        };
+        let stride = self.value_type.fixed_width().unwrap_or(8);
+        let rows = std::mem::take(&mut self.rows);
+        let before = rows.len();
+        self.status_msg = Some("Resolving imported paths…".into());
+
+        self.seed_job.spawn_cancellable(rt, ctx, move |job| {
+            let total = rows.len() as u64;
+            let mut kept: Vec<HitRow> = Vec::new();
+            let mut buf = vec![0u8; stride];
+            for (i, mut row) in rows.into_iter().enumerate() {
+                if i.is_multiple_of(128) {
+                    job.set_progress(i as u64, total);
+                    if job.is_cancelled() {
+                        // Hand back what resolved so far rather than an empty
+                        // list, matching the pointer scanner's rescan.
+                        break;
+                    }
+                }
+                let Some(addr) = resolve_live(&process, &row.hit) else { continue };
+                if process.read_buf(addr, &mut buf).is_err() {
+                    continue;
+                }
+                row.hit.current = buf.clone();
+                row.hit.previous = buf.clone();
+                kept.push(row);
+            }
+            (kept, before)
+        });
+    }
+
     #[cfg(target_os = "linux")]
     fn is_busy(&self) -> bool {
-        self.scan_job.is_running() || self.refine_job.is_running()
+        self.scan_job.is_running()
+            || self.refine_job.is_running()
+            || self.seed_job.is_running()
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -693,6 +978,7 @@ impl SpiderPanel {
         self.scan_job
             .handle()
             .or_else(|| self.refine_job.handle())
+            .or_else(|| self.seed_job.handle())
             .and_then(|h| h.fraction())
     }
 
@@ -700,6 +986,7 @@ impl SpiderPanel {
     fn cancel(&mut self) {
         self.scan_job.cancel();
         self.refine_job.cancel();
+        self.seed_job.cancel();
     }
 
     /// Parse the config fields into an engine config plus a needle.
@@ -894,14 +1181,254 @@ fn resolve_live(process: &Process, hit: &SpiderHit) -> Option<usize> {
 
 /// Prepare a hit for display, anchoring its formula in the owning module when
 /// the root falls inside one so the path survives a restart.
+/// Shift a saved run's heap-rooted paths so they start at `root`.
+///
+/// The object a spider searched is at a different address every run, so two runs
+/// of the same search produce the same offset chains under two different roots.
+/// Moving the saved run onto the current root is what makes the offsets — the
+/// part that is actually a property of the structure — comparable. Module-
+/// anchored paths are left alone: their anchors are already relocation-proof.
+fn align_roots(file: &PtrMapFile, root: usize) -> PtrMapFile {
+    let delta = (root as isize).wrapping_sub(file.goal as isize);
+    PtrMapFile {
+        goal: root,
+        modules: file.modules.clone(),
+        entries: file
+            .entries
+            .iter()
+            .map(|e| PtrMapEntry {
+                anchor: match e.anchor {
+                    nemclass_scan::Anchor::Absolute(a) => {
+                        nemclass_scan::Anchor::Absolute(a.wrapping_add_signed(delta))
+                    }
+                    module => module,
+                },
+                ..e.clone()
+            })
+            .collect(),
+        truncated: file.truncated,
+    }
+}
+
 fn hit_row(hit: SpiderHit, modules: &[ModuleInfoWithName]) -> HitRow {
-    let root = hit.path.root;
-    let module = modules
-        .iter()
-        .find(|m| root >= m.base && root < m.base.saturating_add(m.size));
-    let formula = match module {
-        Some(m) => hit.path.to_formula_at_module(&m.name, m.base),
+    let module = ptrmap_io::module_at(hit.path.root, modules);
+    let formula = match &module {
+        Some((name, base)) => hit.path.to_formula_at_module(name, *base),
         None => hit.path.to_formula_raw(),
     };
-    HitRow { hit, formula }
+    HitRow { hit, formula, module }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nemclass_scan::SpiderPath;
+
+    fn row(
+        root: usize,
+        module: Option<(&str, usize)>,
+        parents: &[usize],
+        offset: usize,
+        value: i32,
+    ) -> HitRow {
+        let path = SpiderPath {
+            root,
+            parent_offsets: Arc::from(parents),
+            offset,
+        };
+        let formula = match module {
+            Some((name, base)) => path.to_formula_at_module(name, base),
+            None => path.to_formula_raw(),
+        };
+        HitRow {
+            hit: SpiderHit {
+                path,
+                current: value.to_le_bytes().to_vec(),
+                previous: (value - 1).to_le_bytes().to_vec(),
+            },
+            formula,
+            module: module.map(|(n, b)| (n.to_string(), b)),
+        }
+    }
+
+    fn panel_with(rows: Vec<HitRow>) -> SpiderPanel {
+        let mut panel = SpiderPanel::new();
+        panel.root_text = "0x55550000".to_string();
+        panel.rows = rows;
+        panel
+    }
+
+    fn sample_rows() -> Vec<HitRow> {
+        vec![
+            row(0x5555_0000, None, &[0x18, 0x40], 0x14, 100),
+            row(0x5555_0000, None, &[], 0x8, 200),
+            row(0x40_1000, Some(("game.exe", 0x40_0000)), &[0x10], 0x4, 300),
+        ]
+    }
+
+    #[test]
+    fn every_row_reaches_the_file_including_the_ones_past_the_display_cap() {
+        let rows: Vec<HitRow> = (0..MAX_DISPLAY + 42)
+            .map(|i| row(0x5555_0000, None, &[0x18], i * 4, i as i32))
+            .collect();
+        let file = panel_with(rows).to_file();
+        assert_eq!(file.entries.len(), MAX_DISPLAY + 42);
+        assert!(file.entries.iter().all(|e| e.kind == PathKind::Spider));
+    }
+
+    #[test]
+    fn paths_survive_a_trip_through_the_file_unchanged() {
+        let original = sample_rows();
+        let file = panel_with(original.clone_paths()).to_file();
+        let back = PtrMapFile::from_bytes(&file.to_bytes()).expect("round trip");
+        let rows = SpiderPanel::rows_from(&back.rebase(&|_| None, 0));
+
+        assert_eq!(rows.len(), original.len());
+        for (got, want) in rows.iter().zip(&original) {
+            assert_eq!(got.formula, want.formula);
+            assert_eq!(got.hit.path, want.hit.path);
+            assert_eq!(got.module, want.module);
+        }
+    }
+
+    #[test]
+    fn an_imported_row_arrives_unseeded() {
+        // The state `unseeded` exists to guard: a refine compares against
+        // `current`, and an empty reading makes `compare_change` reject the row.
+        let file = panel_with(sample_rows()).to_file();
+        let back = PtrMapFile::from_bytes(&file.to_bytes()).unwrap();
+        let rows = SpiderPanel::rows_from(&back.rebase(&|_| None, 0));
+        assert!(rows.iter().all(|r| r.hit.current.is_empty()));
+        assert!(rows.iter().all(|r| r.hit.previous.is_empty()));
+    }
+
+    #[test]
+    fn an_unanchored_root_follows_the_manual_delta() {
+        // The common spider case: the object moved, and the user types where it
+        // lives now. Only the heap-rooted paths shift.
+        let file = panel_with(sample_rows()).to_file();
+        let back = PtrMapFile::from_bytes(&file.to_bytes()).unwrap();
+        let rows = SpiderPanel::rows_from(&back.rebase(&|_| None, 0x1_0000));
+
+        assert_eq!(rows[0].hit.path.root, 0x5556_0000);
+        assert_eq!(rows[1].hit.path.root, 0x5556_0000);
+        assert_eq!(rows[2].hit.path.root, 0x40_1000, "a module anchor ignores the delta");
+        assert_eq!(rows[0].formula, "[[0x55560000 + 0x18] + 0x40] + 0x14");
+    }
+
+    #[test]
+    fn comparing_keeps_the_value_readings_of_the_surviving_rows() {
+        // The reason compare retains in place instead of rebuilding from the
+        // file: rebuilt rows would be unseeded, and the next refine would then
+        // discard every one of them.
+        let mut panel = panel_with(sample_rows());
+        let current = panel.to_file();
+
+        // A second run of a restarted target: the object is now at 0x8888_0000
+        // and the modules moved too. It found the first and third paths again
+        // and never saw the second.
+        let mut other = PtrMapFile {
+            goal: 0x8888_0000,
+            modules: Vec::new(),
+            entries: Vec::new(),
+            truncated: false,
+        };
+        for (root, module, parents, offset) in [
+            (0x8888_0000usize, None, vec![0x18usize, 0x40], 0x14usize),
+            (0x9000_1000, Some(("game.exe", 0x9000_0000usize)), vec![0x10], 0x4),
+        ] {
+            let path = SpiderPath { root, parent_offsets: Arc::from(parents.as_slice()), offset };
+            let anchor = ptrmap_io::anchor_for(&mut other, root, module);
+            other.entries.push(PtrMapEntry::from_spider_path(&path, anchor));
+        }
+
+        let aligned = align_roots(&other, current.goal);
+        let kept: std::collections::HashSet<usize> =
+            current.intersect_indices(&aligned).into_iter().collect();
+        assert_eq!(kept.len(), 2);
+        let mut i = 0;
+        panel.rows.retain(|_| {
+            let keep = kept.contains(&i);
+            i += 1;
+            keep
+        });
+
+        assert_eq!(panel.rows.len(), 2);
+        // The values came through intact, so a refine still has its baseline.
+        assert_eq!(panel.rows[0].hit.current, 100i32.to_le_bytes().to_vec());
+        assert_eq!(panel.rows[0].hit.previous, 99i32.to_le_bytes().to_vec());
+        assert_eq!(panel.rows[1].hit.current, 300i32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn aligning_roots_is_what_makes_a_heap_rooted_compare_work_at_all() {
+        // Without it, a saved run's roots never coincide with this run's and the
+        // comparison silently returns nothing.
+        let a = panel_with(vec![row(0x5555_0000, None, &[0x18], 0x8, 1)]).to_file();
+        let mut b = panel_with(vec![row(0x6666_0000, None, &[0x18], 0x8, 1)]).to_file();
+        b.goal = 0x6666_0000;
+
+        assert!(
+            a.intersect_indices(&b).is_empty(),
+            "raw roots from two runs do not coincide"
+        );
+        assert_eq!(a.intersect_indices(&align_roots(&b, a.goal)), vec![0]);
+    }
+
+    #[test]
+    fn aligning_roots_leaves_module_anchored_paths_alone() {
+        // Their anchors are already relocation-proof; shifting them would break
+        // the match instead of enabling it.
+        let a = panel_with(vec![row(
+            0x40_1000,
+            Some(("game.exe", 0x40_0000)),
+            &[0x10],
+            0x4,
+            1,
+        )])
+        .to_file();
+        let mut b = panel_with(vec![row(
+            0x9000_1000,
+            Some(("game.exe", 0x9000_0000)),
+            &[0x10],
+            0x4,
+            1,
+        )])
+        .to_file();
+        b.goal = 0x8888_0000;
+
+        assert_eq!(a.intersect_indices(&align_roots(&b, a.goal)), vec![0]);
+    }
+
+    #[test]
+    fn aligning_roots_does_not_make_different_offset_chains_match() {
+        // The alignment must not be so aggressive that it collapses distinct
+        // paths — the offsets still have to agree.
+        let a = panel_with(vec![row(0x5555_0000, None, &[0x18], 0x8, 1)]).to_file();
+        let mut b = panel_with(vec![row(0x6666_0000, None, &[0x20], 0x8, 1)]).to_file();
+        b.goal = 0x6666_0000;
+        assert!(a.intersect_indices(&align_roots(&b, a.goal)).is_empty());
+    }
+
+    /// `HitRow` is not `Clone` (a `SpiderHit` carries value buffers); the tests
+    /// only need the paths duplicated.
+    trait ClonePaths {
+        fn clone_paths(&self) -> Vec<HitRow>;
+    }
+
+    impl ClonePaths for Vec<HitRow> {
+        fn clone_paths(&self) -> Vec<HitRow> {
+            self.iter()
+                .map(|r| HitRow {
+                    hit: SpiderHit {
+                        path: r.hit.path.clone(),
+                        current: r.hit.current.clone(),
+                        previous: r.hit.previous.clone(),
+                    },
+                    formula: r.formula.clone(),
+                    module: r.module.clone(),
+                })
+                .collect()
+        }
+    }
 }
