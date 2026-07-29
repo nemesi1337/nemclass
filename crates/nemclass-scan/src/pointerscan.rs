@@ -193,11 +193,21 @@ impl PointerPath {
     /// static offset `base - module_base` is emitted relative to `module_name`.
     pub fn to_formula(&self, module_name: &str, module_base: usize) -> String {
         let base_off = self.base.wrapping_sub(module_base);
-        let mut expr = if base_off == 0 {
+        let base = if base_off == 0 {
             format!("<{module_name}>")
         } else {
             format!("<{module_name}> + {base_off:#x}")
         };
+        self.to_formula_expr(&base)
+    }
+
+    /// [`Self::to_formula`] on top of an arbitrary base expression.
+    ///
+    /// Note the shape differs from [`SpiderPath::to_formula`](crate::SpiderPath::to_formula):
+    /// here each offset is added *after* a dereference (`[expr] + off`), because
+    /// a `PointerPath` dereferences its base. See [`Self::resolve`].
+    pub fn to_formula_expr(&self, base_expr: &str) -> String {
+        let mut expr = base_expr.to_string();
         for &off in &self.offsets {
             expr = if off < 0 {
                 format!("[{expr}] - {:#x}", off.unsigned_abs())
@@ -206,6 +216,12 @@ impl PointerPath {
             };
         }
         expr
+    }
+
+    /// [`Self::to_formula`] with the anchor as a bare hex literal, for a chain
+    /// that never reached a module image. Only valid until the target restarts.
+    pub fn to_formula_raw(&self) -> String {
+        self.to_formula_expr(&format!("{:#x}", self.base))
     }
 }
 

@@ -51,6 +51,7 @@ mod compare;
 mod freeze;
 mod pattern;
 mod pointerscan;
+mod ptrmap;
 mod results;
 mod scanner;
 mod spider;
@@ -65,6 +66,9 @@ pub use pointerscan::{
     NoPointerObserver, PointerMap, PointerMapIoError, PointerPath, PointerScanConfig,
     PointerScanObserver, PointerScanPhase, PointerScanProgress, PointerScanResult,
     pointer_scan, pointer_scan_with, rescan_paths,
+};
+pub use ptrmap::{
+    Anchor, ModuleRef, PathKind, PtrMapEntry, PtrMapError, PtrMapFile, ResolvedPath,
 };
 pub use results::{ResultsIoError, ScanResult, ScanResults};
 pub use signature::{format_signature, make_signature, SignatureConfig};
