@@ -434,6 +434,10 @@ pub struct NemclassApp {
     extract_class_dialog: Option<ExtractClassState>,
     /// Whether the project's enum editor window is open.
     enum_editor_open: bool,
+    /// Whether the settings window is open.
+    settings_open: bool,
+    /// The theme applied to the egui context, so it is only set when it changes.
+    applied_theme: Option<settings::Theme>,
     /// A New/Open the user asked for while the project had unsaved changes.
     pending_discard: Option<PendingDiscard>,
     /// Code-generator panel state (language choice + last generated output).
@@ -713,6 +717,8 @@ impl NemclassApp {
             class_search: String::new(),
             extract_class_dialog: None,
             enum_editor_open: false,
+            settings_open: false,
+            applied_theme: None,
             pending_discard: None,
             generator_panel: GeneratorPanel::default(),
             dissect_len_text: "0x100".to_owned(),
@@ -1896,6 +1902,9 @@ impl Drop for NemclassApp {
 
 impl eframe::App for NemclassApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // No `set_visuals` call existed at all, so the saved theme was never
+        // applied. Cheap: it only touches the context when the theme changes.
+        self.apply_theme(ctx);
         // Drain any background operations that finished since the last frame.
         self.poll_background_jobs();
         self.check_target_alive();
@@ -2086,6 +2095,7 @@ impl eframe::App for NemclassApp {
         self.show_class_rename_modal(ui.ctx());
         self.show_extract_class_dialog(ui.ctx());
         self.show_enum_editor(ui.ctx());
+        self.show_settings_dialog(ui.ctx());
         self.show_unsaved_changes_prompt(ui.ctx());
         // After the dialogs: a modal that has keyboard focus must get the
         // keystroke, and `typing_in_a_text_field` only reports focus once the
@@ -2181,6 +2191,10 @@ impl NemclassApp {
 
             // View menu: toggle dock panels on/off and reset the layout.
             ui.menu_button("View", |ui| self.show_view_menu(ui));
+
+            if ui.button("Settings…").clicked() {
+                self.settings_open = true;
+            }
 
             ui.menu_button("Project", |ui| {
                 if ui.button("Enums…").clicked() {
@@ -5181,6 +5195,122 @@ impl NemclassApp {
             PendingDiscard::New => self.pick_new_project_now(),
             PendingDiscard::Open => self.pick_open_project_now(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Settings
+    // -----------------------------------------------------------------------
+
+    /// Apply the saved theme to the egui context.
+    ///
+    /// Only on a change: `set_visuals` rebuilds the style every call, and doing
+    /// that once a frame is pure waste.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        let theme = self.settings.theme.unwrap_or(settings::Theme::Dark);
+        if self.applied_theme != Some(theme) {
+            ctx.set_visuals(theme.visuals());
+            self.applied_theme = Some(theme);
+        }
+    }
+
+    /// The settings window.
+    ///
+    /// The settings file has persisted the window size, the dock layout, the
+    /// recent projects and the live interval since it existed, and there was no
+    /// way to see or change any of it from inside the application.
+    fn show_settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.strong("Appearance");
+                let mut theme = self.settings.theme.unwrap_or(settings::Theme::Dark);
+                ui.horizontal(|ui| {
+                    for option in [settings::Theme::Dark, settings::Theme::Light] {
+                        if ui.radio_value(&mut theme, option, option.label()).clicked() {
+                            changed = true;
+                        }
+                    }
+                });
+                if changed {
+                    self.settings.theme = Some(theme);
+                }
+
+                ui.add_space(8.0);
+                ui.strong("Live update");
+                let mut interval = self.settings.live_interval_ms.unwrap_or(250);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut interval, 16..=2000)
+                            .text("snapshot interval (ms)"),
+                    )
+                    .changed()
+                {
+                    // Clamped rather than accepted as typed: a zero-millisecond
+                    // interval re-reads the whole class body every frame.
+                    self.settings.live_interval_ms = Some(interval.clamp(16, 2000));
+                    self.snapshot_interval = Duration::from_millis(interval.clamp(16, 2000));
+                    changed = true;
+                }
+
+                ui.add_space(8.0);
+                ui.strong("Startup");
+                let mut reopen = self.settings.last_project.is_some();
+                if ui
+                    .checkbox(&mut reopen, "Reopen the last project")
+                    .on_hover_text("Unticking forgets which project to reopen, not the project")
+                    .changed()
+                {
+                    if !reopen {
+                        self.settings.last_project = None;
+                    } else {
+                        self.settings.last_project = self.project_dir.clone();
+                    }
+                    changed = true;
+                }
+
+                ui.add_space(8.0);
+                ui.strong("Recent projects");
+                if self.settings.recent_projects.is_empty() {
+                    ui.weak("None yet.");
+                } else {
+                    for dir in &self.settings.recent_projects {
+                        ui.weak(dir.display().to_string());
+                    }
+                    if ui.button("Clear list").clicked() {
+                        self.settings.recent_projects.clear();
+                        changed = true;
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Forget the saved dock layout")
+                        .on_hover_text("The default arrangement is restored on the next start")
+                        .clicked()
+                    {
+                        self.settings.dock = None;
+                        changed = true;
+                    }
+                });
+
+                if let Some(path) = settings::Settings::path() {
+                    ui.add_space(6.0);
+                    ui.weak(format!("Stored in {}", path.display()));
+                }
+            });
+
+        if changed {
+            self.mark_settings_dirty();
+        }
+        self.settings_open = open;
     }
 
     // -----------------------------------------------------------------------

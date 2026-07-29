@@ -59,6 +59,36 @@ pub struct Settings {
     /// Live-read snapshot interval, in milliseconds.
     #[serde(default)]
     pub live_interval_ms: Option<u64>,
+    /// Colour theme. `None` follows the system preference.
+    #[serde(default)]
+    pub theme: Option<Theme>,
+}
+
+/// The colour theme.
+///
+/// Several panels hardcode colours chosen against a dark background, so `Light`
+/// is offered but the value colours are not re-tuned for it — the theme changes
+/// the frame, not the syntax palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Theme {
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Dark => "Dark",
+            Theme::Light => "Light",
+        }
+    }
+
+    pub fn visuals(self) -> eframe::egui::Visuals {
+        match self {
+            Theme::Dark => eframe::egui::Visuals::dark(),
+            Theme::Light => eframe::egui::Visuals::light(),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -71,6 +101,7 @@ impl Default for Settings {
             last_project: None,
             last_backend: None,
             live_interval_ms: None,
+            theme: None,
         }
     }
 }

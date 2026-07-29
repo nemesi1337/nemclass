@@ -2,7 +2,7 @@
 
 Where nemclass stands against the three tools it draws from — **ReClass.NET**
 (class reconstruction), **Cheat Engine** (scanning, patching, cheat tables) and
-**PINCE** (Linux debugging workflows) — and what closes the gap.
+**PINCE** (Linux debugging workflows) — and what closed the gap.
 
 This came out of a full review of all six crates in July 2026, cross-read
 against the ReClass.NET sources. The architecture held up well: the layered
@@ -10,7 +10,8 @@ against the ReClass.NET sources. The architecture held up well: the layered
 and the ~70-method JS host API are all ahead of the references in places. What
 was weak was correctness underneath and *workflow* on top.
 
-**Phase 0 (stabilization) is complete.** The milestones below are not.
+**Phase 0 and M1–M8 are implemented.** What is still open is listed under
+[Still open](#still-open) at the end, honestly and specifically.
 
 ---
 
@@ -28,15 +29,11 @@ detail is in the commit messages:
 | Session lifecycle | Attaching to a second process without detaching first left five panels on the old one — including the cheat table, which then wrote process A's frozen values into process B. Nothing detected a dead target. |
 | Input | Typing `0x10` into an Int32 field wrote **10**. Five address parsers with three conventions: `140000000` meant two different addresses depending on which box you typed it in. Ctrl+F fired while typing. |
 
-Verification: `cargo make ci` green (fmt, clippy `-D warnings`, tests), ~420
-tests, the C++/Rust generators' output now compiled by `g++`/`rustc` in-test, and
-an end-to-end `--screenshot` run that attaches to a live process.
-
 ---
 
-## Where nemclass already leads
+## Where nemclass leads
 
-Worth stating, because the gap list below is long and one-sided:
+Worth stating, because the gap list below was long and one-sided:
 
 - **Backend abstraction.** `ProviderRegistry` with a real `dyn ProcessProvider`
   beats ReClass.NET's flat `CoreFunctions` C table; the kernel-module backend has
@@ -54,132 +51,191 @@ Worth stating, because the gap list below is long and one-sided:
 
 ---
 
-## M1 — Class-view workflow
+## M1 — Class-view workflow ✅
 
 *The core ReClass identity, and the biggest single gap.*
 
-Prerequisite: split `views/mod.rs` (5300 lines, ~60 fields on `NemclassApp`)
-into `class_view`, `snapshot`, `node_edit`, `session`, `scripting`, `project`.
-Replace the eight ad-hoc `pending_*` options with one `AppCommand` queue.
+`selected_node` was a single `Option`, and every ReClass "…Node(s)" menu item is
+plural for a reason: selecting eight rows and making them all `Int32` *is* the
+workflow. Selection is now a set plus an anchor, with shift-click ranging over
+the **visible** rows rather than sibling indices.
 
-- **Multi-select / shift+arrow range selection.** `selected_node` is a single
-  `Option`; every ReClass "…Node(s)" menu item is plural. Not being able to
-  select eight rows and change them all to `Int32` is the workflow.
-- Copy/paste nodes; **undo/redo** over `NodeEditOp` (today "Delete 1024 fields"
-  and "Accept auto-dissect" are irreversible); keyboard shortcuts (Delete,
-  arrows, Ctrl+C/V/S/O/N); create-class-from-nodes; hide/unhide; search in class.
-- Expose node types that exist in the model but not in the type menu: `Array`,
-  `Utf8Text`, `Utf16Text`, `VTable`, `Function`, `FunctionPtr`.
-- Class comment editing (the field exists, no UI writes it); an enum editor
-  (`project.enums` round-trips, no UI at all).
-- A dirty flag and an unsaved-changes prompt; confirmation on destructive
-  actions.
+- Undo/redo over whole-project snapshots. Nodes are `Box<dyn Node>` and not
+  `Clone`, so an inverse-operation scheme would need every op to reconstruct
+  what it replaced — which is the serialization this does once, generically.
+  A multi-row change is one undo step, because it was one action.
+- Multi-row edits queue back-to-front: applying a delete or an insert
+  front-to-back shifts every later index.
+- Copy/cut/paste; Delete, arrows, shift+arrow, Ctrl+C/X/V/A/Z/Y, Escape — all
+  guarded on text focus; hide/unhide; make-a-class-from-a-contiguous-run (a
+  gapped selection is refused, not silently reordered); a search filter.
+- The type menu covers every registered type. It offered scalars, vectors and
+  matrices only, so `Array`, the text types, `VTable` and `Function` existed in
+  the model and in saved projects but were unreachable from the UI.
+- Class comments and project enums both round-tripped into generated source with
+  no UI to write them. Both have editors; editing an enum re-binds the nodes
+  that render through it.
+- A dirty marker in the title bar, and New/Open ask before discarding.
+- The editing model, selection and history live in `views/node_edit.rs`.
 
-## M2 — Model completeness and ReClass.NET interop
+## M2 — Model completeness and ReClass.NET interop ✅
 
-- Missing node types: `Union`, `BitField`, `Enum` (bind a field to the existing
-  `EnumDescription`), typed `Array` elements, `ClassInstanceArray`, `Utf32Text`,
-  `Utf16TextPtr`/`Utf32TextPtr`, `NInt`/`NUInt`.
-- **Pointer width.** `Pointer`/`VTable`/`Function` hardcode 8 bytes, so a 32-bit
-  target's layout is unrepresentable. Same for the vtable probe.
-- **`.rcnet` import/export** — there is currently *no* interop with ReClass.NET
-  projects at all. Needs the `IsHidden` node flag the format persists.
-- Plugin extensibility: `NodeRegistry::register` takes bare `fn` pointers, so a
-  plugin cannot capture configuration and a dynamic tag must be leaked. Move to
-  `Box<dyn Fn>` + owned keys (this also collapses the `VECTOR_SHAPES` /
-  `MATRIX_SHAPES` duplication). Add a code-generator extension point — today a
-  plugin node type emits an anonymous byte blob.
-- C# `Utf8Text` marshals as a `string` reference field inside an explicit-layout
-  struct; should use a fixed byte array as the UTF-16 path already does.
+- Every pointer-shaped node hardcoded eight bytes, so a 32-bit target's layout
+  was not merely wrong but **unrepresentable**. Pointer width lives on the
+  `Project` and is pushed into the nodes, because `Node::memory_size` takes only
+  `&self` — the class view lays out fields with no project in scope.
+- New types: `Union`, `BitField`, `Enum`, `ClassInstanceArray`, `Utf32Text`, the
+  three text pointers, `NInt`/`NUInt`, typed `Array` elements. Nodes carry the
+  `hidden` flag `.rcnet` persists.
+- **`.rcnet` import/export.** There was no interop at all. The two models differ
+  — ReClass *wraps* (its pointers and arrays hold an inner node where we hold a
+  UUID and an element tag), and we have double-precision vectors it has no type
+  for — so every approximation is reported rather than absorbed.
+- `NodeRegistry` keys on owned strings and stores `Box<dyn Fn>`: a plugin that
+  computes its tag had to `Box::leak` it, and a bare `fn` cannot capture.
+  `register_codegen` lets a type spell itself in generated source.
+- Two codegen bugs the compile-the-output test caught: Rust emitted `#[repr(C)]`,
+  which pads, where the layout being described is packed; C# marshalled
+  `Utf8Text` as a `string` **reference** inside an explicit-layout struct, which
+  throws `TypeLoadException` the moment it overlaps.
 
-## M3 — Scanner to Cheat Engine parity
+## M3 — Scanner to Cheat Engine parity ✅
 
-- **Batching.** `next_scan` issues one syscall per surviving result — 5 M at the
-  default cap. `MemoryBackend::read_buf_batch` and an `IOV_MAX`-chunked iovec
-  implementation already exist; `ScanTarget` just does not expose them. Biggest
-  available speedup. Also `mem::take` the previous generation instead of cloning
-  ~80 MB per pass.
-- Multi-threaded first scan; a `memchr`-style prefilter for AOB/string scans.
-- Coalesce abutting regions: a value straddling two adjacent `rw-p` mappings is
-  currently never found.
-- Missing CE settings: grouped/struct scan, hex result display, float rounding
-  modes (one absolute tolerance today), percentage increase/decrease, "same as
-  first scan", user-supplied fast-scan alignment (boolean today),
-  case-insensitive and UTF-32 strings, save/load result sets, multi-select
-  results with bulk add, pause-target-while-scanning.
-- `parse_int::<i32>("0xFFFFFFFF")` fails where CE reads it as `-1`; `Between`
-  with no upper bound silently degrades to `GreaterThan`.
+- **Batching.** `next_scan` issued one syscall per surviving result — five
+  million at the default cap — because `ScanTarget` had no batch read, while
+  `read_buf_batch` and its IOV_MAX-chunked iovec implementation had been there
+  the whole time. Batches of 1024. A short batch falls back to per-span reads so
+  one freed address still drops one result.
+- The previous generation is `mem::take`n, not cloned — about 100 MB per pass.
+- A first scan shards across threads, cutting on the alignment lattice and
+  reading `stride - 1` past the cut so a straddling value is found exactly once.
+- Adjacent `rw-p` mappings are coalesced: the walk stopped at each region's end,
+  so a value with two bytes either side of the seam could not be found at all.
+- `Between` with no upper bound quietly became `value > lower`; refused now.
+  `0xFFFFFFFF` for an `i32` was rejected as out of range where CE reads it as -1.
+- Float rounding modes, percentage increase/decrease, same-as-first-scan (which
+  needed a first-scan column carried through every narrowing), case-insensitive
+  and UTF-32 strings, user-supplied alignment, hex display, save/load result sets.
+- AOB and string scans prefilter with `memchr`; a leading wildcard disables it.
 
-## M4 — Pointer scan maturity
+## M4 — Pointer scan maturity ✅
 
-Replace the exponential unmemoized DFS with CE's level-by-level reverse BFS with
-per-level dedup. Add pointermap save/load (the map is rebuilt from scratch every
-scan), rescan against a new goal after a restart, negative offsets,
-offset/alignment filters, "must end in a static", result scoring, and progress +
-cancel — this is the longest operation in the app and shows only a spinner.
+- The reverse search was an unmemoized DFS: every route reaching an intermediate
+  address re-expanded it, so a depth-6 scan did not finish. Level-by-level BFS
+  with a visit set. Collapsed alternative routes are **counted and reported**,
+  not silently dropped.
+- Signed offsets, `max_negative_offset`, `offset_alignment`,
+  `must_end_in_static`, result scoring (shortest chains through smallest offsets
+  first), progress and cancellation for both phases.
+- The map serializes: harvesting it is most of the cost, and it was rebuilt from
+  scratch for every goal. `rescan_paths` re-bases a chain's anchor against a
+  moved module.
+- Overlapping static ranges are coalesced — `is_mapped` consults only the last
+  range whose base is below the address, so an anchor inside an overlap could be
+  missed depending on sort order.
 
-## M5 — Memory viewer editing
+## M5 — Memory viewer editing ✅
 
-In-place hex editing, a byte-selection model, copy/paste/fill, AOB-from-
-selection, scrolling past the fixed 4 KiB window (today you must retype an
-address to advance a page), forward navigation, configurable bytes-per-row,
-bookmarks. Also clamp qword classification to the viewport — Phase 0 moved it off
-the frame loop, but it still classifies the whole page.
+Double-click a byte to type over it; select a span and Copy, Paste, Fill, or
+*Copy as AOB* (in the spelling the scanner's own pattern parser accepts, checked
+by a test). A short write is reported rather than swallowed. Paging is a whole
+window at a time by button or PageUp/PageDown, saturating at both ends;
+navigation gained a forward stack; bytes-per-row is selectable; addresses can be
+bookmarked by name. The qword classification follows the viewport rather than
+classifying the whole page for the sixteen rows anyone can see.
 
-## M6 — Debugger workflows
+## M6 — Debugger workflows ✅
 
-The kernel module already provides hardware breakpoints/watchpoints and register
-capture. What is missing is the layer on top.
+**Find what accesses / writes this address.** Every primitive existed —
+hardware watchpoints, register capture, an event queue — and none of it was
+assembled into the thing anyone opens a debugger for. `AccessTally` aggregates
+hits by RIP, busiest first, with the most recent registers and a bounded site
+table that reports its drops.
 
-- **"Find what accesses / writes this address"** — arm a watchpoint, aggregate
-  hits by RIP with counts, symbols, decoded instruction and register snapshots.
-  The most-used feature in both CE and ReClass.NET, and mostly assembly of parts
-  that already exist.
-- Thread list (`/proc/<pid>/task`; the kernel ABI already reports `tid`),
-  per-thread registers, execution control, call stack, register editing (the ABI
-  is read-only), breakpoint enable/disable, conditions, hit counts.
-- "Set breakpoint here" in the disassembler context menu; today the debugger's
-  address must be hand-typed.
-- Unify debugger attach with the main attach (they open separate authed fds, so
-  they are in different kernel sessions), run it off the UI thread, and add a
-  `ptrace` fallback when the module is not loaded.
+The captured RIP is the instruction *after* the access — a data watchpoint on
+x86 traps once the access retires — and the UI says so rather than presenting it
+as the accessing instruction. `preceding_instruction` does the walk-back by
+finding the decode that ends exactly at the reported RIP, and returns nothing
+when it cannot rather than guessing.
 
-## M7 — Assembler, patching, CE ecosystem
+Also: the event poll drains the queue instead of taking one hit per tick; "Find
+what writes this" on a class field; "Set breakpoint here" in the disassembler; a
+clicked access site opens in the disassembler; a thread list, because every hit
+reports a tid and nothing turned that number into a named thread.
 
-`iced-x86` is already a dependency and ships `code_asm`; there is no assembler
-anywhere today, and NOP-out is the only patch — irreversible, with no record.
+## M7 — Assembler, patching, CE ecosystem ✅ *(partly — see below)*
 
-- Assemble-in-place, then a patch list with revert and persistence.
-- User comments and labels in the disassembler (the Comment column is derived
-  only), rename-function, byte/instruction search, basic-block reconstruction.
-- **`.CT` import** — the community's entire cheat-table corpus is unusable.
-- Cheat-table UX: groups (the field serializes, no UI), per-entry hotkeys, a
-  pointer-offset editor, freeze modes (allow increase/decrease), multi-select.
-- Code injection (alloc + detour) on top of the assembler.
+`PatchSet` keeps the bytes that were there alongside the ones written.
+Re-patching an address keeps the *first* patch's originals: the second patch
+reads already-patched bytes, and storing those would make a revert restore the
+first patch's output. A patch whose two sides disagree in length is refused —
+it could not be reverted cleanly. Patches anchor to their module so a set can be
+re-applied after a restart; an unanchored one refuses to rebase.
 
-## M8 — Platform, polish, docs
+NOP-out is a recorded patch, "Patch bytes…" writes an arbitrary sequence, and
+the patch list reverts and re-applies. Each write invalidates the decoded
+listing — a plain re-focus only scrolled the stale one.
 
-- One toast/status surface replacing the eight independent never-expiring
-  message channels; progress and cancel on the four long operations that lack
-  them (pointer scan, rescan, module dissect, auto-dissect — the last still runs
-  synchronously on the UI thread).
-- **Freeze on its own thread.** It runs from `App::logic`, so freezing silently
-  stops when the window is minimised.
-- A settings dialog (settings persist but have no UI), theme support, Escape on
-  modals, disabled-control hover text.
-- Split `ProcessProvider::enumerate_sections_and_modules`: every scan and
-  pointer-map build pays for a module list it discards, including remote
-  PE-header reads.
-- Windows honestly: there is no Windows `ScanTarget` at all, the Windows symbol
-  resolver is reachable from nothing, and `Error::last` uses `__errno_location`
-  under `#[cfg(unix)]` (wrong on macOS/BSD).
+**`.CT` import.** Pointer chains convert correctly: CE lists offsets
+innermost-first, so reading them in file order builds the chain backwards.
+Imported formulas are checked against the real address grammar by a test. Nested
+group headers become the `group` field. Auto-assembler scripts, Lua and bitfield
+entries are reported by name rather than dropped.
+
+## M8 — Platform, polish, docs ✅ *(partly — see below)*
+
+- **Freeze on its own thread.** It ran from `App::logic`, which egui calls only
+  when it repaints, so freezing silently stopped when the window was minimised —
+  exactly when a trainer is supposed to be working.
+- `ProcessProvider::enumerate_sections` splits the section walk from the module
+  walk. Every scan and pointer-map build called the combined form and threw the
+  modules away, having paid for a second handle and a remote PE-header read per
+  Wine module.
+- `Error::last` called `libc::__errno_location` under a bare `cfg(unix)`. That is
+  the glibc/musl spelling; the BSDs and Apple export `__error`, so it did not
+  link there at all.
+- Auto-dissect runs on the background pool; it froze the window, including the
+  button that started it.
+- A settings dialog and theme support: the settings file had persisted the
+  window size, dock layout, recent projects and live interval since it existed,
+  with no way to see or change any of it, and no `set_visuals` call existed at
+  all.
+- Docs: the getting-started layout showed the pre-dock arrangement, the
+  code-generation example had the wrong signature and a `?` on an infallible
+  call, and the project-format sample showed a shape the serializer does not
+  write.
 
 ---
 
-## Known documentation drift
+## Still open
 
-- `getting-started.md` shows a pre-dock three-tab layout and calls the Classes
-  tab "Memory View".
-- `memory-viewer-and-dissection.md` marks shipped features "(TODO)".
-- `code-generation.md` and `project-format.md` show an API signature and a
-  project file that do not match the code.
+Named specifically rather than left implied by the ticks above.
+
+**A text assembler.** M7 asked for "assemble-in-place". `iced-x86` decodes and
+can *build* instructions programmatically (`code_asm`), but it has no text
+assembler, so "type `mov eax, 1` and write it" needs an x86 mnemonic parser that
+does not exist in the ecosystem's Rust crates. What shipped is byte-level
+patching with revert, which covers NOP-ing, `ret`-ing and hand-assembled edits.
+Code injection (alloc + detour) sits on top of the assembler and is not started.
+
+**Disassembler annotations.** User comments and labels, rename-function,
+byte/instruction search, and basic-block reconstruction (the walk is still
+linear-only).
+
+**Cheat-table UX.** Groups import from `.CT` and serialize, but there is no
+group UI; per-entry hotkeys, a pointer-offset editor and freeze modes
+(allow-increase/decrease) are not built.
+
+**One status surface.** The eight independent `status_msg`/`last_error` channels
+are still eight; messages never expire. Progress and cancel reached the pointer
+scan and auto-dissect, not the scanner rescan or the module dissect.
+
+**Windows.** `nemclass-core`, `-model` and `-scan` cross-compile to
+`x86_64-pc-windows-gnu` and the short-read contract is honest, but there is
+still no Windows `ScanTarget`, the Windows symbol resolver is reachable from
+nothing, and the UI is not Windows-clean. Linux remains the supported platform.
+
+**The CI gate.** `cargo make ci` fails at `fmt-check` on repo-wide pre-existing
+rustfmt drift (~757 hunks) unrelated to any of this work. Clippy `-D warnings`
+and the full test suite are green. A repo-wide reformat belongs in its own
+commit with nothing else in it.
