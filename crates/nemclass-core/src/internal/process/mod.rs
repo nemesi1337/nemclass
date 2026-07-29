@@ -225,6 +225,21 @@ impl Process {
         self.backend.read_buf(address, buf)
     }
 
+    /// Bulk-reads many `(address, buffer)` spans in a single backend call,
+    /// returning the total number of bytes read.
+    ///
+    /// The untyped counterpart to [`Process::read_batch`], for callers whose
+    /// spans are not all one `T` — the value scanner re-reading a generation of
+    /// results, which is otherwise one syscall per result.
+    ///
+    /// A short total means the transfer stopped part-way: `process_vm_readv`
+    /// fills the iovecs in order and stops at the first it cannot read, so the
+    /// caller cannot tell *which* span failed from the total alone and should
+    /// fall back to per-span reads when it needs to know.
+    pub fn read_buf_batch(&self, spans: &mut [(usize, &mut [u8])]) -> crate::Result<usize> {
+        self.backend.read_buf_batch(spans)
+    }
+
     /// Bulk-writes `buf` starting at `address` in a single backend call (one
     /// `process_vm_writev` on Linux). Returns the number of bytes written, which
     /// may be short if the span is partly unmapped or read-only.

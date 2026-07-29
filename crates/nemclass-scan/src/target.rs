@@ -235,13 +235,67 @@ impl SectionFilter {
 /// The scanner only ever reads within a [`Region`] returned by [`Self::regions`]
 /// and never assumes a read is complete — it uses the returned length — so a
 /// short read at a region tail is handled gracefully.
-pub trait ScanTarget {
+///
+/// `Send + Sync` because a first scan shards its regions across threads and
+/// reads through `&self` from all of them.
+pub trait ScanTarget: Send + Sync {
     /// The readable regions to scan, in ascending address order.
     fn regions(&self) -> Result<Vec<Region>>;
 
     /// Reads up to `buf.len()` bytes starting at `addr`, returning the number of
     /// bytes actually read (which may be short if the tail is unmapped).
     fn read(&self, addr: usize, buf: &mut [u8]) -> Result<usize>;
+
+    /// Reads many spans at once, filling `out[i]` with the result for
+    /// `spans[i]`.
+    ///
+    /// The default fans out to [`Self::read`], which is what the mock and any
+    /// simple target want. A live target overrides it with a vectored read: a
+    /// next scan re-reads every surviving result, and at the five-million
+    /// default cap that is five million syscalls where one `process_vm_readv`
+    /// can carry a thousand spans.
+    ///
+    /// `out` is per-span so one unreadable address drops one result rather than
+    /// the whole batch — a long-running target recycles memory constantly.
+    fn read_batch(&self, spans: &mut [(usize, &mut [u8])], out: &mut [Result<usize>]) {
+        for (i, (addr, buf)) in spans.iter_mut().enumerate() {
+            if let Some(slot) = out.get_mut(i) {
+                *slot = self.read(*addr, buf);
+            }
+        }
+    }
+
+    /// How many spans [`Self::read_batch`] should be given at a time.
+    ///
+    /// The default is 1 — no batching — so a target that has not overridden
+    /// `read_batch` is not asked to build batch buffers for nothing.
+    fn batch_size(&self) -> usize {
+        1
+    }
+}
+
+/// Merges regions that touch or overlap, so a value straddling the boundary
+/// between two adjacent mappings is still found.
+///
+/// `/proc/<pid>/maps` splits a single `mmap` the moment part of it gets
+/// different protection, and the heap routinely appears as several abutting
+/// `rw-p` entries. The scan walk stops at each region's end, so an `i32` with
+/// two bytes either side of such a boundary was never tested — a value that is
+/// genuinely there and genuinely writable simply could not be found.
+pub fn coalesce_regions(mut regions: Vec<Region>) -> Vec<Region> {
+    regions.retain(|r| r.size > 0);
+    regions.sort_by_key(|r| r.base);
+    let mut merged: Vec<Region> = Vec::with_capacity(regions.len());
+    for r in regions {
+        match merged.last_mut() {
+            Some(last) if r.base <= last.end() => {
+                let end = last.end().max(r.end());
+                last.size = end - last.base;
+            }
+            _ => merged.push(r),
+        }
+    }
+    merged
 }
 
 /// The write half of a target: what a [`crate::FreezeSet`] needs to keep frozen
@@ -472,6 +526,47 @@ mod linux {
     }
 
     impl ScanTarget for ProcessTarget {
+        fn read_batch(
+            &self,
+            spans: &mut [(usize, &mut [u8])],
+            out: &mut [Result<usize>],
+        ) {
+            // One `process_vm_readv` for the whole batch. It reports a total
+            // rather than a per-span length, and it stops at the first span it
+            // cannot read — so a partial result has to be resolved per span
+            // before anything is trusted.
+            let total = self.process.read_buf_batch(spans);
+            let wanted: usize = spans.iter().map(|(_, b)| b.len()).sum();
+            match total {
+                Ok(n) if n == wanted => {
+                    for (i, (_, buf)) in spans.iter().enumerate() {
+                        if let Some(slot) = out.get_mut(i) {
+                            *slot = Ok(buf.len());
+                        }
+                    }
+                }
+                // Short or failed: fall back to one read per span so the caller
+                // learns exactly which addresses are gone. This costs a syscall
+                // per span for that batch only, which is the old behaviour — and
+                // it is rare, because a batch is short only when the target has
+                // just freed something.
+                _ => {
+                    for (i, (addr, buf)) in spans.iter_mut().enumerate() {
+                        if let Some(slot) = out.get_mut(i) {
+                            *slot = self.process.read_buf(*addr, buf);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn batch_size(&self) -> usize {
+            // `process_vm_readv` takes at most IOV_MAX (1024) iovecs per call,
+            // and `read_buf_batch` already chunks to that. Matching it keeps one
+            // batch to one syscall.
+            1024
+        }
+
         fn regions(&self) -> Result<Vec<Region>> {
             // Enumerate through the native provider and keep the non-empty
             // sections the filter accepts.
@@ -485,11 +580,13 @@ mod linux {
             let provider = nemclass_core::LinuxProvider;
             let (sections, _modules) =
                 nemclass_core::ProcessProvider::enumerate_sections_and_modules(&provider, self.pid)?;
-            Ok(sections
-                .into_iter()
-                .filter(|s| s.size > 0 && self.filter.keep(s))
-                .map(|s| Region::new(s.base, s.size))
-                .collect())
+            Ok(super::coalesce_regions(
+                sections
+                    .into_iter()
+                    .filter(|s| s.size > 0 && self.filter.keep(s))
+                    .map(|s| Region::new(s.base, s.size))
+                    .collect(),
+            ))
         }
 
         fn read(&self, addr: usize, buf: &mut [u8]) -> Result<usize> {

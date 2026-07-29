@@ -345,39 +345,51 @@ fn clone_scanner_after_first(scanner: &Scanner<MockTarget>) -> Scanner<MockTarge
 /// An interior-mutable target for the freeze test and for the change-relative
 /// next-scan tests, which need to mutate the buffer *between* two scans through
 /// the shared reference the `Scanner` holds.
-#[derive(Clone)]
+///
+/// A `Mutex`, not a `RefCell`: `ScanTarget` is `Sync` so a first scan can shard
+/// its regions across threads, and a `RefCell` is precisely what that forbids.
 struct CellTarget {
     base: usize,
-    buf: std::cell::RefCell<Vec<u8>>,
+    buf: std::sync::Mutex<Vec<u8>>,
+}
+
+impl Clone for CellTarget {
+    fn clone(&self) -> Self {
+        Self { base: self.base, buf: std::sync::Mutex::new(self.lock().clone()) }
+    }
 }
 
 impl CellTarget {
     fn new(base: usize, buf: Vec<u8>) -> Self {
         Self {
             base,
-            buf: std::cell::RefCell::new(buf),
+            buf: std::sync::Mutex::new(buf),
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.buf.lock().expect("cell target buffer poisoned")
     }
 
     fn peek(&self, addr: usize, len: usize) -> Vec<u8> {
         let off = addr - self.base;
-        self.buf.borrow()[off..off + len].to_vec()
+        self.lock()[off..off + len].to_vec()
     }
 
     fn poke(&self, addr: usize, bytes: &[u8]) {
         let off = addr - self.base;
-        self.buf.borrow_mut()[off..off + bytes.len()].copy_from_slice(bytes);
+        self.lock()[off..off + bytes.len()].copy_from_slice(bytes);
     }
 }
 
 impl crate::ScanTarget for CellTarget {
     fn regions(&self) -> crate::Result<Vec<Region>> {
-        Ok(vec![Region::new(self.base, self.buf.borrow().len())])
+        Ok(vec![Region::new(self.base, self.lock().len())])
     }
 
     fn read(&self, addr: usize, buf: &mut [u8]) -> crate::Result<usize> {
         let off = addr - self.base;
-        let b = self.buf.borrow();
+        let b = self.lock();
         let n = buf.len().min(b.len().saturating_sub(off));
         buf[..n].copy_from_slice(&b[off..off + n]);
         Ok(n)
@@ -387,7 +399,7 @@ impl crate::ScanTarget for CellTarget {
 impl WriteTarget for CellTarget {
     fn write(&self, addr: usize, buf: &[u8]) -> crate::Result<usize> {
         let off = addr - self.base;
-        let mut b = self.buf.borrow_mut();
+        let mut b = self.lock();
         let n = buf.len().min(b.len().saturating_sub(off));
         b[off..off + n].copy_from_slice(&buf[..n]);
         Ok(n)
@@ -1265,4 +1277,312 @@ fn freeze_reports_why_an_entry_did_not_stick() {
     );
     // The reachable entry was still pinned: one bad address does not abort.
     assert_eq!(target.peek(BASE + 4, 4).unwrap(), 99i32.to_le_bytes());
+}
+
+// ── Cheat Engine parity: needles, comparisons and the parallel walk ─────────
+
+#[test]
+fn a_hex_needle_that_fills_a_signed_width_is_read_as_a_bit_pattern() {
+    // Cheat Engine reads `0xFFFFFFFF` for a 4-byte signed value as -1. Parsing
+    // it as a magnitude and range-checking rejected it outright, so a hex
+    // constant for any negative value could not be typed at all.
+    let needle = ScanValueType::I32.parse_needle("0xFFFFFFFF").unwrap();
+    assert!(needle.compare_first(&(-1i32).to_le_bytes(), 0, ScanCompareType::Exact));
+
+    assert!(
+        ScanValueType::I8
+            .parse_needle("0x80")
+            .unwrap()
+            .compare_first(&(-128i8).to_le_bytes(), 0, ScanCompareType::Exact)
+    );
+    // Decimal is still range-checked: 4294967295 typed as a signed 32-bit
+    // value is a mistake, not a bit pattern.
+    assert!(ScanValueType::I32.parse_needle("4294967295").is_err());
+    // And a hex value that does not fit the width is still an error.
+    assert!(ScanValueType::I32.parse_needle("0x1FFFFFFFF").is_err());
+}
+
+#[test]
+fn a_between_without_an_upper_bound_is_refused_not_silently_widened() {
+    let target = MockTarget::new(BASE, buf_with_i32(8, 42));
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    let needle = ScanValueType::I32.parse_needle("10").unwrap();
+    // It used to degrade to `value > 10`, which is a different search with far
+    // more results and nothing to tell the user it happened.
+    let err = scanner.first_scan(ScanCompareType::Between, Some(needle)).unwrap_err();
+    assert!(matches!(err, crate::ScanError::BetweenNeedsUpperBound), "{err}");
+
+    let bounded = ScanValueType::I32
+        .parse_needle("10")
+        .unwrap()
+        .with_upper_bound("100")
+        .unwrap();
+    let results = scanner.first_scan(ScanCompareType::Between, Some(bounded)).unwrap();
+    assert_eq!(results.len(), 1);
+}
+
+#[test]
+fn truncate_rounding_finds_a_float_by_the_integer_the_game_displays() {
+    // A health bar showing "100" is really 100.63 in memory; with the default
+    // tolerance a needle of 100 misses it entirely.
+    let mut buf = vec![0u8; 32];
+    buf[8..12].copy_from_slice(&100.63f32.to_le_bytes());
+    let target = MockTarget::new(BASE, buf);
+    let mut scanner = Scanner::new(target, ScanValueType::F32);
+
+    let plain = ScanValueType::F32.parse_needle("100").unwrap();
+    assert_eq!(
+        scanner.first_scan(ScanCompareType::Exact, Some(plain)).unwrap().len(),
+        0,
+        "the default tolerance is too tight for this"
+    );
+
+    let truncating = ScanValueType::F32
+        .parse_needle("100")
+        .unwrap()
+        .with_round_mode(crate::FloatRound::Truncate);
+    let hits = scanner.first_scan(ScanCompareType::Exact, Some(truncating)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits.get(0).unwrap().address, BASE + 8);
+}
+
+#[test]
+fn strict_rounding_matches_only_the_exact_float() {
+    let mut buf = vec![0u8; 32];
+    buf[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+    buf[8..12].copy_from_slice(&1.005f32.to_le_bytes());
+    let target = MockTarget::new(BASE, buf);
+    let mut scanner = Scanner::new(target, ScanValueType::F32);
+
+    let strict = ScanValueType::F32
+        .parse_needle("1.0")
+        .unwrap()
+        .with_round_mode(crate::FloatRound::Strict);
+    let hits = scanner.first_scan(ScanCompareType::Exact, Some(strict)).unwrap();
+    assert_eq!(hits.len(), 1, "1.005 is within the default tolerance but not equal");
+    assert_eq!(hits.get(0).unwrap().address, BASE);
+}
+
+#[test]
+fn a_case_insensitive_string_scan_finds_either_casing() {
+    let mut buf = vec![0u8; 64];
+    buf[8..16].copy_from_slice(b"PlayerHP");
+    let target = MockTarget::new(BASE, buf);
+    let mut scanner = Scanner::new(target, ScanValueType::StringUtf8).with_alignment(1);
+
+    let exact = ScanValueType::StringUtf8.parse_needle("playerhp").unwrap();
+    assert_eq!(
+        scanner.first_scan(ScanCompareType::Exact, Some(exact)).unwrap().len(),
+        0
+    );
+
+    let folded = ScanValueType::StringUtf8
+        .parse_needle("playerhp")
+        .unwrap()
+        .with_case_insensitive(true);
+    let hits = scanner.first_scan(ScanCompareType::Exact, Some(folded)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits.get(0).unwrap().address, BASE + 8);
+}
+
+#[test]
+fn a_utf32_string_scan_matches_four_byte_code_units() {
+    let mut buf = vec![0u8; 64];
+    for (i, ch) in "Hi!".chars().enumerate() {
+        buf[8 + i * 4..12 + i * 4].copy_from_slice(&(ch as u32).to_le_bytes());
+    }
+    let target = MockTarget::new(BASE, buf);
+    let mut scanner = Scanner::new(target, ScanValueType::StringUtf32).with_alignment(1);
+    let needle = ScanValueType::StringUtf32.parse_needle("Hi!").unwrap();
+    assert_eq!(needle.stride(), 12);
+    let hits = scanner.first_scan(ScanCompareType::Exact, Some(needle)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits.get(0).unwrap().address, BASE + 8);
+}
+
+#[test]
+fn same_as_first_scan_compares_against_the_original_not_the_previous_value() {
+    let target = CellTarget::new(BASE, buf_with_i32(8, 100));
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    let needle = ScanValueType::I32.parse_needle("100").unwrap();
+    scanner.first_scan(ScanCompareType::Exact, Some(needle)).unwrap();
+
+    // Move away, then back. `Unchanged` compares to the step before and fails;
+    // `UnchangedFromFirst` compares to the first scan and holds.
+    scanner.target().poke(BASE + 8, &50i32.to_le_bytes());
+    assert_eq!(scanner.next_scan(ScanCompareType::Changed, None).unwrap().len(), 1);
+    scanner.target().poke(BASE + 8, &100i32.to_le_bytes());
+
+    let mut branch = scanner.clone_for_test();
+    assert_eq!(
+        branch.next_scan(ScanCompareType::Unchanged, None).unwrap().len(),
+        0,
+        "the value did change since the previous scan"
+    );
+    assert_eq!(
+        scanner
+            .next_scan(ScanCompareType::UnchangedFromFirst, None)
+            .unwrap()
+            .len(),
+        1,
+        "but it is back to what the first scan saw"
+    );
+}
+
+#[test]
+fn a_percentage_decrease_finds_a_drop_a_fixed_delta_could_not() {
+    let mut buf = vec![0u8; 32];
+    buf[0..4].copy_from_slice(&1000i32.to_le_bytes());
+    buf[8..12].copy_from_slice(&50i32.to_le_bytes());
+    let target = CellTarget::new(BASE, buf);
+    let mut scanner = Scanner::new(target, ScanValueType::I32);
+    scanner.first_scan(ScanCompareType::Unknown, None).unwrap();
+
+    // Both fall by 20%, but by 200 and by 10 — no single delta finds both.
+    scanner.target().poke(BASE, &800i32.to_le_bytes());
+    scanner.target().poke(BASE + 8, &40i32.to_le_bytes());
+
+    let needle = ScanValueType::I32.parse_needle("20").unwrap();
+    let hits = scanner
+        .next_scan(ScanCompareType::DecreasedByPercent, Some(needle))
+        .unwrap();
+    let addresses: Vec<usize> = hits.iter().map(|r| r.address).collect();
+    assert!(addresses.contains(&BASE), "the 1000 → 800 drop: {addresses:?}");
+    assert!(addresses.contains(&(BASE + 8)), "the 50 → 40 drop: {addresses:?}");
+}
+
+#[test]
+fn a_parallel_first_scan_finds_exactly_what_the_serial_one_does() {
+    // Large enough to cross the parallel threshold and to be sharded, with the
+    // needle planted either side of a shard cut so a boundary bug shows up.
+    const SPAN: usize = 24 * 1024 * 1024;
+    let mut buf = vec![0u8; SPAN];
+    let planted: Vec<usize> = vec![
+        0,
+        4096,
+        8 * 1024 * 1024 - 4,   // ends exactly on a shard boundary
+        8 * 1024 * 1024,       // starts one
+        8 * 1024 * 1024 + 4,
+        16 * 1024 * 1024 - 8,
+        SPAN - 4,
+    ];
+    for &off in &planted {
+        buf[off..off + 4].copy_from_slice(&0x1234_5678i32.to_le_bytes());
+    }
+
+    let expected: Vec<usize> = planted.iter().map(|o| BASE + o).collect();
+
+    for threads in [1usize, 4] {
+        let target = MockTarget::new(BASE, buf.clone());
+        let mut scanner = Scanner::new(target, ScanValueType::I32).with_threads(threads);
+        let needle = ScanValueType::I32.parse_needle("0x12345678").unwrap();
+        let results = scanner.first_scan(ScanCompareType::Exact, Some(needle)).unwrap();
+        let found: Vec<usize> = results.iter().map(|r| r.address).collect();
+        assert_eq!(found, expected, "threads = {threads}");
+    }
+}
+
+#[test]
+fn a_cancelled_parallel_scan_leaves_the_previous_results_alone() {
+    const SPAN: usize = 24 * 1024 * 1024;
+    let target = MockTarget::new(BASE, vec![7u8; SPAN]);
+    let mut scanner = Scanner::new(target, ScanValueType::U8).with_threads(4);
+
+    let needle = ScanValueType::U8.parse_needle("7").unwrap();
+    let baseline = scanner
+        .first_scan(ScanCompareType::Exact, Some(needle.clone()))
+        .unwrap()
+        .len();
+    assert!(baseline > 0);
+
+    let mut ticks = 0usize;
+    let err = scanner
+        .first_scan_with(ScanCompareType::Exact, Some(needle), &mut |_p| {
+            ticks += 1;
+            ticks < 4
+        })
+        .unwrap_err();
+    assert!(matches!(err, crate::ScanError::Cancelled), "{err}");
+    assert_eq!(scanner.results().len(), baseline, "the old generation survived");
+}
+
+#[test]
+fn abutting_regions_are_merged_so_a_straddling_value_is_found() {
+    // Two adjacent `rw-p` mappings — exactly how the heap appears in
+    // /proc/<pid>/maps once part of one `mmap` gets different flags.
+    let merged = crate::coalesce_regions(vec![
+        Region::new(0x1000, 0x1000),
+        Region::new(0x2000, 0x1000),
+        Region::new(0x5000, 0x1000),
+    ]);
+    assert_eq!(merged, vec![Region::new(0x1000, 0x2000), Region::new(0x5000, 0x1000)]);
+
+    // And overlapping ones do not double-count the overlap.
+    let overlapping = crate::coalesce_regions(vec![
+        Region::new(0x1000, 0x2000),
+        Region::new(0x2000, 0x2000),
+    ]);
+    assert_eq!(overlapping, vec![Region::new(0x1000, 0x3000)]);
+}
+
+#[test]
+fn a_value_straddling_two_adjacent_regions_is_found_once_they_are_merged() {
+    let mut buf = vec![0u8; 0x2000];
+    // Two bytes either side of the 0x1000 boundary.
+    buf[0xFFE..0x1002].copy_from_slice(&0x1234_5678i32.to_le_bytes());
+
+    let split = MockTarget::with_regions(
+        BASE,
+        buf.clone(),
+        vec![Region::new(BASE, 0x1000), Region::new(BASE + 0x1000, 0x1000)],
+    );
+    let mut scanner = Scanner::new(split, ScanValueType::I32).with_alignment(1);
+    let needle = ScanValueType::I32.parse_needle("0x12345678").unwrap();
+    assert_eq!(
+        scanner.first_scan(ScanCompareType::Exact, Some(needle.clone())).unwrap().len(),
+        0,
+        "each region's walk stops at its own end"
+    );
+
+    let merged = MockTarget::with_regions(
+        BASE,
+        buf,
+        crate::coalesce_regions(vec![
+            Region::new(BASE, 0x1000),
+            Region::new(BASE + 0x1000, 0x1000),
+        ]),
+    );
+    let mut scanner = Scanner::new(merged, ScanValueType::I32).with_alignment(1);
+    let hits = scanner.first_scan(ScanCompareType::Exact, Some(needle)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits.get(0).unwrap().address, BASE + 0xFFE);
+}
+
+#[test]
+fn the_byte_prefilter_does_not_change_which_positions_match() {
+    let mut buf = vec![0u8; 4096];
+    for (i, off) in [100usize, 1000, 2500].iter().enumerate() {
+        buf[*off..*off + 4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF - i as u8]);
+    }
+    let target = MockTarget::new(BASE, buf);
+    let mut scanner = Scanner::new(target, ScanValueType::Bytes).with_alignment(1);
+
+    // A leading literal byte: the prefilter is active.
+    let literal = ScanValueType::Bytes.parse_needle("DE AD BE ??").unwrap();
+    let hits = scanner.first_scan(ScanCompareType::Exact, Some(literal)).unwrap();
+    assert_eq!(hits.iter().map(|r| r.address).collect::<Vec<_>>(), [
+        BASE + 100,
+        BASE + 1000,
+        BASE + 2500
+    ]);
+
+    // A leading wildcard: any byte is a legal start, so the prefilter must not
+    // engage — and the same positions must still be found.
+    let wildcarded = ScanValueType::Bytes.parse_needle("?? AD BE ??").unwrap();
+    let hits = scanner.first_scan(ScanCompareType::Exact, Some(wildcarded)).unwrap();
+    assert_eq!(hits.iter().map(|r| r.address).collect::<Vec<_>>(), [
+        BASE + 100,
+        BASE + 1000,
+        BASE + 2500
+    ]);
 }

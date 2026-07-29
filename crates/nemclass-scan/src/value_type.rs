@@ -49,6 +49,30 @@ pub enum ScanValueType {
     StringUtf8,
     /// UTF-16 (little-endian) encoded string.
     StringUtf16,
+    /// UTF-32 (little-endian) encoded string.
+    StringUtf32,
+}
+
+/// How a float candidate is compared to a float needle for equality — Cheat
+/// Engine's and ReClass.NET's "rounding" setting.
+///
+/// A float almost never holds the value a user typed: `100.0` health may sit in
+/// memory as `99.99998`. A single absolute tolerance (the old, only, behaviour)
+/// handles that badly at both ends of the range — too coarse near zero, far too
+/// fine at `1e7`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FloatRound {
+    /// `|value - needle| < tolerance`. The historical behaviour, and still the
+    /// default.
+    #[default]
+    Normal,
+    /// Bit-for-bit equality of the two floats. Finds only a value written from
+    /// exactly this literal.
+    Strict,
+    /// Compare the integral parts only: `4.7` matches a needle of `4`. This is
+    /// what makes a health bar showing "100" findable when it is really
+    /// `100.63`.
+    Truncate,
 }
 
 impl ScanValueType {
@@ -63,13 +87,23 @@ impl ScanValueType {
             Self::I16 | Self::U16 => Some(2),
             Self::I32 | Self::U32 | Self::F32 => Some(4),
             Self::I64 | Self::U64 | Self::F64 => Some(8),
-            Self::Bytes | Self::StringUtf8 | Self::StringUtf16 => None,
+            Self::Bytes | Self::StringUtf8 | Self::StringUtf16 | Self::StringUtf32 => None,
         }
     }
 
     /// Whether this is one of the string types.
     pub const fn is_string(&self) -> bool {
-        matches!(self, Self::StringUtf8 | Self::StringUtf16)
+        matches!(self, Self::StringUtf8 | Self::StringUtf16 | Self::StringUtf32)
+    }
+
+    /// Bytes per code unit for the string types; `None` for everything else.
+    pub const fn code_unit_size(&self) -> Option<usize> {
+        match self {
+            Self::StringUtf8 => Some(1),
+            Self::StringUtf16 => Some(2),
+            Self::StringUtf32 => Some(4),
+            _ => None,
+        }
     }
 
     /// Compares `cur` against `prev` for a change-relative next scan that has no
@@ -102,7 +136,7 @@ impl ScanValueType {
                 else {
                     return false;
                 };
-                compare_float(compare, c, 0.0, None, Some(p), DEFAULT_FLOAT_TOLERANCE)
+                compare_float(compare, c, 0.0, None, Some(p), DEFAULT_FLOAT_TOLERANCE, FloatRound::Normal)
             }
             _ => {
                 let signed = is_signed(*self);
@@ -134,6 +168,7 @@ impl ScanValueType {
             Self::Bytes => "bytes",
             Self::StringUtf8 => "string_utf8",
             Self::StringUtf16 => "string_utf16",
+            Self::StringUtf32 => "string_utf32",
         }
     }
 
@@ -157,6 +192,7 @@ impl ScanValueType {
             "bytes" | "aob" => Some(Self::Bytes),
             "string_utf8" | "string" | "utf8" => Some(Self::StringUtf8),
             "string_utf16" | "utf16" => Some(Self::StringUtf16),
+            "string_utf32" | "utf32" => Some(Self::StringUtf32),
             _ => None,
         }
     }
@@ -174,10 +210,10 @@ impl ScanValueType {
     pub fn parse_needle(&self, input: &str) -> Result<Needle, NeedleParseError> {
         let s = input.trim();
         let val = match self {
-            Self::I8 => NeedleValue::I(parse_int::<i8>(s)? as i128, 1, None),
-            Self::I16 => NeedleValue::I(parse_int::<i16>(s)? as i128, 2, None),
-            Self::I32 => NeedleValue::I(parse_int::<i32>(s)? as i128, 4, None),
-            Self::I64 => NeedleValue::I(parse_int::<i64>(s)? as i128, 8, None),
+            Self::I8 => NeedleValue::I(parse_signed(s, 1)?, 1, None),
+            Self::I16 => NeedleValue::I(parse_signed(s, 2)?, 2, None),
+            Self::I32 => NeedleValue::I(parse_signed(s, 4)?, 4, None),
+            Self::I64 => NeedleValue::I(parse_signed(s, 8)?, 8, None),
             Self::U8 => NeedleValue::I(parse_uint::<u8>(s)? as i128, 1, None),
             Self::U16 => NeedleValue::I(parse_uint::<u16>(s)? as i128, 2, None),
             Self::U32 => NeedleValue::I(parse_uint::<u32>(s)? as i128, 4, None),
@@ -203,11 +239,20 @@ impl ScanValueType {
                 }
                 NeedleValue::Str(bytes)
             }
+            Self::StringUtf32 => {
+                let mut bytes = Vec::with_capacity(input.chars().count() * 4);
+                for ch in input.chars() {
+                    bytes.extend_from_slice(&(ch as u32).to_le_bytes());
+                }
+                NeedleValue::Str(bytes)
+            }
         };
         Ok(Needle {
             ty: *self,
             value: val,
             tolerance: DEFAULT_FLOAT_TOLERANCE,
+            round: FloatRound::Normal,
+            case_insensitive: false,
         })
     }
 }
@@ -218,6 +263,12 @@ pub struct Needle {
     ty: ScanValueType,
     value: NeedleValue,
     tolerance: f64,
+    round: FloatRound,
+    /// Match strings without regard to ASCII case. Only ASCII is folded: the
+    /// candidate bytes are raw target memory in a known encoding, and folding
+    /// non-ASCII correctly would need full Unicode case mapping over a decoded
+    /// string — which is a different (and much slower) scan.
+    case_insensitive: bool,
 }
 
 /// The typed payload of a [`Needle`]. Integers keep a widening `i128` (holds any
@@ -244,6 +295,50 @@ impl Needle {
     pub fn with_float_tolerance(mut self, tolerance: f64) -> Self {
         self.tolerance = tolerance;
         self
+    }
+
+    /// Sets how float equality is decided. No effect on non-float needles.
+    pub fn with_round_mode(mut self, round: FloatRound) -> Self {
+        self.round = round;
+        self
+    }
+
+    /// The active float rounding mode.
+    pub fn round_mode(&self) -> FloatRound {
+        self.round
+    }
+
+    /// Matches strings ignoring ASCII case. No effect on non-string needles.
+    pub fn with_case_insensitive(mut self, yes: bool) -> Self {
+        self.case_insensitive = yes;
+        self
+    }
+
+    /// Whether a [`ScanCompareType::Between`] upper bound has been supplied.
+    ///
+    /// The scanner checks this rather than letting the comparison quietly
+    /// degrade to `value > needle`, which is a different search returning far
+    /// more results than the user asked for.
+    pub fn has_upper_bound(&self) -> bool {
+        matches!(
+            &self.value,
+            NeedleValue::I(_, _, Some(_)) | NeedleValue::F(_, _, Some(_))
+        )
+    }
+
+    /// The needle's bytes, when it is a literal byte or string needle.
+    ///
+    /// Used by the scanner to prefilter a chunk with `memchr` before testing
+    /// every position: a long literal is overwhelmingly absent, and skipping
+    /// straight to each occurrence of its first byte avoids that work.
+    pub(crate) fn literal_prefix(&self) -> Option<u8> {
+        match &self.value {
+            // A case-insensitive needle has two acceptable first bytes, so a
+            // single-byte prefilter would drop half the matches.
+            NeedleValue::Str(b) if !self.case_insensitive => b.first().copied(),
+            NeedleValue::Bytes(p) => p.first_literal_byte(),
+            _ => None,
+        }
     }
 
     /// Sets the exclusive upper bound for [`ScanCompareType::Between`] by parsing
@@ -276,7 +371,7 @@ impl Needle {
     /// (absolute comparisons only; `previous` is `None`). Returns whether the
     /// candidate matches. Never reads past `data`.
     pub fn compare_first(&self, data: &[u8], offset: usize, compare: ScanCompareType) -> bool {
-        self.compare(data, offset, compare, None)
+        self.compare(data, offset, compare, None, None)
     }
 
     /// Compares the candidate value at `data[offset..]` against the `previous`
@@ -289,7 +384,20 @@ impl Needle {
         compare: ScanCompareType,
         previous: &[u8],
     ) -> bool {
-        self.compare(data, offset, compare, Some(previous))
+        self.compare(data, offset, compare, Some(previous), None)
+    }
+
+    /// [`Self::compare_next`] with the value the *first* scan captured, for the
+    /// same-as-first comparisons.
+    pub fn compare_next_with_first(
+        &self,
+        data: &[u8],
+        offset: usize,
+        compare: ScanCompareType,
+        previous: &[u8],
+        first: &[u8],
+    ) -> bool {
+        self.compare(data, offset, compare, Some(previous), Some(first))
     }
 
     /// Core comparison. `previous` carries the bytes of the previous scan value
@@ -300,21 +408,25 @@ impl Needle {
         offset: usize,
         compare: ScanCompareType,
         previous: Option<&[u8]>,
+        first: Option<&[u8]>,
     ) -> bool {
+        // The same-as-first compares read the first-scan value in place of the
+        // previous one; everything downstream then treats it as `prev`.
+        let baseline = if compare.needs_first() { first.or(previous) } else { previous };
         match &self.value {
             NeedleValue::I(needle, width, upper) => {
                 let Some(cur) = read_int(data, offset, *width, is_signed(self.ty)) else {
                     return false;
                 };
-                let prev = previous.and_then(|p| read_int(p, 0, *width, is_signed(self.ty)));
+                let prev = baseline.and_then(|p| read_int(p, 0, *width, is_signed(self.ty)));
                 compare_int(compare, cur, *needle, *upper, prev)
             }
             NeedleValue::F(needle, width, upper) => {
                 let Some(cur) = read_float(data, offset, *width) else {
                     return false;
                 };
-                let prev = previous.and_then(|p| read_float(p, 0, *width));
-                compare_float(compare, cur, *needle, *upper, prev, self.tolerance)
+                let prev = baseline.and_then(|p| read_float(p, 0, *width));
+                compare_float(compare, cur, *needle, *upper, prev, self.tolerance, self.round)
             }
             NeedleValue::Bytes(pattern) => {
                 // AOB is an equality-family match; ReClass.NET only defines
@@ -332,9 +444,24 @@ impl Needle {
                 let Some(window) = data.get(offset..end) else {
                     return false;
                 };
+                let equal = if self.case_insensitive {
+                    // Fold per byte. For UTF-8 that is the ASCII range, which is
+                    // where case-insensitive search is actually wanted; for
+                    // UTF-16/32 LE the ASCII code units are the low byte of each
+                    // unit and the high bytes are zero on both sides, so a
+                    // per-byte fold is still correct for ASCII and a no-op
+                    // elsewhere.
+                    window.len() == needle.len()
+                        && window
+                            .iter()
+                            .zip(needle.iter())
+                            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                } else {
+                    window == needle.as_slice()
+                };
                 match compare {
-                    ScanCompareType::Exact | ScanCompareType::Unknown => window == needle.as_slice(),
-                    ScanCompareType::NotEqual => window != needle.as_slice(),
+                    ScanCompareType::Exact | ScanCompareType::Unknown => equal,
+                    ScanCompareType::NotEqual => !equal,
                     _ => false,
                 }
             }
@@ -417,6 +544,16 @@ fn compare_int(
         ScanCompareType::Unchanged => prev.is_some_and(|p| cur == p),
         ScanCompareType::IncreasedBy => prev.is_some_and(|p| cur == p + needle),
         ScanCompareType::DecreasedBy => prev.is_some_and(|p| cur == p - needle),
+        // `>=`/`<=`, not `==`: a percentage of an integer rarely lands on one,
+        // so an equality test would match almost nothing.
+        ScanCompareType::IncreasedByPercent => {
+            prev.is_some_and(|p| (cur as f64) >= p as f64 * (1.0 + needle as f64 / 100.0))
+        }
+        ScanCompareType::DecreasedByPercent => {
+            prev.is_some_and(|p| (cur as f64) <= p as f64 * (1.0 - needle as f64 / 100.0))
+        }
+        ScanCompareType::UnchangedFromFirst => prev.is_some_and(|p| cur == p),
+        ScanCompareType::ChangedFromFirst => prev.is_some_and(|p| cur != p),
     }
 }
 
@@ -429,8 +566,13 @@ fn compare_float(
     upper: Option<f64>,
     prev: Option<f64>,
     tol: f64,
+    round: FloatRound,
 ) -> bool {
-    let nearly = |a: f64, b: f64| (a - b).abs() < tol;
+    let nearly = |a: f64, b: f64| match round {
+        FloatRound::Normal => (a - b).abs() < tol,
+        FloatRound::Strict => a == b,
+        FloatRound::Truncate => a.trunc() == b.trunc(),
+    };
     match compare {
         ScanCompareType::Exact => nearly(cur, needle),
         ScanCompareType::NotEqual => !nearly(cur, needle),
@@ -444,6 +586,14 @@ fn compare_float(
         ScanCompareType::Unchanged => prev.is_some_and(|p| nearly(cur, p)),
         ScanCompareType::IncreasedBy => prev.is_some_and(|p| nearly(cur, p + needle)),
         ScanCompareType::DecreasedBy => prev.is_some_and(|p| nearly(cur, p - needle)),
+        ScanCompareType::IncreasedByPercent => {
+            prev.is_some_and(|p| cur >= p * (1.0 + needle / 100.0))
+        }
+        ScanCompareType::DecreasedByPercent => {
+            prev.is_some_and(|p| cur <= p * (1.0 - needle / 100.0))
+        }
+        ScanCompareType::UnchangedFromFirst => prev.is_some_and(|p| nearly(cur, p)),
+        ScanCompareType::ChangedFromFirst => prev.is_some_and(|p| !nearly(cur, p)),
     }
 }
 
@@ -470,13 +620,47 @@ impl core::fmt::Display for NeedleParseError {
 
 impl std::error::Error for NeedleParseError {}
 
-/// Parses a signed integer needle: decimal or `0x`-prefixed hex.
-fn parse_int<T>(s: &str) -> Result<T, NeedleParseError>
-where
-    T: TryFrom<i128>,
-{
-    let v = parse_i128_radix(s)?;
-    T::try_from(v).map_err(|_| NeedleParseError::Integer)
+/// Parses a signed integer needle of `width` bytes: decimal or `0x`-prefixed hex.
+///
+/// A hex literal that fills the width is read as the *bit pattern*, so
+/// `0xFFFFFFFF` for an `i32` is `-1` rather than an out-of-range error. That is
+/// what Cheat Engine does and what anyone typing a hex constant means: they are
+/// naming bytes, not a magnitude. A decimal literal is still range-checked,
+/// because `4294967295` typed as a signed 32-bit value is a mistake.
+fn parse_signed(s: &str, width: usize) -> Result<i128, NeedleParseError> {
+    let trimmed = s.trim();
+    let (neg, body) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, trimmed),
+    };
+    let is_hex = body.starts_with("0x") || body.starts_with("0X");
+    let mag = parse_u128_radix(body)?;
+
+    let bits = width * 8;
+    let modulus = 1u128 << bits;
+    if neg {
+        let mag = mag as i128;
+        let min = -(1i128 << (bits - 1));
+        if -mag < min {
+            return Err(NeedleParseError::Integer);
+        }
+        return Ok(-mag);
+    }
+    if is_hex && mag < modulus {
+        // Reinterpret the bit pattern as this width's signed value.
+        let sign_bit = 1u128 << (bits - 1);
+        return Ok(if mag & sign_bit != 0 {
+            (mag as i128) - (modulus as i128)
+        } else {
+            mag as i128
+        });
+    }
+    let max = (1i128 << (bits - 1)) - 1;
+    let v = i128::try_from(mag).map_err(|_| NeedleParseError::Integer)?;
+    if v > max {
+        return Err(NeedleParseError::Integer);
+    }
+    Ok(v)
 }
 
 /// Parses an unsigned integer needle: decimal or `0x`-prefixed hex.
@@ -486,16 +670,6 @@ where
 {
     let v = parse_u128_radix(s)?;
     T::try_from(v).map_err(|_| NeedleParseError::Integer)
-}
-
-/// Parses a possibly-`0x`-prefixed signed integer into an `i128`.
-fn parse_i128_radix(s: &str) -> Result<i128, NeedleParseError> {
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s),
-    };
-    let mag = parse_u128_radix(body)? as i128;
-    Ok(if neg { -mag } else { mag })
 }
 
 /// Parses a possibly-`0x`-prefixed unsigned integer into a `u128`.

@@ -7,6 +7,8 @@
 //! ported — a single-threaded chunked walk keeps the engine dependency-free and
 //! deterministic for tests; a caller can shard regions across threads later.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use crate::compare::ScanCompareType;
 use crate::results::ScanResults;
 use crate::target::{Region, RegionFilter, ScanTarget};
@@ -44,6 +46,8 @@ pub enum ScanError {
     /// A needle-less scan on a variable-width type, which has no stride to
     /// step by.
     NoStride(ScanValueType),
+    /// A `Between` was run without an upper bound.
+    BetweenNeedsUpperBound,
     /// Every address in the previous generation failed to read — the process is
     /// almost certainly gone. Distinguished from "narrowed to zero results" so a
     /// dead target never looks like a successful scan.
@@ -81,6 +85,11 @@ impl core::fmt::Display for ScanError {
                  change the type",
                 needle.as_tag(),
                 scanner.as_tag()
+            ),
+            Self::BetweenNeedsUpperBound => write!(
+                f,
+                "Between needs both bounds — enter the upper one, or use \"greater than\" \
+                 if that is what you meant"
             ),
             Self::NoStride(ty) => write!(
                 f,
@@ -157,6 +166,16 @@ const HISTORY_DEPTH: usize = 3;
 /// killed" into "narrow your scan range", which is a message a user can act on.
 const DEFAULT_RESULT_LIMIT: usize = 5_000_000;
 
+/// The largest span one worker takes in a parallel first scan. Small enough that
+/// a single huge mapping is shared out rather than pinning one thread, large
+/// enough that the per-shard setup is noise.
+const SHARD_SPAN: usize = 8 * 1024 * 1024;
+
+/// Below this total span a first scan stays single-threaded: spawning threads
+/// costs more than the walk saves, and the deterministic path is easier to
+/// reason about when something goes wrong.
+const PARALLEL_THRESHOLD: usize = 4 * 1024 * 1024;
+
 /// How often a scan reports progress: every this many candidate positions on a
 /// first scan, or previous results on a next scan. Frequent enough for a smooth
 /// bar and a responsive Stop, rare enough that the callback is not measurable.
@@ -181,12 +200,15 @@ pub struct ScanProgress {
 /// Scans run on a background worker that cannot be killed from outside, so
 /// stopping one has to be cooperative. This is also the only honest source of
 /// progress: the total is not known until the region walk has been set up.
-pub trait ScanObserver {
+///
+/// `Send` because a parallel first scan ticks from its workers (through one
+/// lock, so an implementation still never sees concurrent calls).
+pub trait ScanObserver: Send {
     /// Reports progress. Return `false` to abort.
     fn tick(&mut self, progress: ScanProgress) -> bool;
 }
 
-impl<F: FnMut(ScanProgress) -> bool> ScanObserver for F {
+impl<F: FnMut(ScanProgress) -> bool + Send> ScanObserver for F {
     fn tick(&mut self, progress: ScanProgress) -> bool {
         self(progress)
     }
@@ -225,6 +247,8 @@ pub struct Scanner<T: ScanTarget> {
     alignment: Option<usize>,
     /// Cap on how many matches a first scan will collect.
     result_limit: usize,
+    /// Worker threads for a first scan. `None` asks the platform.
+    threads: Option<usize>,
     /// Whether the last first scan stopped early on [`Self::result_limit`].
     truncated: bool,
     /// Result generations, oldest first; the last is the current one. Bounded to
@@ -246,6 +270,7 @@ impl<T: ScanTarget> Scanner<T> {
             scanned_regions: 0,
             alignment: None,
             result_limit: DEFAULT_RESULT_LIMIT,
+            threads: None,
             truncated: false,
             history: Vec::new(),
             has_scanned: false,
@@ -295,6 +320,26 @@ impl<T: ScanTarget> Scanner<T> {
         self.alignment
             .unwrap_or_else(|| self.value_type.fixed_width().unwrap_or(1))
             .max(1)
+    }
+
+    /// Sets how many worker threads a first scan uses. `1` forces the
+    /// single-threaded walk; `0` or unset asks the platform.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = (threads > 0).then_some(threads);
+        self
+    }
+
+    /// Replaces the worker-thread count in place.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = (threads > 0).then_some(threads);
+    }
+
+    /// The worker-thread count a first scan will use.
+    fn thread_count(&self) -> usize {
+        self.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        })
+        .max(1)
     }
 
     /// Caps how many matches a first scan collects. See [`DEFAULT_RESULT_LIMIT`].
@@ -425,10 +470,6 @@ impl<T: ScanTarget> Scanner<T> {
 
         let regions = self.region_filter.apply(&self.target.regions()?);
         self.scanned_regions = regions.len();
-        let mut results = ScanResults::with_stride(stride);
-        let mut buf = vec![0u8; CHUNK_SIZE.max(stride)];
-        let mut scanned = 0usize;
-        let mut skipped = 0usize;
         self.truncated = false;
 
         // An estimate, since a region may read short: the walked span divided by
@@ -436,30 +477,23 @@ impl<T: ScanTarget> Scanner<T> {
         // available before the walk starts.
         let align = self.alignment();
         let total: usize = regions.iter().map(|r| r.size / align).sum();
+        let span: usize = regions.iter().map(|r| r.size).sum();
 
-        for region in &regions {
-            let outcome = self.scan_region_first(
-                region,
-                compare,
-                needle.as_ref(),
-                stride,
-                &mut buf,
-                &mut results,
-                observer,
-                &mut scanned,
-                &mut skipped,
-                total,
-            )?;
-            if outcome == WalkOutcome::Cancelled {
-                // Deliberately before `push_generation`: a stopped scan must
-                // leave the previous results exactly as they were.
-                return Err(ScanError::Cancelled);
-            }
-            if results.len() >= self.result_limit {
-                self.truncated = true;
-                break;
-            }
-        }
+        // Shard the address space across workers once it is big enough to be
+        // worth the threads. ReClass.NET's parallel pool was deliberately not
+        // ported when this engine was written; a first scan over a real working
+        // set is entirely memory-read-bound and shards cleanly.
+        let shards = self.shard_regions(&regions, stride);
+        let workers = self.thread_count().min(shards.len()).max(1);
+        let (results, scanned, skipped, truncated) =
+            if workers > 1 && span >= PARALLEL_THRESHOLD {
+                self.first_scan_sharded(
+                    &shards, compare, needle.as_ref(), stride, observer, total, workers,
+                )?
+            } else {
+                self.first_scan_serial(&regions, compare, needle.as_ref(), stride, observer, total)?
+            };
+        self.truncated = truncated;
 
         self.last_stats = ScanStats {
             scanned,
@@ -519,67 +553,32 @@ impl<T: ScanTarget> Scanner<T> {
             return Err(ScanError::NoStride(self.value_type));
         }
 
-        let previous = self.results().clone();
-        let mut results = ScanResults::with_stride(stride);
-        results.reserve(previous.len());
-        let mut buf = vec![0u8; stride];
-        let mut unreadable = 0usize;
-        let mut last_err = None;
-
-        for (i, prev) in previous.iter().enumerate() {
-            if i.is_multiple_of(PROGRESS_INTERVAL)
-                && !observer.tick(ScanProgress {
-                    done: i,
-                    total: previous.len(),
-                    matches: results.len(),
-                })
-            {
-                // Before `push_generation`, so a stopped narrowing leaves the
-                // user's result set exactly as it was.
-                return Err(ScanError::Cancelled);
-            }
-            // Re-read exactly this result's span and re-compare against its
-            // captured previous bytes. An address that has since been freed or
-            // unmapped drops just that result: a long-running target recycles
-            // memory constantly, and aborting the whole pass would make every
-            // scan session die the first time one candidate went away.
-            match self.target.read(prev.address, &mut buf) {
-                Ok(read) if read >= stride => {}
-                Ok(_) => {
-                    unreadable += 1;
-                    continue;
-                }
-                Err(e) => {
-                    unreadable += 1;
-                    last_err = Some(e);
-                    continue;
-                }
-            }
-            let matched = match &needle {
-                Some(n) => n.compare_next(&buf, 0, compare, prev.current),
-                None => self
-                    .value_type
-                    .compare_change(compare, &buf[..stride], prev.current),
-            };
-            if matched {
-                // This generation's `previous` is the *previous* generation's
-                // current — the value the user last saw, which is what a Cheat
-                // Engine "Previous" column shows.
-                results.push(prev.address, &buf[..stride], prev.current);
-            }
+        // Borrowed, not cloned. The previous generation is
+        // `len * (8 + 3 * stride)` bytes — around 100 MB at the default
+        // five-million cap for an `i32` — and it was duplicated on every single
+        // narrowing pass purely to satisfy the borrow checker.
+        let previous = std::mem::take(self.history.last_mut().expect("has_scanned"));
+        let outcome = self.run_next_scan(&previous, compare, needle.as_ref(), stride, observer);
+        // Put it back before anything can return: this generation is the user's
+        // current result set until a new one replaces it, and an error or a
+        // cancellation must leave it exactly where it was.
+        if let Some(slot) = self.history.last_mut() {
+            *slot = previous;
         }
+        let (results, unreadable, last_err) = outcome?;
+        let previous_len = self.results().len();
 
         // Everything gone is not a narrowing — it is a dead target. Report it
         // and leave the current generation intact rather than handing back an
         // empty result set that reads as "your value isn't there any more".
-        if unreadable == previous.len() && !previous.is_empty() {
+        if unreadable == previous_len && previous_len > 0 {
             return Err(ScanError::TargetUnreadable(
                 last_err.unwrap_or(nemclass_core::Error::ProcessNotFound),
             ));
         }
 
         self.last_stats = ScanStats {
-            scanned: previous.len(),
+            scanned: previous_len,
             matched: results.len(),
             unreadable,
             // A next scan reads only known result addresses, so there is no
@@ -588,6 +587,290 @@ impl<T: ScanTarget> Scanner<T> {
         };
         self.push_generation(results);
         Ok(self.results())
+    }
+
+    /// Splits `regions` into work units of at most [`SHARD_SPAN`].
+    ///
+    /// A shard's span is extended by `stride - 1` so a value straddling the cut
+    /// is still read, while the shard's *positions* stop short of the next
+    /// shard's start — the walk stops once fewer than `stride` bytes remain, and
+    /// both ends sit on the alignment lattice, so no position is tested twice.
+    fn shard_regions(&self, regions: &[Region], stride: usize) -> Vec<Region> {
+        let align = self.alignment();
+        let mut out = Vec::new();
+        for region in regions {
+            if region.size <= SHARD_SPAN {
+                out.push(region.clone());
+                continue;
+            }
+            let end = region.end();
+            let mut start = region.base;
+            while start < end {
+                // Cut on the lattice, so the next shard's first candidate is
+                // exactly one step past this shard's last.
+                let mut cut = Self::align_up(start.saturating_add(SHARD_SPAN), align).min(end);
+                if cut <= start {
+                    cut = end;
+                }
+                let read_end = cut.saturating_add(stride - 1).min(end);
+                out.push(Region::new(start, read_end - start));
+                start = cut;
+            }
+        }
+        out
+    }
+
+    /// The single-threaded region walk.
+    fn first_scan_serial(
+        &self,
+        regions: &[Region],
+        compare: ScanCompareType,
+        needle: Option<&Needle>,
+        stride: usize,
+        observer: &mut dyn ScanObserver,
+        total: usize,
+    ) -> Result<(ScanResults, usize, usize, bool)> {
+        let mut results = ScanResults::with_stride(stride);
+        let mut buf = vec![0u8; CHUNK_SIZE.max(stride)];
+        let mut scanned = 0usize;
+        let mut skipped = 0usize;
+        let mut truncated = false;
+
+        for region in regions {
+            let outcome = self.scan_region_first(
+                region, compare, needle, stride, &mut buf, &mut results, observer, &mut scanned,
+                &mut skipped, total,
+            )?;
+            if outcome == WalkOutcome::Cancelled {
+                // Deliberately before `push_generation`: a stopped scan must
+                // leave the previous results exactly as they were.
+                return Err(ScanError::Cancelled);
+            }
+            if results.len() >= self.result_limit {
+                truncated = true;
+                break;
+            }
+        }
+        Ok((results, scanned, skipped, truncated))
+    }
+
+    /// The sharded region walk: `workers` threads over `shards`.
+    ///
+    /// Each shard's matches are collected separately and concatenated in shard
+    /// order, so the result set is still ascending by address regardless of the
+    /// order the threads finish in.
+    #[allow(clippy::too_many_arguments)]
+    fn first_scan_sharded(
+        &self,
+        shards: &[Region],
+        compare: ScanCompareType,
+        needle: Option<&Needle>,
+        stride: usize,
+        observer: &mut dyn ScanObserver,
+        total: usize,
+        workers: usize,
+    ) -> Result<(ScanResults, usize, usize, bool)> {
+        let next_shard = AtomicUsize::new(0);
+        let scanned = AtomicUsize::new(0);
+        let skipped = AtomicUsize::new(0);
+        let matched = AtomicUsize::new(0);
+        let cancelled = AtomicBool::new(false);
+        // One slot per shard so the join order does not decide the address
+        // order of the results.
+        let slots: Vec<std::sync::Mutex<ScanResults>> =
+            (0..shards.len()).map(|_| std::sync::Mutex::new(ScanResults::with_stride(stride))).collect();
+        // The observer is `&mut` and cannot be shared, so ticks funnel through
+        // one lock. They happen once every PROGRESS_INTERVAL candidates, so the
+        // contention is nowhere near the read cost.
+        let observer = std::sync::Mutex::new(observer);
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    let mut buf = vec![0u8; CHUNK_SIZE.max(stride)];
+                    loop {
+                        if cancelled.load(Ordering::Relaxed)
+                            || matched.load(Ordering::Relaxed) >= self.result_limit
+                        {
+                            return;
+                        }
+                        let index = next_shard.fetch_add(1, Ordering::Relaxed);
+                        let Some(shard) = shards.get(index) else { return };
+
+                        let mut local = ScanResults::with_stride(stride);
+                        let mut local_scanned = 0usize;
+                        let mut local_skipped = 0usize;
+
+                        // The per-shard walk reports through a closure that
+                        // folds this thread's progress into the shared counters
+                        // and relays the observer's verdict.
+                        let mut relay = |progress: ScanProgress| -> bool {
+                            if cancelled.load(Ordering::Relaxed) {
+                                return false;
+                            }
+                            let done = scanned.load(Ordering::Relaxed) + progress.done;
+                            let go = observer
+                                .lock()
+                                .map(|mut o| {
+                                    o.tick(ScanProgress {
+                                        done,
+                                        total,
+                                        matches: matched.load(Ordering::Relaxed) + progress.matches,
+                                    })
+                                })
+                                .unwrap_or(true);
+                            if !go {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                            go
+                        };
+
+                        let outcome = self.scan_region_first(
+                            shard, compare, needle, stride, &mut buf, &mut local, &mut relay,
+                            &mut local_scanned, &mut local_skipped, total,
+                        );
+                        match outcome {
+                            Ok(WalkOutcome::Cancelled) => {
+                                cancelled.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            Ok(WalkOutcome::Completed) => {}
+                            Err(_) => {
+                                cancelled.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+
+                        scanned.fetch_add(local_scanned, Ordering::Relaxed);
+                        skipped.fetch_add(local_skipped, Ordering::Relaxed);
+                        matched.fetch_add(local.len(), Ordering::Relaxed);
+                        if let Ok(mut slot) = slots[index].lock() {
+                            *slot = local;
+                        }
+                    }
+                });
+            }
+        });
+
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(ScanError::Cancelled);
+        }
+
+        let mut results = ScanResults::with_stride(stride);
+        results.reserve(matched.load(Ordering::Relaxed));
+        let mut truncated = false;
+        for slot in slots {
+            let mut part = slot.into_inner().unwrap_or_else(|e| e.into_inner());
+            results.append(&mut part);
+            if results.len() >= self.result_limit {
+                truncated = true;
+                break;
+            }
+        }
+
+        Ok((
+            results,
+            scanned.load(Ordering::Relaxed),
+            skipped.load(Ordering::Relaxed),
+            truncated,
+        ))
+    }
+
+    /// The next-scan core: re-read every previous result in batches and
+    /// re-compare.
+    ///
+    /// Returns the new generation, how many addresses could not be read, and the
+    /// last read error (for the "everything is gone" diagnosis).
+    fn run_next_scan(
+        &self,
+        previous: &ScanResults,
+        compare: ScanCompareType,
+        needle: Option<&Needle>,
+        stride: usize,
+        observer: &mut dyn ScanObserver,
+    ) -> Result<(ScanResults, usize, Option<nemclass_core::Error>)> {
+        let mut results = ScanResults::with_stride(stride);
+        results.reserve(previous.len());
+        let mut unreadable = 0usize;
+        let mut last_err = None;
+
+        // One vectored read per batch instead of one syscall per result. At the
+        // five-million default cap that is the difference between five million
+        // syscalls and about five thousand.
+        let batch = self.target.batch_size().clamp(1, 4096);
+        let mut bytes = vec![0u8; batch * stride];
+        let mut statuses: Vec<core::result::Result<usize, nemclass_core::Error>> =
+            Vec::with_capacity(batch);
+
+        let mut index = 0usize;
+        while index < previous.len() {
+            let count = batch.min(previous.len() - index);
+
+            if !observer.tick(ScanProgress {
+                done: index,
+                total: previous.len(),
+                matches: results.len(),
+            }) {
+                // The caller puts the previous generation back, so a stopped
+                // narrowing leaves the user's result set exactly as it was.
+                return Err(ScanError::Cancelled);
+            }
+
+            statuses.clear();
+            statuses.resize_with(count, || Ok(0));
+            {
+                let mut spans: Vec<(usize, &mut [u8])> = bytes[..count * stride]
+                    .chunks_mut(stride)
+                    .enumerate()
+                    .map(|(i, chunk)| {
+                        (previous.get(index + i).expect("in range").address, chunk)
+                    })
+                    .collect();
+                self.target.read_batch(&mut spans, &mut statuses);
+            }
+
+            for i in 0..count {
+                // An address that has since been freed or unmapped drops just
+                // that result: a long-running target recycles memory constantly,
+                // and aborting the whole pass would make every scan session die
+                // the first time one candidate went away.
+                match std::mem::replace(&mut statuses[i], Ok(0)) {
+                    Ok(read) if read >= stride => {}
+                    Ok(_) => {
+                        unreadable += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        unreadable += 1;
+                        last_err = Some(e);
+                        continue;
+                    }
+                }
+                let prev = previous.get(index + i).expect("in range");
+                let cur = &bytes[i * stride..(i + 1) * stride];
+                let matched = match needle {
+                    Some(n) => {
+                        n.compare_next_with_first(cur, 0, compare, prev.current, prev.first)
+                    }
+                    None if compare.needs_first() => {
+                        self.value_type.compare_change(compare, cur, prev.first)
+                    }
+                    None => self.value_type.compare_change(compare, cur, prev.current),
+                };
+                if matched {
+                    // This generation's `previous` is the *previous* generation's
+                    // current — the value the user last saw, which is what a Cheat
+                    // Engine "Previous" column shows. `first` rides along
+                    // untouched so a later "same as first scan" still has the
+                    // original.
+                    results.push_with_first(prev.address, cur, prev.current, prev.first);
+                }
+            }
+
+            index += count;
+        }
+
+        Ok((results, unreadable, last_err))
     }
 
     /// Walks one region in overlapping [`CHUNK_SIZE`] windows, comparing every
@@ -674,9 +957,31 @@ impl<T: ScanTarget> Scanner<T> {
 
             // The last position where a full stride still fits in what we read.
             let last = read - stride;
-            // `addr` is aligned, so offset 0 is a candidate and every `align`
-            // bytes after it is too.
-            for off in (0..=last).step_by(align) {
+            // A literal byte/string needle almost never matches, and testing
+            // every position to discover that is the whole cost of an AOB scan.
+            // `memchr` finds the occurrences of the needle's first byte with SIMD
+            // and the walk visits only those, which is typically two orders of
+            // magnitude fewer positions.
+            let prefix = match (needle, compare) {
+                (Some(n), ScanCompareType::Exact) => n.literal_prefix(),
+                _ => None,
+            };
+            let candidates: Box<dyn Iterator<Item = usize>> = match prefix {
+                Some(byte) => Box::new(
+                    memchr::memchr_iter(byte, &buf[..read])
+                        // Keep the alignment lattice: a prefiltered position that
+                        // is not on it was never a candidate.
+                        .filter(move |off| off % align == 0)
+                        .take_while(move |off| *off <= last),
+                ),
+                None => Box::new((0..=last).step_by(align)),
+            };
+            // `scanned` still counts lattice positions, not prefiltered hits:
+            // it drives the progress bar against a total computed from the span,
+            // and counting only the hits would make the bar stall at zero.
+            let mut lattice_positions = last / align + 1;
+            for off in candidates {
+                lattice_positions = lattice_positions.saturating_sub(1);
                 *scanned += 1;
                 since_tick += 1;
                 if since_tick >= PROGRESS_INTERVAL {
@@ -705,6 +1010,10 @@ impl<T: ScanTarget> Scanner<T> {
                     }
                 }
             }
+
+            // Positions the prefilter skipped were still examined, as far as
+            // "how much of the span is done" is concerned.
+            *scanned += lattice_positions;
 
             // Advance so the next window overlaps by `stride - 1`, guaranteeing a
             // value straddling the previous chunk boundary is still tested, then
@@ -761,6 +1070,12 @@ impl<T: ScanTarget> Scanner<T> {
                         scanner: self.value_type,
                     });
                 }
+                // A `Between` with no upper bound used to degrade silently to
+                // `value > lower`, which is a different search returning far
+                // more results than were asked for — and no way to tell.
+                if compare.needs_upper_bound() && !n.has_upper_bound() {
+                    return Err(ScanError::BetweenNeedsUpperBound);
+                }
             }
             None => {
                 if compare.needs_needle() {
@@ -793,6 +1108,7 @@ impl<T: ScanTarget + Clone> Scanner<T> {
             scanned_regions: self.scanned_regions,
             alignment: self.alignment,
             result_limit: self.result_limit,
+            threads: self.threads,
             truncated: self.truncated,
             history: self.history.clone(),
             has_scanned: self.has_scanned,

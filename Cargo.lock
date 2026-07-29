@@ -3296,6 +3296,7 @@ name = "nemclass-scan"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "memchr",
  "nemclass-core",
  "nemclass-model",
 ]

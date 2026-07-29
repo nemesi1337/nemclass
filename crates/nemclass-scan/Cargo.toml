@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 nemclass-core.workspace = true
 bytemuck.workspace = true
+memchr.workspace = true
 
 [dev-dependencies]
 # Tests only: verify emitted pointer-scan address formulas parse with the real

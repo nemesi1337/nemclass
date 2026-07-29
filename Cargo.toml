@@ -37,6 +37,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # would fight the deliberate `serde = "=1.0.219"` pin above. Both versions are
 # already resolved in Cargo.lock transitively, so this adds no new resolution.
 quick-xml = { version = "0.41", default-features = false }
+# SIMD substring search for the scanner's byte/string prefilter. Already resolved
+# in Cargo.lock transitively, so this adds no new dependency resolution.
+memchr = "2"
 flate2 = "1"
 thiserror = "2"
 env_logger = "0.11"

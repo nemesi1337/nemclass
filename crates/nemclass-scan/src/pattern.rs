@@ -37,6 +37,12 @@ impl PatternByte {
         self.mask != 0xFF
     }
 
+    /// The matcher's byte value. Only meaningful when it is not a wildcard.
+    #[inline]
+    pub const fn value(&self) -> u8 {
+        self.value
+    }
+
     /// Tests a candidate byte against this matcher.
     #[inline]
     pub const fn matches(&self, candidate: u8) -> bool {
@@ -78,6 +84,18 @@ impl BytePattern {
     /// Builds a pattern from explicit matchers.
     pub fn from_matchers(bytes: Vec<PatternByte>) -> Self {
         Self { bytes }
+    }
+
+    /// The first byte of the pattern when it is fully significant.
+    ///
+    /// A scan can skip straight to each occurrence of this byte instead of
+    /// testing every position, but only if a match is *required* to start with
+    /// it — a leading wildcard makes any byte a legal start.
+    pub fn first_literal_byte(&self) -> Option<u8> {
+        match self.bytes.first() {
+            Some(b) if !b.is_wildcard() => Some(b.value()),
+            _ => None,
+        }
     }
 
     /// Parses a hex pattern string with `??`/`A?`/`?B` wildcards.

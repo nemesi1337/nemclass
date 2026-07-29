@@ -41,6 +41,18 @@ pub enum ScanCompareType {
     Changed,
     /// `value == previous`.
     Unchanged,
+    /// `value >= previous * (1 + needle/100)` — Cheat Engine's percentage
+    /// increase. Distinct from [`Self::IncreasedBy`], which is an absolute
+    /// delta: a health bar that drops by 10% of a varying maximum cannot be
+    /// found with a fixed delta at all.
+    IncreasedByPercent,
+    /// `value <= previous * (1 - needle/100)`.
+    DecreasedByPercent,
+    /// `value == first`, where *first* is the value captured by the first scan
+    /// rather than by the previous one.
+    UnchangedFromFirst,
+    /// `value != first`.
+    ChangedFromFirst,
 }
 
 impl ScanCompareType {
@@ -57,7 +69,17 @@ impl ScanCompareType {
                 | Self::DecreasedBy
                 | Self::Changed
                 | Self::Unchanged
+                | Self::IncreasedByPercent
+                | Self::DecreasedByPercent
+                | Self::UnchangedFromFirst
+                | Self::ChangedFromFirst
         )
+    }
+
+    /// Whether this comparison reads the value captured by the *first* scan
+    /// rather than by the previous one.
+    pub const fn needs_first(&self) -> bool {
+        matches!(self, Self::UnchangedFromFirst | Self::ChangedFromFirst)
     }
 
     /// Whether this is the "unknown initial value" baseline, which is only
@@ -93,6 +115,10 @@ impl ScanCompareType {
             "decreasedby" => Some(Self::DecreasedBy),
             "changed" => Some(Self::Changed),
             "unchanged" => Some(Self::Unchanged),
+            "increasedbypercent" | "incpct" => Some(Self::IncreasedByPercent),
+            "decreasedbypercent" | "decpct" => Some(Self::DecreasedByPercent),
+            "unchangedfromfirst" | "sameasfirst" => Some(Self::UnchangedFromFirst),
+            "changedfromfirst" | "differentfromfirst" => Some(Self::ChangedFromFirst),
             _ => None,
         }
     }
@@ -109,7 +135,37 @@ impl ScanCompareType {
                 | Self::Decreased
                 | Self::Changed
                 | Self::Unchanged
+                | Self::UnchangedFromFirst
+                | Self::ChangedFromFirst
         )
+    }
+
+    /// Whether this comparison reads the exclusive upper bound a `Between`
+    /// carries.
+    pub const fn needs_upper_bound(&self) -> bool {
+        matches!(self, Self::Between)
+    }
+
+    /// A short human label, for menus and status lines.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Exact => "equal to",
+            Self::NotEqual => "not equal to",
+            Self::GreaterThan => "greater than",
+            Self::LessThan => "less than",
+            Self::Between => "between",
+            Self::Unknown => "unknown initial value",
+            Self::Increased => "increased",
+            Self::IncreasedBy => "increased by",
+            Self::Decreased => "decreased",
+            Self::DecreasedBy => "decreased by",
+            Self::Changed => "changed",
+            Self::Unchanged => "unchanged",
+            Self::IncreasedByPercent => "increased by %",
+            Self::DecreasedByPercent => "decreased by %",
+            Self::UnchangedFromFirst => "same as first scan",
+            Self::ChangedFromFirst => "different from first scan",
+        }
     }
 }
 

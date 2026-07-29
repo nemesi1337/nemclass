@@ -64,7 +64,7 @@ pub use pattern::{BytePattern, PatternByte, PatternError};
 pub use pointerscan::{
     pointer_scan, PointerMap, PointerPath, PointerScanConfig, PointerScanResult,
 };
-pub use results::{ScanResult, ScanResults};
+pub use results::{ResultsIoError, ScanResult, ScanResults};
 pub use signature::{format_signature, make_signature, SignatureConfig};
 pub use scanner::{NoObserver, ScanError, ScanObserver, ScanProgress, ScanStats, Scanner};
 pub use spider::{
@@ -73,9 +73,10 @@ pub use spider::{
 };
 pub use target::{
     FilterState, MockTarget, Region, RegionFilter, ScanTarget, SectionFilter, WriteTarget,
+    coalesce_regions,
 };
 pub use value_type::{
-    DEFAULT_FLOAT_TOLERANCE, Needle, NeedleParseError, ScanValueType,
+    DEFAULT_FLOAT_TOLERANCE, FloatRound, Needle, NeedleParseError, ScanValueType,
 };
 
 // The live Linux scan target (`process_vm_readv`/`writev` regions + IO).

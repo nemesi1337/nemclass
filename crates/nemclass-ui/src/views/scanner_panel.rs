@@ -35,8 +35,8 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use nemclass_scan::{
-    FilterState, Needle, Region, RegionFilter, ScanCompareType, ScanValueType, Scanner,
-    SectionFilter,
+    FilterState, FloatRound, Needle, Region, RegionFilter, ScanCompareType, ScanValueType,
+    Scanner, SectionFilter,
 };
 
 #[cfg(target_os = "linux")]
@@ -105,6 +105,16 @@ pub struct ScannerPanel {
     /// width. On by default — compilers align scalars, so the misses are rare
     /// and it cuts both scan time and result count by the type width.
     fast_scan: bool,
+    /// The alignment Fast Scan uses, when the user has overridden it. Cheat
+    /// Engine lets you type this — a value laid out on a 16-byte lattice is a
+    /// quarter of the candidates of a 4-byte one. Empty means the type's width.
+    alignment_text: String,
+    /// How float equality is decided (Cheat Engine's rounding setting).
+    round_mode: FloatRound,
+    /// Match strings ignoring ASCII case.
+    case_insensitive: bool,
+    /// Show result values as hex rather than decimal.
+    show_hex: bool,
 
     // ── scan scope (first scan only) ───────────────────────────────────
     /// Master toggle for the whole "Scan range" section.
@@ -175,6 +185,10 @@ impl ScannerPanel {
             needle_text:  String::new(),
             upper_text:   String::new(),
             fast_scan:    true,
+            alignment_text: String::new(),
+            round_mode: FloatRound::Normal,
+            case_insensitive: false,
+            show_hex: false,
             scan_range_enabled: false,
             range_start_text: String::new(),
             range_end_text:   String::new(),
@@ -457,7 +471,48 @@ impl ScannerPanel {
                         "Only test addresses aligned to the value's width. Much faster and \
                          far fewer results; untick to find deliberately misaligned values.",
                     );
+                if self.fast_scan {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.alignment_text)
+                            .desired_width(40.0)
+                            .hint_text("auto"),
+                    )
+                    .on_hover_text(
+                        "Alignment in bytes. Blank uses the value's own width; a larger \
+                         value (16, 32) is much faster when you know the layout.",
+                    );
+                }
             });
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            if matches!(self.value_type, ScanValueType::F32 | ScanValueType::F64) {
+                ui.label("Rounding:");
+                egui::ComboBox::from_id_salt("scan-round-mode")
+                    .selected_text(match self.round_mode {
+                        FloatRound::Normal => "Normal",
+                        FloatRound::Strict => "Exact",
+                        FloatRound::Truncate => "Truncated",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.round_mode, FloatRound::Normal, "Normal")
+                            .on_hover_text("Within a small tolerance of the typed value");
+                        ui.selectable_value(&mut self.round_mode, FloatRound::Truncate, "Truncated")
+                            .on_hover_text(
+                                "Ignore the fractional part — finds 100.63 when the game \
+                                 shows 100",
+                            );
+                        ui.selectable_value(&mut self.round_mode, FloatRound::Strict, "Exact")
+                            .on_hover_text("Bit-for-bit equality");
+                    });
+                ui.separator();
+            }
+            if self.value_type.is_string() {
+                ui.checkbox(&mut self.case_insensitive, "Ignore case");
+                ui.separator();
+            }
+            ui.checkbox(&mut self.show_hex, "Hex values")
+                .on_hover_text("Show the Value and Previous columns in hexadecimal");
         });
 
         ui.add_space(2.0);
@@ -859,8 +914,7 @@ impl ScannerPanel {
 
         let compare = self.compare;
         let value_type = self.value_type;
-        // 0 means "use the type's own width" (Fast Scan); 1 tests every byte.
-        let alignment = if self.fast_scan { 0 } else { 1 };
+        let alignment = self.scan_alignment();
         self.last_job_was_first_scan = true;
         self.status_msg = Some("Scanning…".into());
         self.scan_job.spawn_cancellable(rt, ctx, move |job| {
@@ -939,6 +993,19 @@ impl ScannerPanel {
     /// attaches it as the exclusive upper bound via [`Needle::with_upper_bound`].
     /// A missing or empty upper-bound field is treated as a parse error so the
     /// user always gets a meaningful two-sided range, never a silent `> value`.
+    /// The first-scan candidate step: 0 asks the scanner for the value's own
+    /// width, 1 tests every byte, and anything else is the user's override.
+    ///
+    /// A non-numeric or zero override falls back to the type width rather than
+    /// erroring: the field is a hint, and refusing to scan over a typo in an
+    /// optional box is worse than ignoring it.
+    fn scan_alignment(&self) -> usize {
+        if !self.fast_scan {
+            return 1;
+        }
+        self.alignment_text.trim().parse::<usize>().unwrap_or(0)
+    }
+
     fn parse_needle(&mut self) -> Option<Needle> {
         // Two very different situations used to collapse into a silent `None`:
         // a compare that legitimately takes no needle, and a compare that needs
@@ -955,7 +1022,9 @@ impl ScannerPanel {
             return None;
         }
         let needle = match self.value_type.parse_needle(&self.needle_text) {
-            Ok(n) => n,
+            Ok(n) => n
+                .with_round_mode(self.round_mode)
+                .with_case_insensitive(self.case_insensitive),
             Err(e) => {
                 self.status_msg = Some(format!("Bad value: {e}"));
                 return None;
@@ -1002,6 +1071,7 @@ impl ScannerPanel {
         let row_height  = text_height + 4.0;
 
         let value_type = self.value_type;
+        let show_hex = self.show_hex;
         // Disjoint field borrows: the table body needs `&self.result_snapshot`
         // and `&self.live_cache` while mutating the freeze state, so split them
         // here rather than cloning a thousand rows every frame to dodge it.
@@ -1074,7 +1144,7 @@ impl ScannerPanel {
                     row.col(|ui| {
                         match live {
                             LiveValue::Read(bytes) => {
-                                let text = format_value_bytes(bytes, value_type);
+                                let text = format_value_bytes_radix(bytes, value_type, show_hex);
                                 // Tint when the live value has moved away from
                                 // what the scan matched: the clearest possible
                                 // signal that this column really is live.
@@ -1101,7 +1171,11 @@ impl ScannerPanel {
                     });
                     row.col(|ui| {
                         ui.monospace(
-                            egui::RichText::new(format_value_bytes(&entry.previous, value_type))
+                            egui::RichText::new(format_value_bytes_radix(
+                                &entry.previous,
+                                value_type,
+                                show_hex,
+                            ))
                                 .weak(),
                         );
                     });
@@ -1122,7 +1196,7 @@ impl ScannerPanel {
                                 freeze_cb(
                                     addr,
                                     value_type.as_tag(),
-                                    format_value_bytes(bytes, value_type),
+                                    format_value_bytes_radix(bytes, value_type, show_hex),
                                 );
                             }
                             if ui.small_button("Add to class").clicked() {
@@ -1258,6 +1332,32 @@ pub(super) fn read_live_bytes(process: Option<&Process>, addr: usize, vt: ScanVa
     (n >= width).then_some(buf)
 }
 
+/// [`format_value_bytes`], optionally in hexadecimal.
+///
+/// Cheat Engine's "hexadecimal" checkbox. Integers are shown as their raw
+/// little-endian bytes widened to the type; floats and the variable-width types
+/// have no useful hex form and are left as they are.
+pub(super) fn format_value_bytes_radix(
+    bytes: &[u8],
+    vt: ScanValueType,
+    hex: bool,
+) -> String {
+    if !hex {
+        return format_value_bytes(bytes, vt);
+    }
+    let Some(width) = vt.fixed_width() else {
+        return format_value_bytes(bytes, vt);
+    };
+    if matches!(vt, ScanValueType::F32 | ScanValueType::F64) || bytes.len() < width {
+        return format_value_bytes(bytes, vt);
+    }
+    let mut raw = 0u64;
+    for (i, &b) in bytes[..width].iter().enumerate() {
+        raw |= (b as u64) << (i * 8);
+    }
+    format!("0x{raw:0width$X}", width = width * 2)
+}
+
 pub(super) fn format_value_bytes(bytes: &[u8], vt: ScanValueType) -> String {
     match vt {
         ScanValueType::I8  if !bytes.is_empty()   => i8::from_le_bytes([bytes[0]]).to_string(),
@@ -1298,6 +1398,7 @@ pub(super) fn value_type_label(vt: ScanValueType) -> &'static str {
         ScanValueType::Bytes       => "Bytes (AOB)",
         ScanValueType::StringUtf8  => "String (UTF-8)",
         ScanValueType::StringUtf16 => "String (UTF-16)",
+        ScanValueType::StringUtf32 => "String (UTF-32)",
     }
 }
 
@@ -1315,6 +1416,10 @@ pub(super) fn compare_label(ct: ScanCompareType) -> &'static str {
         ScanCompareType::DecreasedBy => "Decreased By",
         ScanCompareType::Changed     => "Changed",
         ScanCompareType::Unchanged   => "Unchanged",
+        ScanCompareType::IncreasedByPercent => "Increased By % ",
+        ScanCompareType::DecreasedByPercent => "Decreased By %",
+        ScanCompareType::UnchangedFromFirst => "Same As First Scan",
+        ScanCompareType::ChangedFromFirst   => "Different From First Scan",
     }
 }
 
@@ -1332,6 +1437,7 @@ pub(super) const ALL_VALUE_TYPES: &[ScanValueType] = &[
     ScanValueType::Bytes,
     ScanValueType::StringUtf8,
     ScanValueType::StringUtf16,
+    ScanValueType::StringUtf32,
 ];
 
 /// Compares offered before any scan: the absolute kinds plus the "unknown
@@ -1362,6 +1468,10 @@ pub(super) const NEXT_SCAN_COMPARES: &[ScanCompareType] = &[
     ScanCompareType::DecreasedBy,
     ScanCompareType::Changed,
     ScanCompareType::Unchanged,
+    ScanCompareType::IncreasedByPercent,
+    ScanCompareType::DecreasedByPercent,
+    ScanCompareType::UnchangedFromFirst,
+    ScanCompareType::ChangedFromFirst,
 ];
 
 /// The compares the combo offers, given whether a scan session is active.
