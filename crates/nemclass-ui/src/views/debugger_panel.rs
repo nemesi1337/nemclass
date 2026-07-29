@@ -28,7 +28,7 @@ mod linux {
     use eframe::egui;
 
     use nemclass_core::{
-        Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Registers,
+        AccessTally, Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Registers,
         kernel::abi::HwBreakpointType,
     };
 
@@ -37,6 +37,18 @@ mod linux {
 
     /// Maximum event-log entries kept in memory.
     const MAX_EVENTS: usize = 200;
+
+    /// How often the thread list is re-read. Threads come and go, but not on a
+    /// frame's timescale, and each refresh is one directory walk plus a read per
+    /// thread.
+    const THREAD_REFRESH: Duration = Duration::from_secs(2);
+
+    /// How many events one poll folds in before handing the frame back.
+    ///
+    /// A watchpoint on a field written every frame produces hits faster than the
+    /// poll interval; without a ceiling this loop would keep itself fed and the
+    /// UI would stop repainting.
+    const MAX_EVENTS_PER_POLL: usize = 4096;
 
     /// Breakpoint kind selected in the "set breakpoint" row.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +169,36 @@ mod linux {
 
         // ── latest register snapshot ──────────────────────────────────
         latest_regs:  Option<Registers>,
+
+        // ── "find what accesses this address" ─────────────────────────
+        /// Address the watch is armed on, as typed.
+        watch_addr_text: String,
+        /// Span in bytes: 1, 2, 4 or 8.
+        watch_len: u32,
+        /// Whether to watch writes only or reads as well.
+        watch_writes_only: bool,
+        /// The armed watchpoint, if any, and what it covers.
+        watch: Option<ActiveWatch>,
+        /// Per-instruction tally of what has hit the watch.
+        watch_tally: AccessTally,
+        watch_err: Option<String>,
+        /// The target's threads, refreshed on a throttle.
+        threads: Vec<(i32, String)>,
+        threads_at: Option<Instant>,
+        /// Set when the user clicks an access site; consumed by the parent to
+        /// open the disassembler there.
+        pending_goto_disasm: Option<usize>,
+    }
+
+    /// The watchpoint behind the access finder.
+    ///
+    /// Held here rather than in a `nemclass_core::AccessWatch` because that
+    /// takes ownership of the `Debugger`, and this panel's event log polls the
+    /// same session — one queue cannot have two owners.
+    struct ActiveWatch {
+        id: BreakpointId,
+        address: u64,
+        length: u32,
     }
 
     impl DebuggerPanel {
@@ -178,6 +220,15 @@ mod linux {
                 events:       Vec::new(),
                 last_poll:    None,
                 latest_regs:  None,
+                watch_addr_text: String::new(),
+                watch_len: 4,
+                watch_writes_only: true,
+                watch: None,
+                watch_tally: AccessTally::new(),
+                watch_err: None,
+                threads: Vec::new(),
+                threads_at: None,
+                pending_goto_disasm: None,
             }
         }
 
@@ -198,23 +249,40 @@ mod linux {
             self.last_poll = Some(Instant::now());
 
             // Non-blocking poll: Duration::ZERO means "return immediately".
-            match dbg.wait_event(Some(Duration::ZERO)) {
-                Ok(Some(ev)) => {
-                    let entry = EventEntry::from_event(&ev);
-                    // Update latest register snapshot.
-                    if let Some(r) = entry.registers() {
-                        self.latest_regs = Some(*r);
+            // Drain the whole queue rather than one event per tick. A
+            // watchpoint on a field written every frame produces hits far faster
+            // than the poll interval, so taking one at a time meant the queue
+            // only ever grew and the tally lagged further behind the target.
+            let watch_id = self.watch.as_ref().map(|w| w.id);
+            for _ in 0..MAX_EVENTS_PER_POLL {
+                match dbg.wait_event(Some(Duration::ZERO)) {
+                    Ok(Some(ev)) => {
+                        // Watchpoint hits go to the tally, not the log: a busy
+                        // field produces thousands a second and would bury every
+                        // other event.
+                        if Some(ev.breakpoint) == watch_id {
+                            self.watch_tally.record(ev.registers, ev.tid);
+                            self.latest_regs = Some(ev.registers);
+                            continue;
+                        }
+                        let entry = EventEntry::from_event(&ev);
+                        // Update latest register snapshot.
+                        if let Some(r) = entry.registers() {
+                            self.latest_regs = Some(*r);
+                        }
+                        self.events.push(entry);
+                        if self.events.len() > MAX_EVENTS {
+                            self.events.drain(..self.events.len() - MAX_EVENTS);
+                        }
                     }
-                    self.events.push(entry);
-                    if self.events.len() > MAX_EVENTS {
-                        self.events.drain(..self.events.len() - MAX_EVENTS);
+                    // No event ready — normal for a non-blocking poll.
+                    Ok(None) => break,
+                    Err(e) => {
+                        // Log the error but don't disconnect: a one-shot read
+                        // error does not mean the session is gone.
+                        self.events.push(EventEntry::Message(format!("[poll error: {e}]")));
+                        break;
                     }
-                }
-                Ok(None) => {} // No event ready — normal for a non-blocking poll.
-                Err(e)   => {
-                    // Log the error but don't disconnect: a one-shot read error
-                    // does not mean the session is gone.
-                    self.events.push(EventEntry::Message(format!("[poll error: {e}]")));
                 }
             }
         }
@@ -225,6 +293,41 @@ mod linux {
             self.attach_err = None;
             self.events.clear();
             self.latest_regs = None;
+            // The watchpoint died with the session's fd; forgetting the id here
+            // stops a later Stop from trying to clear a slot that is gone.
+            self.watch = None;
+            self.watch_tally.clear();
+            self.watch_err = None;
+        }
+
+        /// Arm the access finder on `addr` from elsewhere in the app (the class
+        /// view's "find what writes this" action).
+        pub fn watch_address(&mut self, addr: usize, len: u32, writes_only: bool) {
+            self.watch_addr_text = format!("{addr:#x}");
+            self.watch_len = len;
+            self.watch_writes_only = writes_only;
+            self.start_watch();
+        }
+
+        /// The address the user asked to disassemble, if any. Consumed.
+        pub fn take_goto_disasm(&mut self) -> Option<usize> {
+            self.pending_goto_disasm.take()
+        }
+
+        /// Arm an execute breakpoint at `addr` from elsewhere in the app (the
+        /// disassembler's "set breakpoint here").
+        ///
+        /// The address field is filled in either way, so a failure leaves the
+        /// user one click from retrying rather than retyping.
+        pub fn set_execute_breakpoint(&mut self, addr: usize) {
+            self.bp_addr_text = format!("{addr:#x}");
+            self.bp_kind = BpKind::Execute;
+            if self.debugger.is_some() {
+                self.do_set_breakpoint();
+            } else {
+                self.bp_err =
+                    Some("Attach the debugger, then press Set to arm this breakpoint.".into());
+            }
         }
 
         // ── main UI ───────────────────────────────────────────────────
@@ -233,6 +336,10 @@ mod linux {
             self.show_attach_row(ui, pid);
             ui.separator();
             self.show_bp_controls(ui);
+            ui.separator();
+            self.show_access_finder(ui);
+            ui.separator();
+            self.show_threads(ui, pid);
             ui.separator();
             self.show_event_log(ui);
             ui.separator();
@@ -426,6 +533,256 @@ mod linux {
 
         // ── event log ─────────────────────────────────────────────────
 
+        // ── thread list ───────────────────────────────────────────────
+
+        /// The target's threads.
+        ///
+        /// Every debugger hit reports a `tid`, and there was nothing anywhere in
+        /// the app to turn that number into a thread with a name.
+        fn show_threads(&mut self, ui: &mut egui::Ui, pid: Option<libc::pid_t>) {
+            let Some(pid) = pid else { return };
+            egui::CollapsingHeader::new("Threads")
+                .id_salt("debugger_threads")
+                .show(ui, |ui| {
+                    let now = Instant::now();
+                    let stale = self
+                        .threads_at
+                        .map(|t: Instant| now.duration_since(t) >= THREAD_REFRESH)
+                        .unwrap_or(true);
+                    if stale {
+                        self.threads_at = Some(now);
+                        // Read through a fresh handle rather than the debugger's:
+                        // `/proc/<pid>/task` needs no session at all, and this
+                        // keeps the list working before an attach.
+                        self.threads = std::fs::read_dir(format!("/proc/{pid}/task"))
+                            .map(|dir| {
+                                let mut out: Vec<(i32, String)> = dir
+                                    .flatten()
+                                    .filter_map(|e| {
+                                        let tid =
+                                            e.file_name().to_str()?.parse::<i32>().ok()?;
+                                        let name = std::fs::read_to_string(format!(
+                                            "/proc/{pid}/task/{tid}/comm"
+                                        ))
+                                        .map(|s| s.trim().to_string())
+                                        .unwrap_or_default();
+                                        Some((tid, name))
+                                    })
+                                    .collect();
+                                out.sort_by_key(|(tid, _)| *tid);
+                                out
+                            })
+                            .unwrap_or_default();
+                    }
+
+                    if self.threads.is_empty() {
+                        ui.weak("No threads listed — the process may have exited.");
+                        return;
+                    }
+                    // Which threads the access finder has actually seen, so a
+                    // hit's tid is recognisable rather than a bare number.
+                    let seen: std::collections::HashSet<i32> =
+                        self.watch_tally.sites().iter().map(|s| s.first_tid).collect();
+                    egui::ScrollArea::vertical()
+                        .id_salt("thread_list")
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            for (tid, name) in &self.threads {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format!("{tid:>7}"));
+                                    ui.label(name);
+                                    if seen.contains(tid) {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(140, 200, 140),
+                                            "• hit the watchpoint",
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                });
+        }
+
+        // ── find what accesses this address ───────────────────────────
+
+        /// The headline debugger workflow: arm a watchpoint on a field and see
+        /// which instructions touch it, ranked by how often.
+        ///
+        /// Every primitive for this already existed — hardware watchpoints,
+        /// register capture, an event queue — and none of it was assembled into
+        /// the thing anyone actually opens a debugger for.
+        fn show_access_finder(&mut self, ui: &mut egui::Ui) {
+            ui.strong("Find what accesses this address");
+
+            let attached = self.debugger.is_some();
+            let watching = self.watch.is_some();
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Address:");
+                ui.add_enabled(
+                    !watching,
+                    egui::TextEdit::singleline(&mut self.watch_addr_text)
+                        .desired_width(150.0)
+                        .hint_text("0x7fff…"),
+                );
+                ui.label("Size:");
+                ui.add_enabled_ui(!watching, |ui| {
+                    egui::ComboBox::from_id_salt("access_watch_len")
+                        .selected_text(self.watch_len.to_string())
+                        .width(48.0)
+                        .show_ui(ui, |ui| {
+                            for len in [1u32, 2, 4, 8] {
+                                ui.selectable_value(&mut self.watch_len, len, len.to_string());
+                            }
+                        });
+                });
+                ui.add_enabled_ui(!watching, |ui| {
+                    ui.checkbox(&mut self.watch_writes_only, "Writes only")
+                        .on_hover_text(
+                            "x86 debug registers cannot watch reads alone, so unticking this \
+                             reports reads *and* writes — a CPU limitation, not a choice here.",
+                        );
+                });
+
+                if !watching {
+                    if ui
+                        .add_enabled(attached, egui::Button::new("Start"))
+                        .on_disabled_hover_text("Attach the debugger first")
+                        .clicked()
+                    {
+                        self.start_watch();
+                    }
+                } else if ui.button("Stop").clicked() {
+                    self.stop_watch();
+                }
+                if ui.add_enabled(watching, egui::Button::new("Reset")).clicked() {
+                    self.watch_tally.clear();
+                }
+            });
+
+            if let Some(err) = &self.watch_err {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+
+            let Some(watch) = &self.watch else { return };
+            let total = self.watch_tally.total_hits();
+            ui.label(format!(
+                "Watching {:#x} (+{} bytes) — {total} hit(s) from {} instruction(s)",
+                watch.address,
+                watch.length,
+                self.watch_tally.site_count()
+            ));
+            if self.watch_tally.dropped_hits() > 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 160, 40),
+                    format!(
+                        "{} hit(s) from further instructions were not recorded — the site \
+                         list is capped.",
+                        self.watch_tally.dropped_hits()
+                    ),
+                );
+            }
+
+            let sites = self.watch_tally.sites();
+            if sites.is_empty() {
+                ui.weak("Nothing has touched it yet.");
+                return;
+            }
+
+            let mut goto: Option<usize> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("access_sites")
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for site in sites.iter().take(64) {
+                        ui.horizontal(|ui| {
+                            // The captured RIP is the instruction *after* the
+                            // access — a data watchpoint traps on completion —
+                            // so the address to look at is the one before it.
+                            let label = format!("{:#018x}", site.rip);
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new(label).monospace())
+                                    .frame(false))
+                                .on_hover_text(
+                                    "Open in the disassembler. This is the instruction *after* \
+                                     the access: a data watchpoint traps once the access has \
+                                     completed.",
+                                )
+                                .clicked()
+                            {
+                                goto = Some(site.rip as usize);
+                            }
+                            ui.label(format!("×{}", site.hits));
+                            ui.weak(format!("tid {}", site.first_tid));
+                            let r = site.last_registers;
+                            ui.weak(
+                                egui::RichText::new(format!(
+                                    "rax={:x} rbx={:x} rcx={:x} rdx={:x}",
+                                    r.rax, r.rbx, r.rcx, r.rdx
+                                ))
+                                .monospace(),
+                            )
+                            .on_hover_text(format!(
+                                "rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x}\n\
+                                 r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n\
+                                 r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                                r.rsp, r.rbp, r.rsi, r.rdi,
+                                r.r8, r.r9, r.r10, r.r11,
+                                r.r12, r.r13, r.r14, r.r15,
+                            ));
+                        });
+                    }
+                });
+            if let Some(addr) = goto {
+                self.pending_goto_disasm = Some(addr);
+            }
+        }
+
+        fn start_watch(&mut self) {
+            self.watch_err = None;
+            let Some(dbg) = &mut self.debugger else {
+                self.watch_err = Some("Attach the debugger first.".into());
+                return;
+            };
+            let addr = match crate::views::parse_address(&self.watch_addr_text) {
+                Ok(a) => a as u64,
+                Err(e) => {
+                    self.watch_err = Some(e);
+                    return;
+                }
+            };
+            let kind = if self.watch_writes_only {
+                HwBreakpointType::Write
+            } else {
+                HwBreakpointType::ReadWrite
+            };
+            let spec = match BreakpointSpec::hardware(addr, self.watch_len, kind) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.watch_err = Some(e.to_string());
+                    return;
+                }
+            };
+            match dbg.set_breakpoint(spec) {
+                Ok(id) => {
+                    self.watch_tally.clear();
+                    self.watch = Some(ActiveWatch { id, address: addr, length: self.watch_len });
+                }
+                Err(e) => self.watch_err = Some(format!("Could not arm the watchpoint: {e}")),
+            }
+        }
+
+        fn stop_watch(&mut self) {
+            let Some(watch) = self.watch.take() else { return };
+            let Some(dbg) = &mut self.debugger else { return };
+            // Reported rather than swallowed: the breakpoint stays armed in the
+            // kernel until the fd closes, and a silently occupied debug register
+            // is how the next watch fails for no visible reason.
+            if let Err(e) = dbg.clear_breakpoint(watch.id) {
+                self.watch_err = Some(format!("Could not disarm the watchpoint: {e}"));
+            }
+        }
+
         fn show_event_log(&mut self, ui: &mut egui::Ui) {
             ui.heading("Event Log");
 
@@ -519,6 +876,9 @@ mod stub {
         pub fn with_key(_key: String) -> Self { Self }
         pub fn tick_events(&mut self) {}
         pub fn on_detach(&mut self) {}
+        pub fn watch_address(&mut self, _addr: usize, _len: u32, _writes_only: bool) {}
+        pub fn take_goto_disasm(&mut self) -> Option<usize> { None }
+        pub fn set_execute_breakpoint(&mut self, _addr: usize) {}
         pub fn show(&mut self, ui: &mut egui::Ui, _pid: Option<i32>) {
             ui.colored_label(
                 egui::Color32::GRAY,

@@ -58,8 +58,9 @@ pub use symbol_resolver::SymbolResolver;
 // plus the ergonomic debugger controller layered over the client.
 #[cfg(target_os = "linux")]
 pub use kernel::{
-    Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Event, KernelBackend,
-    KernelClient, PtraceStatus, Registers,
+    AccessKind, AccessSite, AccessTally, AccessWatch, Breakpoint, BreakpointId, BreakpointSpec, DebugEvent,
+    Debugger, Event, KernelBackend, KernelClient, PtraceStatus, Registers,
+    preceding_instruction,
 };
 
 // The native Windows backend/provider (`ReadProcessMemory` etc.). Compiled only
@@ -147,6 +148,34 @@ impl Process {
             .map_err(|_| Error::ProcessDied)?
             .to_string_lossy()
             .into_owned())
+    }
+
+    /// The target's threads: `(tid, name)` pairs, ascending by tid.
+    ///
+    /// From `/proc/<pid>/task`, which is the only place this exists — the
+    /// debugger reports a `tid` on every hit and there was nothing to turn that
+    /// number into a thread anyone could name.
+    ///
+    /// A thread that exits between the directory listing and the `comm` read is
+    /// skipped rather than failing the whole call: the set is a snapshot of
+    /// something that changes underneath it by definition.
+    #[cfg(target_os = "linux")]
+    pub fn threads(&self) -> crate::Result<Vec<ThreadInfo>> {
+        let dir = fs::read_dir(format!("/proc/{}/task", self.pid))
+            .map_err(|_| Error::ProcessDied)?;
+        let mut out = Vec::new();
+        for entry in dir.flatten() {
+            let Some(tid) = entry.file_name().to_str().and_then(|s| s.parse::<Pid>().ok())
+            else {
+                continue;
+            };
+            let name = fs::read_to_string(format!("/proc/{}/task/{tid}/comm", self.pid))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            out.push(ThreadInfo { tid, name });
+        }
+        out.sort_by_key(|t| t.tid);
+        Ok(out)
     }
 
     /// Returns the name of the process

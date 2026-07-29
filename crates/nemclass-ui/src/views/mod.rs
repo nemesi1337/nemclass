@@ -3168,6 +3168,12 @@ impl NemclassApp {
         }
     }
 
+    /// Arm the debugger's access finder on `addr` and bring the tab forward.
+    fn find_what_accesses(&mut self, addr: usize, len: u32, writes_only: bool) {
+        self.debugger_panel.watch_address(addr, len, writes_only);
+        self.pending_focus = Some(TabKind::Debugger);
+    }
+
     fn show_debugger_tab(&mut self, ui: &mut egui::Ui) {
         #[cfg(target_os = "linux")]
         let pid: Option<libc::pid_t> = self.process.as_ref().map(|p| p.pid() as libc::pid_t);
@@ -3175,6 +3181,15 @@ impl NemclassApp {
         let pid: Option<i32> = None;
 
         self.debugger_panel.show(ui, pid);
+
+        // A clicked access site opens in the disassembler.
+        if let Some(addr) = self.debugger_panel.take_goto_disasm() {
+            self.pending_focus = Some(TabKind::Disassembly);
+            #[cfg(target_os = "linux")]
+            self.disassembly_panel.goto(addr);
+            #[cfg(not(target_os = "linux"))]
+            let _ = addr;
+        }
     }
 
     fn show_memory_viewer(&mut self, ui: &mut egui::Ui) {
@@ -3272,6 +3287,15 @@ impl NemclassApp {
         if let Some(action) = self.disassembly_panel.take_action() {
             use disassembly::DisasmAction;
             use nemclass_model::node::builtins::Hex64Node;
+
+            // Not a class edit, so it is handled before the class lookup below
+            // — it works with no class selected at all.
+            if let DisasmAction::SetBreakpoint(addr) = action {
+                self.debugger_panel.set_execute_breakpoint(addr);
+                self.pending_focus = Some(TabKind::Debugger);
+                return;
+            }
+
             let uuid = self
                 .selected_class
                 .or_else(|| self.project.classes_in_order().next().map(|c| c.uuid));
@@ -3289,6 +3313,8 @@ impl NemclassApp {
                         node.comment = format!("From disassembler {addr:#018X}");
                         class.children.push(Box::new(node));
                     }
+                    // Handled above, before the class lookup.
+                    DisasmAction::SetBreakpoint(_) => {}
                 }
             }
         }
@@ -4687,6 +4713,42 @@ impl NemclassApp {
         if ui.button(format!("Delete{plural}\tDel")).clicked() {
             self.delete_selection();
             ui.close();
+        }
+
+        // The field's live address, which is what a watchpoint needs.
+        let field_address = self
+            .node_snapshots
+            .iter()
+            .find(|s| s.owner_class == snap_owner && s.local_path == snap_local_path)
+            .map(|s| (s.address, s._memory_size));
+        if let Some((addr, size)) = field_address
+            && addr != 0
+        {
+            ui.separator();
+            // Debug registers only cover 1/2/4/8 bytes, so a wider field is
+            // watched at its first word rather than refused.
+            let len = match size {
+                1 => 1u32,
+                2 => 2,
+                3..=4 => 4,
+                _ => 8,
+            };
+            if ui
+                .button("Find what writes this")
+                .on_hover_text("Arm a watchpoint and list the instructions that write here")
+                .clicked()
+            {
+                self.find_what_accesses(addr, len, true);
+                ui.close();
+            }
+            if ui
+                .button("Find what accesses this")
+                .on_hover_text("Reads and writes both")
+                .clicked()
+            {
+                self.find_what_accesses(addr, len, false);
+                ui.close();
+            }
         }
 
         if type_tag == "Pointer" {

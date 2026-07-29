@@ -24,6 +24,7 @@ pub use internal::{
     Section,
     SectionType,
     Module,
+    ThreadInfo,
     // Process enumeration.
     ProcessIterator,
     // Disassembler wrapper (iced-x86). `FlowKind` is the per-instruction
@@ -97,8 +98,9 @@ pub use internal::{WINDOWS_NATIVE, WindowsBackend, WindowsProvider};
 // non-Linux builds stay clean.
 #[cfg(target_os = "linux")]
 pub use internal::{
-    Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Event, KernelBackend,
-    KernelClient, KernelProvider, PtraceStatus, Registers, kernel,
+    AccessKind, AccessSite, AccessTally, AccessWatch, Breakpoint, BreakpointId, BreakpointSpec, DebugEvent,
+    Debugger, Event, KernelBackend, KernelClient, KernelProvider, PtraceStatus, Registers,
+    kernel, preceding_instruction,
 };
 
 #[derive(thiserror::Error, Debug)]

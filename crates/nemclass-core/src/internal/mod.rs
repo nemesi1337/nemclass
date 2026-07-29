@@ -12,7 +12,7 @@ mod analysis;
 pub use process::{
     MemoryBackend, MemoryRegion, Module, ModuleInfoWithName, Pid, Process, ProcessEntry,
     ProcessIterator, ProcessProvider, Protection, ProviderRegistry, Section, SectionType, Symbol,
-    pe, symbols,
+    ThreadInfo, pe, symbols,
 };
 
 // On-disk symbolication (M5.2). Behind the optional `symbols` feature so the base
@@ -40,8 +40,9 @@ pub use process::{WINDOWS_NATIVE, WindowsBackend, WindowsProvider};
 // the `Debugger` controller layered over the client.
 #[cfg(target_os = "linux")]
 pub use process::{
-    Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Event, KernelBackend,
-    KernelClient, KernelProvider, PtraceStatus, Registers, kernel,
+    AccessKind, AccessSite, AccessTally, AccessWatch, Breakpoint, BreakpointId, BreakpointSpec, DebugEvent,
+    Debugger, Event, KernelBackend, KernelClient, KernelProvider, PtraceStatus, Registers,
+    kernel, preceding_instruction,
 };
 
 // Disassembler wrapper (iced-x86) — consumed by the future scanner/host APIs.

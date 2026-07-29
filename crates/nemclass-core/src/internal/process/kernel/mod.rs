@@ -19,8 +19,10 @@
 //! seam free of Linux specifics for a future Windows backend.
 
 pub mod abi;
+pub mod access_watch;
 pub mod client;
 pub mod debugger;
 
 pub use client::{Event, KernelBackend, KernelClient, PtraceStatus, NEMCLASS_DEVICE};
+pub use access_watch::{AccessKind, AccessSite, AccessTally, AccessWatch, preceding_instruction};
 pub use debugger::{Breakpoint, BreakpointId, BreakpointSpec, DebugEvent, Debugger, Registers};

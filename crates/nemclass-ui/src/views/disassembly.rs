@@ -175,6 +175,9 @@ pub struct DisassemblyPanel {
 pub enum DisasmAction {
     SetClassAddress(usize),
     AddAddressToClass(usize),
+    /// Arm an execute breakpoint here. The debugger's address had to be typed
+    /// by hand, which meant copying it out of this very view.
+    SetBreakpoint(usize),
 }
 
 impl DisassemblyPanel {
@@ -1194,6 +1197,15 @@ impl DisassemblyPanel {
                                     .clicked()
                                 {
                                     nop_target = Some((addr as usize, length));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui
+                                    .button("Set breakpoint here")
+                                    .on_hover_text("Arm an execute breakpoint in the debugger")
+                                    .clicked()
+                                {
+                                    queued_action = Some(DisasmAction::SetBreakpoint(addr as usize));
                                     ui.close();
                                 }
                                 ui.separator();

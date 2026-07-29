@@ -102,3 +102,11 @@ pub struct RawModule {
     pub base: usize,
     pub end: usize,
 }
+/// One thread of a target process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadInfo {
+    /// Kernel thread id, which is what the debugger reports on a hit.
+    pub tid: Pid,
+    /// The thread's `comm` name, or empty if it could not be read.
+    pub name: String,
+}
